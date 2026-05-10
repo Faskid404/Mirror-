@@ -4,7 +4,10 @@ import base64
 import re
 import math
 from collections import Counter
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent))
 from smart_filter import high_entropy, is_demo_value, confidence_score, confidence_label, severity_from_confidence
 
 ENTROPY_THRESHOLD = 3.8
