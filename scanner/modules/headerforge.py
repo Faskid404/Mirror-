@@ -3,7 +3,10 @@ import asyncio
 import aiohttp
 import json
 import re
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent))
 from smart_filter import confidence_score, confidence_label, severity_from_confidence
 
 SECURITY_HEADERS = [
