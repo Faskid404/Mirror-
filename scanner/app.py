@@ -309,35 +309,27 @@ def health():
 
 app.register_blueprint(bp, url_prefix=SCANNER_BASE)
 
-  # ─── Serve built React frontend ───────────────────────────────────────────────
-  from flask import send_from_directory as _send_from_directory
 
-  FRONTEND_DIST = SCANNER_ROOT.parent / "artifacts" / "vulnscan" / "dist" / "public"
+# Serve built React frontend
+from flask import send_from_directory as _send_from_directory
+FRONTEND_DIST = SCANNER_ROOT.parent / 'artifacts' / 'vulnscan' / 'dist' / 'public'
 
-  if FRONTEND_DIST.exists():
-      @app.route("/", defaults={"path": ""})
-      @app.route("/<path:path>")
-      def serve_frontend(path):
-          # Let the blueprint handle /scanner-api routes
-          if path.startswith("scanner-api"):
-              from flask import abort
-              abort(404)
-          static_file = FRONTEND_DIST / path
-          if path and static_file.exists() and static_file.is_file():
-              return _send_from_directory(str(FRONTEND_DIST), path)
-          # Fall back to index.html for React client-side routing
-          return _send_from_directory(str(FRONTEND_DIST), "index.html")
-  else:
-      @app.route("/")
-      def index():
-          return jsonify({
-              "name":    "Mirror Security Scanner API",
-              "status":  "running",
-              "base":    SCANNER_BASE,
-              "health":  f"{SCANNER_BASE}/api/health",
-              "modules": list(MODULE_PATHS.keys()),
-              "note":    "Frontend not built yet. Run: cd artifacts/vulnscan && npm install && npm run build",
-          })
+if FRONTEND_DIST.exists():
+    @app.route('/', defaults={'path': ''})
+    @app.route('/<path:path>')
+    def serve_frontend(path):
+        if path.startswith('scanner-api'):
+            from flask import abort
+            abort(404)
+        static_file = FRONTEND_DIST / path
+        if path and static_file.exists() and static_file.is_file():
+            return _send_from_directory(str(FRONTEND_DIST), path)
+        return _send_from_directory(str(FRONTEND_DIST), 'index.html')
+else:
+    @app.route('/')
+    def index():
+        return jsonify({'name': 'Mirror Scanner API', 'status': 'running'})
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
