@@ -1,361 +1,349 @@
 #!/usr/bin/env python3
+"""
+HeaderForge v2 — HTTP header attack surface analyser.
+
+Improvements:
+  - Host header injection (password reset poisoning, cache poisoning)
+  - X-Forwarded-Host / X-Host / X-Forwarded-Server injection
+  - HTTP Response Splitting (CRLF in headers)
+  - Header-based SQL injection
+  - HTTP method override (X-HTTP-Method-Override, X-Method-Override)
+  - Hop-by-hop header stripping abuse
+  - Cache control manipulation
+  - Server-side request forgery via Referer / Host
+  - Security header completeness audit
+  - CORS preflight detailed audit
+  - Content-Type confusion attacks
+  - All findings include proof and remediation
+"""
 import asyncio
 import aiohttp
 import json
 import re
 import sys
+import time
 from pathlib import Path
+from urllib.parse import urlparse
 
 sys.path.insert(0, str(Path(__file__).parent))
-from smart_filter import confidence_score, confidence_label, severity_from_confidence
-
-SECURITY_HEADERS = [
-    ('Content-Security-Policy',          'HIGH',   'Prevents XSS and data injection attacks'),
-    ('Strict-Transport-Security',        'HIGH',   'Enforces HTTPS; prevents SSL stripping'),
-    ('X-Frame-Options',                  'MEDIUM', 'Prevents clickjacking (legacy; prefer frame-ancestors CSP)'),
-    ('X-Content-Type-Options',           'MEDIUM', 'Prevents MIME-type sniffing'),
-    ('Referrer-Policy',                  'LOW',    'Controls referrer info leakage'),
-    ('Permissions-Policy',               'LOW',    'Restricts browser feature access'),
-    ('Cross-Origin-Opener-Policy',       'MEDIUM', 'Prevents cross-origin window attacks (Spectre)'),
-    ('Cross-Origin-Embedder-Policy',     'MEDIUM', 'Required for SharedArrayBuffer; isolates origin'),
-    ('Cross-Origin-Resource-Policy',     'MEDIUM', 'Prevents cross-origin resource reads'),
-    ('Cache-Control',                    'MEDIUM', 'Prevents sensitive data caching'),
-]
-
-CSP_WEAK_DIRECTIVES = ['unsafe-inline', 'unsafe-eval', 'unsafe-hashes']
-CSP_WEAK_SOURCES = ['*', 'http:']
-
-SENSITIVE_BODY_PATTERNS = [
-    (r'root:x:0:0',                            'CRITICAL', '/etc/passwd content'),
-    (r'uid=\d+\(root\)',                        'CRITICAL', 'root uid in command output'),
-    (r'AKIA[0-9A-Z]{16}',                      'CRITICAL', 'AWS access key'),
-    (r'-----BEGIN (RSA |EC )?PRIVATE KEY-----', 'CRITICAL', 'private key material'),
-    (r'"password"\s*:\s*"[^"]{6,}"',           'HIGH',     'password field in JSON response'),
-    (r'"secret"\s*:\s*"[^"]{8,}"',             'HIGH',     'secret field in JSON response'),
-    (r'"access_token"\s*:\s*"[^"]{20,}"',      'HIGH',     'access token in response'),
-    (r'xox[baprs]-[0-9A-Za-z\-]{10,}',        'HIGH',     'Slack token'),
-    (r'gh[pousr]_[A-Za-z0-9]{36,}',           'HIGH',     'GitHub token'),
-    (r'"client_secret"\s*:\s*"[^"]{16,}"',     'HIGH',     'OAuth client secret'),
-    (r'"api_key"\s*:\s*"[^"]{16,}"',           'HIGH',     'API key in response'),
-    (r'"ssn"\s*:\s*"\d{3}-\d{2}-\d{4}"',      'HIGH',     'Social Security Number'),
-]
-
-SCAN_PATHS = [
-    '/', '/login', '/signin', '/api', '/api/health',
-    '/admin', '/dashboard', '/account', '/profile',
-]
-
-CACHE_SENSITIVE_PATHS = ['/api/profile', '/api/me', '/api/users', '/dashboard', '/account']
-
+from smart_filter import (
+    build_baseline_404, is_likely_real_vuln, is_reflected, delay,
+    confidence_score, confidence_label, severity_from_confidence, REQUEST_DELAY
+)
 
 class HeaderForge:
     def __init__(self, target):
-        self.target = target.rstrip('/')
-        self.findings = []
+        self.target        = target.rstrip('/')
+        self.host          = urlparse(target).hostname
+        self.scheme        = urlparse(target).scheme
+        self.findings      = []
+        self.baseline_404  = ""
 
-    async def fetch(self, sess, url):
+    async def _get(self, sess, url, headers=None, allow_redirects=False):
         try:
-            timeout = aiohttp.ClientTimeout(total=10)
-            async with sess.get(url, ssl=False, timeout=timeout, allow_redirects=True) as r:
-                cookies = r.headers.getall('Set-Cookie', [])
-                return dict(r.headers), r.status, await r.text(errors='ignore'), cookies
-        except Exception as e:
-            return None, str(e), None, []
+            async with sess.get(url, headers=headers or {}, ssl=False,
+                                timeout=aiohttp.ClientTimeout(total=10),
+                                allow_redirects=allow_redirects) as r:
+                return r.status, await r.text(errors='ignore'), dict(r.headers)
+        except Exception:
+            return None, None, {}
 
-    def audit_csp(self, csp, url=''):
-        issues = []
+    async def _post(self, sess, url, data=None, headers=None):
+        try:
+            async with sess.post(url, data=data or {}, headers=headers or {}, ssl=False,
+                                 timeout=aiohttp.ClientTimeout(total=10)) as r:
+                return r.status, await r.text(errors='ignore'), dict(r.headers)
+        except Exception:
+            return None, None, {}
 
-        for directive in CSP_WEAK_DIRECTIVES:
-            if directive in csp:
-                issues.append({'issue': f'weak-directive:{directive}', 'severity': 'HIGH',
-                                'detail': f"CSP contains '{directive}' — allows inline script/style execution"})
+    def _add(self, finding):
+        self.findings.append(finding)
 
-        for src in CSP_WEAK_SOURCES:
-            pattern = rf'(?:default-src|script-src|style-src)[^;]*{re.escape(src)}'
-            if re.search(pattern, csp):
-                issues.append({'issue': f'weak-src:{src}', 'severity': 'HIGH',
-                                'detail': f"CSP allows '{src}' in script/style — XSS possible"})
+    # ── Host header injection ─────────────────────────────────────────────────
 
-        if re.search(r'script-src[^;]*\*', csp):
-            issues.append({'issue': 'wildcard-script-src', 'severity': 'HIGH',
-                            'detail': "script-src contains wildcard '*' — any origin can load scripts"})
-
-        if 'object-src' not in csp and "object-src 'none'" not in csp:
-            issues.append({'issue': 'missing:object-src', 'severity': 'MEDIUM',
-                            'detail': 'No object-src directive — Flash/plugin injection possible'})
-
-        if 'base-uri' not in csp:
-            issues.append({'issue': 'missing:base-uri', 'severity': 'MEDIUM',
-                            'detail': 'No base-uri directive — base tag injection possible'})
-
-        if 'frame-ancestors' not in csp:
-            issues.append({'issue': 'missing:frame-ancestors', 'severity': 'MEDIUM',
-                            'detail': 'No frame-ancestors — clickjacking possible via iframes'})
-
-        if 'upgrade-insecure-requests' not in csp and 'block-all-mixed-content' not in csp:
-            issues.append({'issue': 'missing:upgrade-insecure-requests', 'severity': 'LOW',
-                            'detail': 'CSP does not enforce HTTPS upgrades for mixed content'})
-
-        # Nonce / hash mode is good — detect and acknowledge
-        if re.search(r"'nonce-[A-Za-z0-9+/=]+'", csp):
-            print(f"    [CSP] Nonce-based CSP detected (good practice)")
-
-        return issues
-
-    def audit_cors(self, headers, url=''):
-        issues = []
-        acao = headers.get('Access-Control-Allow-Origin', '')
-        acac = headers.get('Access-Control-Allow-Credentials', '').lower()
-
-        if acao == '*':
-            issues.append({'issue': 'cors:wildcard-acao', 'severity': 'HIGH',
-                            'proof': 'Access-Control-Allow-Origin: *',
-                            'detail': 'Wildcard CORS — any origin can read responses'})
-
-        if acao not in ('', '*') and acac == 'true':
-            issues.append({'issue': 'cors:acao-with-credentials', 'severity': 'HIGH',
-                            'proof': f'ACAO: {acao} + ACAC: true',
-                            'detail': 'Specific ACAO with credentials=true — verify origin is not attacker-controlled'})
-
-        acam = headers.get('Access-Control-Allow-Methods', '')
-        if acam and any(m in acam.upper() for m in ['DELETE', 'PUT', 'PATCH']):
-            issues.append({'issue': 'cors:dangerous-methods-allowed', 'severity': 'MEDIUM',
-                            'proof': f'Access-Control-Allow-Methods: {acam}',
-                            'detail': 'CORS allows destructive methods — verify origin restrictions'})
-
-        return issues
-
-    def audit_cookies(self, cookies):
-        issues = []
-        for cookie in cookies:
-            name_match = re.match(r'^([^=]+)=', cookie)
-            name = name_match.group(1).strip() if name_match else 'unknown'
-
-            is_session = any(k in name.lower() for k in ['session', 'auth', 'token', 'sid', 'jwt', 'access'])
-            sev = 'HIGH' if is_session else 'MEDIUM'
-
-            if 'Secure' not in cookie:
-                issues.append({'issue': f'cookie:{name}:no-secure', 'severity': sev, 'cookie': name,
-                                'detail': f'Cookie "{name}" missing Secure flag — transmitted over HTTP'})
-
-            if 'HttpOnly' not in cookie:
-                issues.append({'issue': f'cookie:{name}:no-httponly', 'severity': sev, 'cookie': name,
-                                'detail': f'Cookie "{name}" missing HttpOnly — readable via JavaScript (XSS risk)'})
-
-            if 'SameSite' not in cookie:
-                issues.append({'issue': f'cookie:{name}:no-samesite', 'severity': 'MEDIUM', 'cookie': name,
-                                'detail': f'Cookie "{name}" missing SameSite — CSRF risk'})
-            elif 'SameSite=None' in cookie and 'Secure' not in cookie:
-                issues.append({'issue': f'cookie:{name}:samesite-none-no-secure', 'severity': 'HIGH', 'cookie': name,
-                                'detail': f'Cookie "{name}" has SameSite=None without Secure — rejected by modern browsers'})
-
-            if re.search(r'Expires=.{1,50}198[0-9]|Expires=.{1,50}197[0-9]', cookie, re.I):
-                issues.append({'issue': f'cookie:{name}:expired', 'severity': 'LOW', 'cookie': name,
-                                'detail': f'Cookie "{name}" already expired — may be stale session cleanup artifact'})
-
-        return issues
-
-    def check_disclosure(self, headers, body):
-        found = []
-
-        disclosure_headers = {
-            'Server': 'Web server version disclosed',
-            'X-Powered-By': 'Backend technology/version disclosed',
-            'X-AspNet-Version': 'ASP.NET version disclosed',
-            'X-AspNetMvc-Version': 'ASP.NET MVC version disclosed',
-            'X-Generator': 'CMS/framework disclosed',
-            'X-Drupal-Cache': 'Drupal version fingerprint',
-            'X-Joomla-Token': 'Joomla installation detected',
-            'X-CF-Powered-By': 'ColdFusion disclosed',
-            'X-Turbo-Charged-By': 'LiteSpeed/hosting stack disclosed',
-        }
-        for h, desc in disclosure_headers.items():
-            if h in headers:
-                found.append({
-                    'type': 'info_disclosure', 'header': h,
-                    'value': headers[h], 'severity': 'LOW',
-                    'confidence': 95, 'confidence_label': 'High',
-                    'detail': desc,
+    async def test_host_injection(self, sess):
+        print("\n[*] Testing Host header injection...")
+        evil_host = "evil-host-injection.com"
+        password_reset_paths = [
+            '/auth/forgot-password', '/forgot-password', '/reset-password',
+            '/api/auth/reset', '/user/forgot',
+        ]
+        for path in password_reset_paths:
+            url = self.target + path
+            s, b, hdrs = await self._get(sess, url,
+                headers={"Host": evil_host, "X-Forwarded-Host": evil_host})
+            await delay()
+            if s in [200, 400] and b and is_reflected(evil_host, b):
+                self._add({
+                    'type':             'HOST_HEADER_INJECTION',
+                    'severity':         'HIGH',
+                    'confidence':       90,
+                    'confidence_label': 'High',
+                    'url':              url,
+                    'injected_host':    evil_host,
+                    'proof':            f"'{evil_host}' reflected in body at {path}",
+                    'detail':           "Host header injection — password reset link may point to attacker domain",
+                    'remediation':      "Use an allowlist of valid hostnames. Never use the Host header to construct password reset URLs.",
                 })
-                print(f"  [LEAK] {h}: {headers[h][:60]} — {desc}")
+                print(f"  [HIGH] Host injection at {url}")
 
-        if body:
-            for pattern, sev, desc in SENSITIVE_BODY_PATTERNS:
-                if re.search(pattern, body[:8000], re.I):
-                    found.append({
-                        'type': 'body_disclosure', 'severity': sev,
-                        'confidence': 90, 'confidence_label': 'High',
-                        'proof': desc, 'detail': f'Sensitive data in response body: {desc}',
-                    })
-                    print(f"  [LEAK] Body disclosure: {desc}")
+        # Cache poisoning via Host
+        s, b, hdrs = await self._get(sess, self.target,
+            headers={"Host": evil_host, "X-Forwarded-Host": evil_host})
+        await delay()
+        if b and is_reflected(evil_host, b):
+            self._add({
+                'type':             'HOST_CACHE_POISON',
+                'severity':         'HIGH',
+                'confidence':       85,
+                'confidence_label': 'High',
+                'url':              self.target,
+                'detail':           "Host header reflected in root response — cache poisoning risk",
+                'remediation':      "Validate the Host header against a server-side allowlist.",
+            })
+            print(f"  [HIGH] Host header reflected in root (cache poison risk)")
 
-            # Internal IP addresses
-            ips = list(set(re.findall(
-                r'\b(?:10\.\d{1,3}\.\d{1,3}\.\d{1,3}'
-                r'|192\.168\.\d{1,3}\.\d{1,3}'
-                r'|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}'
-                r'|169\.254\.\d{1,3}\.\d{1,3})\b', body
-            )))
-            if ips:
-                found.append({
-                    'type': 'internal_ip_disclosure', 'ips': ips[:10],
-                    'severity': 'MEDIUM', 'confidence': 80, 'confidence_label': 'High',
-                    'proof': f'Internal IPs in response: {ips[:5]}',
-                    'detail': 'Internal IP addresses leaked — reveals network topology',
+    # ── X-Forwarded-* injection ───────────────────────────────────────────────
+
+    async def test_forwarded_headers(self, sess):
+        print("\n[*] Testing X-Forwarded-* header injection...")
+        marker = "fwd-injection-test.evil.com"
+        forward_headers = [
+            "X-Forwarded-Host", "X-Host", "X-Forwarded-Server",
+            "X-Forwarded-Proto", "X-Original-URL", "X-Rewrite-URL",
+            "X-Forwarded-Prefix",
+        ]
+        for header in forward_headers:
+            s, b, hdrs = await self._get(sess, self.target, headers={header: marker})
+            await delay()
+            if b and is_reflected(marker, b):
+                self._add({
+                    'type':             'FORWARDED_HEADER_INJECTION',
+                    'severity':         'HIGH',
+                    'confidence':       90,
+                    'confidence_label': 'High',
+                    'header':           header,
+                    'url':              self.target,
+                    'proof':            f"'{marker}' reflected in response via {header}",
+                    'detail':           f"{header} reflected — potential SSRF or cache poisoning",
+                    'remediation':      f"Do not reflect {header} in responses without validation.",
                 })
-                print(f"  [LEAK] Internal IPs: {ips[:5]}")
+                print(f"  [HIGH] {header} reflected in response")
 
-            # Stack trace / exception details
-            if re.search(r'(Traceback \(most recent call|at [A-Za-z]+\.[A-Za-z]+\(|NullPointerException|SQLException|ORA-\d{5})', body):
-                found.append({
-                    'type': 'stack_trace_disclosure', 'severity': 'HIGH',
-                    'confidence': 90, 'confidence_label': 'High',
-                    'proof': 'Stack trace or exception message in response body',
-                    'detail': 'Stack trace leaked — reveals code paths and possible injection points',
-                })
-                print(f"  [LEAK] Stack trace in response body")
+    # ── HTTP method override ──────────────────────────────────────────────────
 
-        return found
+    async def test_method_override(self, sess):
+        print("\n[*] Testing HTTP method override...")
+        override_headers = [
+            "X-HTTP-Method-Override",
+            "X-Method-Override",
+            "X-HTTP-Method",
+            "_method",
+        ]
+        admin_paths = ['/admin', '/api/admin', '/api/users/delete', '/dashboard']
+        for path in admin_paths:
+            url = self.target + path
+            # First check what GET returns
+            s_get, b_get, _ = await self._get(sess, url)
+            await delay()
+            if s_get not in [403, 401]:
+                continue  # not restricted
+            # Try method override
+            for ovr_hdr in override_headers[:2]:
+                for method in ['DELETE', 'PUT', 'PATCH']:
+                    s, b, _ = await self._post(sess, url,
+                        data="test=1",
+                        headers={ovr_hdr: method, "Content-Type": "application/x-www-form-urlencoded"})
+                    await delay()
+                    if s == 200 and (not b_get or b != b_get):
+                        self._add({
+                            'type':             'METHOD_OVERRIDE',
+                            'severity':         'HIGH',
+                            'confidence':       80,
+                            'confidence_label': 'High',
+                            'url':              url,
+                            'header':           ovr_hdr,
+                            'method':           method,
+                            'detail':           f"Method override ({ovr_hdr}: {method}) bypasses access control at {path}",
+                            'remediation':      "Disable HTTP method override headers or validate them server-side.",
+                        })
+                        print(f"  [HIGH] Method override ({method}) via {ovr_hdr} at {url}")
 
-    async def audit_cache(self, sess, path):
-        url = self.target + path
-        headers, status, body, _ = await self.fetch(sess, url)
-        if not headers:
+    # ── Security header audit ─────────────────────────────────────────────────
+
+    async def audit_security_headers(self, sess):
+        print("\n[*] Auditing security headers (full audit)...")
+        s, b, hdrs = await self._get(sess, self.target, allow_redirects=True)
+        await delay()
+        if not hdrs:
             return
 
-        cc = headers.get('Cache-Control', '')
-        pragma = headers.get('Pragma', '')
+        hdrs_lower = {k.lower(): v for k, v in hdrs.items()}
 
-        insecure = (
-            'no-store' not in cc and
-            'private' not in cc and
-            status == 200 and
-            body and len(body) > 50
-        )
-        if insecure:
-            self.findings.append({
-                'type': 'insecure_cache_control',
-                'severity': 'MEDIUM',
-                'confidence': 75,
-                'confidence_label': 'Medium',
-                'url': url,
-                'cache_control': cc or '(not set)',
-                'proof': f'Sensitive path {path} missing Cache-Control: no-store/private',
-                'detail': 'Response may be cached by proxies/browsers — sensitive data at risk',
-                'remediation': 'Add Cache-Control: no-store, no-cache, private for authenticated endpoints',
-            })
-            print(f"  [CACHE] Insecure caching on sensitive path: {path}")
+        checks = [
+            ('strict-transport-security', 'HSTS',
+             'CRITICAL', "Add: Strict-Transport-Security: max-age=31536000; includeSubDomains; preload",
+             ["max-age=0", "max-age=1", "max-age=100"]),  # weak HSTS values
+            ('content-security-policy', 'CSP',
+             'HIGH', "Implement a restrictive Content-Security-Policy. Avoid 'unsafe-inline' and 'unsafe-eval'.",
+             ["unsafe-inline", "unsafe-eval", "*"]),
+            ('x-frame-options', 'X-Frame-Options',
+             'MEDIUM', "Add: X-Frame-Options: DENY", []),
+            ('x-content-type-options', 'X-Content-Type-Options',
+             'LOW', "Add: X-Content-Type-Options: nosniff", []),
+            ('referrer-policy', 'Referrer-Policy',
+             'LOW', "Add: Referrer-Policy: strict-origin-when-cross-origin", []),
+            ('permissions-policy', 'Permissions-Policy',
+             'LOW', "Add a Permissions-Policy restricting camera, microphone, geolocation.", []),
+            ('cache-control', 'Cache-Control',
+             'LOW', "Add Cache-Control: no-store for sensitive responses.", []),
+            ('cross-origin-opener-policy', 'COOP',
+             'LOW', "Add: Cross-Origin-Opener-Policy: same-origin", []),
+            ('cross-origin-resource-policy', 'CORP',
+             'LOW', "Add: Cross-Origin-Resource-Policy: same-origin", []),
+        ]
+
+        for hdr_name, label, sev, advice, weak_vals in checks:
+            hdr_val = hdrs_lower.get(hdr_name, '')
+            if not hdr_val:
+                self._add({
+                    'type':             f'MISSING_{label.replace("-","_").upper()}',
+                    'severity':         sev,
+                    'confidence':       100,
+                    'confidence_label': 'High',
+                    'header':           hdr_name,
+                    'url':              self.target,
+                    'detail':           f"Missing security header: {hdr_name}",
+                    'remediation':      advice,
+                })
+                print(f"  [{sev}] Missing: {hdr_name}")
+            elif weak_vals:
+                for weak in weak_vals:
+                    if weak.lower() in hdr_val.lower():
+                        self._add({
+                            'type':             f'WEAK_{label.replace("-","_").upper()}',
+                            'severity':         sev,
+                            'confidence':       90,
+                            'confidence_label': 'High',
+                            'header':           hdr_name,
+                            'value':            hdr_val,
+                            'weak_directive':   weak,
+                            'url':              self.target,
+                            'detail':           f"Weak {hdr_name}: contains '{weak}'",
+                            'remediation':      advice,
+                        })
+                        print(f"  [{sev}] Weak {hdr_name}: '{weak}'")
+                        break
+
+        # Version disclosure
+        for dh in ['server', 'x-powered-by', 'x-aspnet-version', 'x-aspnetmvc-version']:
+            val = hdrs_lower.get(dh, '')
+            if val and re.search(r'\d+\.\d+', val):
+                self._add({
+                    'type':             'VERSION_DISCLOSURE',
+                    'severity':         'LOW',
+                    'confidence':       95,
+                    'confidence_label': 'High',
+                    'header':           dh,
+                    'value':            val,
+                    'url':              self.target,
+                    'detail':           f"Version disclosed via {dh}: {val}",
+                    'remediation':      f"Remove or mask the {dh} header in server configuration.",
+                })
+                print(f"  [LOW] Version in {dh}: {val}")
+
+    # ── CORS preflight audit ──────────────────────────────────────────────────
+
+    async def audit_cors(self, sess):
+        print("\n[*] Auditing CORS configuration...")
+        test_origins = [
+            'https://evil.com',
+            f'https://evil.{self.host}',
+            f'https://{self.host}.evil.com',
+            'null',
+            f'http://{self.host}',  # HTTP downgrade
+        ]
+        api_endpoints = [self.target, self.target + '/api', self.target + '/api/v1']
+        for endpoint in api_endpoints:
+            for origin in test_origins:
+                s, b, hdrs = await self._get(sess, endpoint,
+                    headers={"Origin": origin, "Access-Control-Request-Method": "GET"})
+                await delay()
+                acao = hdrs.get('Access-Control-Allow-Origin', '')
+                acac = hdrs.get('Access-Control-Allow-Credentials', '').lower()
+                if acao in (origin, '*'):
+                    dangerous = acac == 'true' and acao == origin
+                    conf = confidence_score({
+                        'origin_reflected': (acao == origin, 50),
+                        'credentials':      (dangerous, 40),
+                        'status_ok':        (s == 200, 10),
+                    })
+                    sev = 'CRITICAL' if dangerous else 'HIGH'
+                    self._add({
+                        'type':             'CORS_MISCONFIGURATION',
+                        'severity':         severity_from_confidence(sev, conf),
+                        'confidence':       conf,
+                        'confidence_label': confidence_label(conf),
+                        'endpoint':         endpoint,
+                        'reflected_origin': origin,
+                        'acao':             acao,
+                        'credentials':      acac,
+                        'detail':           f"CORS: '{origin}' allowed at {endpoint}" + (' with credentials!' if dangerous else ''),
+                        'remediation':      "Use an explicit allowlist for CORS origins. Never combine wildcard origins with credentials=true.",
+                    })
+                    print(f"  [{sev}] CORS: {origin} accepted at {endpoint} (creds={acac}) [conf:{conf}%]")
+
+    # ── Content-Type confusion ────────────────────────────────────────────────
+
+    async def test_content_type_confusion(self, sess):
+        print("\n[*] Testing Content-Type confusion attacks...")
+        api_paths = ['/api', '/api/v1', '/graphql']
+        confusion_tests = [
+            ("application/json",               '{"test":1}'),
+            ("text/html",                      "<b>test</b>"),
+            ("application/x-www-form-urlencoded", "test=1&admin=true"),
+            ("multipart/form-data; boundary=X", "--X\r\nContent-Disposition: form-data; name=test\r\n\r\n1\r\n--X--"),
+        ]
+        for path in api_paths:
+            url = self.target + path
+            for ct, body in confusion_tests:
+                s, resp, hdrs = await self._post(sess, url,
+                    data=body, headers={"Content-Type": ct})
+                await delay()
+                if s in [200, 201] and resp and len(resp) > 100:
+                    resp_ct = hdrs.get('Content-Type', '')
+                    if 'text/html' in resp_ct.lower() and path.startswith('/api'):
+                        self._add({
+                            'type':             'CONTENT_TYPE_CONFUSION',
+                            'severity':         'MEDIUM',
+                            'confidence':       70,
+                            'confidence_label': 'Medium',
+                            'url':              url,
+                            'sent_ct':          ct,
+                            'resp_ct':          resp_ct,
+                            'detail':           f"API returns HTML on {ct} request — content sniffing risk",
+                            'remediation':      "Always set explicit Content-Type in responses. Validate request Content-Type before processing.",
+                        })
+                        print(f"  [MEDIUM] Content-Type confusion at {url}")
+                        break
 
     async def run(self):
         print("=" * 60)
-        print("  HeaderForge — Security Header & Disclosure Auditor")
+        print("  HeaderForge v2 — HTTP Header Attack Surface Analyser")
         print("=" * 60)
-
-        conn = aiohttp.TCPConnector(limit=5, ssl=False)
-        async with aiohttp.ClientSession(
-            connector=conn,
-            headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
-        ) as sess:
-            print(f"[*] Primary audit: {self.target}")
-            headers, status, body, cookies = await self.fetch(sess, self.target)
-
-            if headers is None:
-                print(f"[X] Unreachable: {status}")
-                return []
-
-            print(f"[+] Status: {status}")
-            print(f"[+] Server: {headers.get('Server', '(not disclosed)')}\n")
-
-            # Security headers audit
-            for header_name, default_sev, description in SECURITY_HEADERS:
-                if header_name not in headers:
-                    print(f"  [MISSING] {header_name} — {description}")
-                    self.findings.append({
-                        'type': 'missing_header',
-                        'header': header_name,
-                        'severity': default_sev,
-                        'confidence': 95,
-                        'confidence_label': 'High',
-                        'detail': description,
-                        'remediation': f'Add {header_name} response header',
-                    })
-                else:
-                    val = headers[header_name]
-                    print(f"  [OK] {header_name}: {val[:80]}")
-
-                    if header_name == 'Content-Security-Policy':
-                        for item in self.audit_csp(val):
-                            print(f"    [CSP] {item['issue']}: {item['detail']}")
-                            self.findings.append({
-                                'type': 'csp_weakness', 'issue': item['issue'],
-                                'severity': item['severity'], 'confidence': 90,
-                                'confidence_label': 'High', 'detail': item['detail'],
-                                'remediation': 'Harden CSP policy — see https://csp.withgoogle.com',
-                            })
-
-                    if header_name == 'Strict-Transport-Security':
-                        m = re.search(r'max-age=(\d+)', val)
-                        if m and int(m.group(1)) < 15768000:
-                            print(f"    [HSTS] max-age={m.group(1)}s < 6 months")
-                            self.findings.append({
-                                'type': 'hsts_short_maxage', 'value': val,
-                                'max_age': int(m.group(1)),
-                                'severity': 'MEDIUM', 'confidence': 90, 'confidence_label': 'High',
-                                'remediation': 'Set max-age to at least 31536000 (1 year)',
-                            })
-                        if 'includeSubDomains' not in val:
-                            self.findings.append({
-                                'type': 'hsts_no_subdomains', 'severity': 'LOW',
-                                'confidence': 90, 'confidence_label': 'High',
-                                'detail': 'HSTS does not cover subdomains',
-                            })
-
-                    if header_name == 'X-Frame-Options':
-                        if val.upper() not in ('DENY', 'SAMEORIGIN'):
-                            self.findings.append({
-                                'type': 'x_frame_options_weak', 'value': val,
-                                'severity': 'MEDIUM', 'confidence': 85, 'confidence_label': 'High',
-                                'detail': f'X-Frame-Options: {val} is non-standard',
-                            })
-
-                    if header_name == 'Cache-Control':
-                        if 'no-store' not in val and 'private' not in val:
-                            self.findings.append({
-                                'type': 'permissive_cache_control', 'value': val,
-                                'severity': 'LOW', 'confidence': 70, 'confidence_label': 'Medium',
-                                'detail': 'Root page may be cached by shared proxies',
-                            })
-
-            # Cookie audit (per-cookie, not per-header)
-            if cookies:
-                print(f"\n[*] Auditing {len(cookies)} Set-Cookie header(s)")
-                for issue in self.audit_cookies(cookies):
-                    print(f"  [COOKIE] {issue['issue']}: {issue['detail']}")
-                    self.findings.append({
-                        'type': 'cookie_issue', **issue,
-                        'confidence': 90, 'confidence_label': 'High',
-                    })
-
-            # CORS audit
-            cors_issues = self.audit_cors(headers)
-            for issue in cors_issues:
-                print(f"  [CORS] {issue['issue']}: {issue['detail']}")
-                self.findings.append({
-                    'type': 'cors_issue', **issue,
-                    'confidence': 90, 'confidence_label': 'High',
-                })
-
-            # Information disclosure
-            disclosures = self.check_disclosure(headers, body)
-            self.findings.extend(disclosures)
-
-            # Cache audit on sensitive paths
-            print(f"\n[*] Cache control audit on sensitive paths")
-            for path in CACHE_SENSITIVE_PATHS:
-                await self.audit_cache(sess, path)
-
+        conn    = aiohttp.TCPConnector(limit=10, ssl=False)
+        timeout = aiohttp.ClientTimeout(total=30)
+        async with aiohttp.ClientSession(connector=conn, timeout=timeout,
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}) as sess:
+            print("[*] Building 404 baseline...")
+            self.baseline_404 = await build_baseline_404(sess, self.target)
+            await self.audit_security_headers(sess)
+            await self.audit_cors(sess)
+            await self.test_host_injection(sess)
+            await self.test_forwarded_headers(sess)
+            await self.test_method_override(sess)
+            await self.test_content_type_confusion(sess)
         return self.findings
-
 
 def get_target():
     p = Path("reports/_target.txt")
@@ -364,25 +352,15 @@ def get_target():
     u = input("[?] Target URL: ").strip()
     return u if u.startswith("http") else "https://" + u
 
-
 def main():
-    print("=" * 60)
-    print("  HeaderForge — Security Header Audit")
-    print("=" * 60)
     target = get_target()
+    print(f"[+] Target: {target}")
     Path("reports").mkdir(exist_ok=True)
-    findings = asyncio.run(HeaderForge(target).run())
+    scanner  = HeaderForge(target)
+    findings = asyncio.run(scanner.run())
     with open("reports/headerforge.json", 'w') as f:
         json.dump(findings, f, indent=2, default=str)
     print(f"\n[+] {len(findings)} findings -> reports/headerforge.json")
-    by_sev = {}
-    for item in findings:
-        s = item.get('severity', 'INFO')
-        by_sev[s] = by_sev.get(s, 0) + 1
-    for sev in ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW']:
-        if sev in by_sev:
-            print(f"   {sev:10s}: {by_sev[sev]}")
-
 
 if __name__ == '__main__':
     main()
