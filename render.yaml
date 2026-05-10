@@ -1,0 +1,10 @@
+services:
+    - type: web
+      name: mirror
+      runtime: python
+      buildCommand: pip install -r scanner/requirements.txt && npm install -g pnpm && pnpm install --no-frozen-lockfile && pnpm --filter @workspace/vulnscan run build
+      startCommand: cd scanner && gunicorn app:app
+      envVars:
+        - key: NODE_ENV
+          value: production
+  
