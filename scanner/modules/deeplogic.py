@@ -4,7 +4,10 @@ import aiohttp
 import json
 import hashlib
 import time
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent))
 from smart_filter import REQUEST_DELAY, confidence_score, confidence_label, severity_from_confidence
 
 class DeepLogic:
