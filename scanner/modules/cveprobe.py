@@ -5,6 +5,7 @@ CVEProbe — Nuclei-style HTTP probe engine
   48 SharePoint CVEs (build-version matched)
   70 platforms covered
   6 attack chains auto-detected
+  Evasion engine: WAF bypass headers, path encoding, IP spoofing, UA rotation
 """
 import asyncio
 import aiohttp
@@ -13,8 +14,10 @@ import re
 import sys
 import os
 import time
+import random
+import string
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote
 
 # Allow sibling imports when run as subprocess
 sys.path.insert(0, str(Path(__file__).parent))
@@ -527,17 +530,78 @@ for _cve, _major, _build, _desc, _chain in SHAREPOINT_CVES:
 # ─── Detection engine ─────────────────────────────────────────────────────────
 
 class CVEProbe:
-    def __init__(self, target):
-        self.target   = target.rstrip("/")
-        self.findings = []
+    # ── Evasion strategy definitions ─────────────────────────────────────────
+    EVASION_STRATEGIES = [
+        # 0: baseline — no evasion
+        {"label": "baseline", "headers": {}, "path_fn": lambda p: p},
 
-    async def _request(self, sess, probe):
-        method  = probe.get("method", "GET")
-        path    = probe.get("path", "/")
-        hdrs    = probe.get("headers", {})
-        body    = probe.get("body", None)
-        url     = self.target + path
+        # 1: WAF IP spoof — pretend request originates from localhost
+        {"label": "ip_spoof", "headers": {
+            "X-Forwarded-For":        "127.0.0.1",
+            "X-Real-IP":              "127.0.0.1",
+            "X-Originating-IP":       "127.0.0.1",
+            "X-Remote-Addr":          "127.0.0.1",
+            "X-Client-IP":            "127.0.0.1",
+            "X-Host":                 "127.0.0.1",
+            "X-Custom-IP-Authorization": "127.0.0.1",
+        }, "path_fn": lambda p: p},
 
+        # 2: URL-encoded path — single %2f encoding on slashes
+        {"label": "url_encode", "headers": {}, "path_fn": lambda p: quote(p, safe=":?=&@!")},
+
+        # 3: Double URL encoding — %252f style
+        {"label": "double_encode", "headers": {}, "path_fn": lambda p: p.replace("/", "%252f").replace("..", "%252e%252e") if "/" in p else p},
+
+        # 4: Case confusion — uppercase the path (works on case-insensitive servers)
+        {"label": "case_upper", "headers": {}, "path_fn": lambda p: p.upper() if p not in ["/", ""] else p},
+
+        # 5: Path traversal prefix — prepend /./ to confuse normalisation
+        {"label": "dot_slash", "headers": {}, "path_fn": lambda p: "/." + p if p.startswith("/") else p},
+
+        # 6: Null-byte suffix — some WAFs stop parsing at null byte
+        {"label": "null_suffix", "headers": {}, "path_fn": lambda p: p + "%00"},
+
+        # 7: Random case mix — alternate upper/lower chars
+        {"label": "mixed_case", "headers": {}, "path_fn": lambda p: "".join(
+            c.upper() if i % 2 == 0 else c.lower() for i, c in enumerate(p))},
+
+        # 8: Full WAF bypass header pack with encoded path
+        {"label": "full_bypass", "headers": {
+            "X-Forwarded-For":      "127.0.0.1",
+            "X-Real-IP":            "127.0.0.1",
+            "X-Originating-IP":     "127.0.0.1",
+            "X-WAF-Bypass":         "1",
+            "X-Bypass":             "true",
+            "Forwarded":            "for=127.0.0.1;proto=https",
+            "Via":                  "1.1 trusted-proxy",
+            "CF-Connecting-IP":     "127.0.0.1",
+            "True-Client-IP":       "127.0.0.1",
+        }, "path_fn": lambda p: quote(p, safe=":?=&@!")},
+
+        # 9: HTTP/1.0 downgrade via header (some WAFs inspect HTTP version)
+        {"label": "http10_downgrade", "headers": {
+            "Connection": "close",
+            "Pragma":     "no-cache",
+        }, "path_fn": lambda p: p},
+    ]
+
+    USER_AGENTS = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+        "Mozilla/5.0 (X11; Linux x86_64; rv:125.0) Gecko/20100101 Firefox/125.0",
+        "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+        "curl/8.7.1",
+        "python-requests/2.31.0",
+        "Go-http-client/1.1",
+    ]
+
+    def __init__(self, target, use_evasion=True):
+        self.target       = target.rstrip("/")
+        self.findings     = []
+        self.use_evasion  = use_evasion
+
+    # ── Single HTTP request ───────────────────────────────────────────────────
+    async def _request(self, sess, method, url, hdrs, body):
         try:
             timeout = aiohttp.ClientTimeout(total=12)
             kwargs  = dict(headers=hdrs, ssl=False, timeout=timeout,
@@ -545,7 +609,7 @@ class CVEProbe:
             if method == "POST":
                 if isinstance(body, str):
                     kwargs["data"] = body
-                else:
+                elif body is not None:
                     kwargs["json"] = body
                 async with sess.post(url, **kwargs) as r:
                     return r.status, await r.text(errors="ignore")
@@ -554,6 +618,40 @@ class CVEProbe:
                     return r.status, await r.text(errors="ignore")
         except Exception:
             return None, None
+
+    # ── Try probe with each evasion strategy until a match is found ──────────
+    async def _probe_with_evasion(self, sess, probe):
+        method       = probe.get("method", "GET")
+        base_path    = probe.get("path", "/")
+        probe_hdrs   = probe.get("headers", {})
+        body         = probe.get("body", None)
+        match_status = probe.get("match_status", [])
+        match_body   = probe.get("match_body",   [])
+
+        strategies = self.EVASION_STRATEGIES if self.use_evasion else self.EVASION_STRATEGIES[:1]
+
+        for strat in strategies:
+            evasion_hdrs = {
+                "User-Agent": random.choice(self.USER_AGENTS),
+                **strat["headers"],
+                **probe_hdrs,
+            }
+            path = strat["path_fn"](base_path)
+            url  = self.target + path
+
+            status, body_text = await self._request(sess, method, url, evasion_hdrs, body)
+            if status is None:
+                continue
+
+            status_ok = not match_status or status in match_status
+            body_ok   = not match_body   or any(
+                k.lower() in (body_text or "").lower() for k in match_body
+            )
+
+            if status_ok and body_ok:
+                return status, body_text, strat["label"], url
+
+        return None, None, None, None
 
     def _detect_sharepoint_version(self, body: str):
         """Extract SharePoint build number from headers/body."""
@@ -567,35 +665,33 @@ class CVEProbe:
         return None
 
     async def probe_all(self):
-        headers = {"User-Agent": "Mozilla/5.0 (Security Research)"}
         connector = aiohttp.TCPConnector(ssl=False, limit=20)
-        async with aiohttp.ClientSession(headers=headers, connector=connector) as sess:
+        async with aiohttp.ClientSession(connector=connector) as sess:
             for probe in CVE_PROBES:
                 try:
-                    status, body = await self._request(sess, probe)
+                    status, body, evasion_label, matched_url = \
+                        await self._probe_with_evasion(sess, probe)
+
                     if status is None:
+                        await asyncio.sleep(REQUEST_DELAY * 0.5)
                         continue
 
-                    match_status = probe.get("match_status", [])
-                    match_body   = probe.get("match_body",   [])
+                    self.findings.append({
+                        "cve":          probe["cve"],
+                        "name":         probe["name"],
+                        "platform":     probe["platform"],
+                        "severity":     probe["severity"],
+                        "url":          matched_url,
+                        "status":       status,
+                        "chain":        probe.get("chain"),
+                        "evasion_used": evasion_label,
+                    })
 
-                    status_ok = not match_status or status in match_status
-                    body_ok   = not match_body   or any(k.lower() in (body or "").lower() for k in match_body)
-
-                    if status_ok and body_ok:
-                        self.findings.append({
-                            "cve":      probe["cve"],
-                            "name":     probe["name"],
-                            "platform": probe["platform"],
-                            "severity": probe["severity"],
-                            "url":      self.target + probe["path"],
-                            "status":   status,
-                            "chain":    probe.get("chain"),
-                        })
-                        print(f"  [VULN] {probe['cve']} — {probe['name']} [{probe['severity']}]")
+                    tag = "" if evasion_label == "baseline" else f" via {evasion_label}"
+                    print(f"  [VULN] {probe['cve']} — {probe['name']} [{probe['severity']}]{tag}")
 
                     await asyncio.sleep(REQUEST_DELAY * 0.5)
-                except Exception as e:
+                except Exception:
                     pass
 
         return self.findings
