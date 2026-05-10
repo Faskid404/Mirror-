@@ -36,7 +36,7 @@ export default function Dashboard() {
   const [status, setStatus]         = useState<any>(null);
   const [lines, setLines]           = useState<string[]>([]);
   const [lineIdx, setLineIdx]       = useState(0);
-  const [showModules, setShowModules] = useState(false);
+  const [showModules, setShowModules] = useState(true);
   const termRef = useRef<HTMLDivElement>(null);
   const pollRef = useRef<any>(null);
 
@@ -110,7 +110,7 @@ export default function Dashboard() {
       {/* Header */}
       <div>
         <h1 className="text-xl font-semibold text-foreground">Security Arsenal</h1>
-        <p className="text-sm text-muted-foreground mt-0.5">Professional vulnerability assessment suite — authorized testing only</p>
+        <p className="text-sm text-muted-foreground mt-0.5">Professional vulnerability assessment suite â authorized testing only</p>
       </div>
 
       {/* Health bar */}
@@ -119,13 +119,13 @@ export default function Dashboard() {
           <>
             <CheckCircle className="w-4 h-4 text-accent shrink-0" />
             <span className="text-foreground font-medium">Scanner online</span>
-            <span className="text-muted-foreground">·</span>
+            <span className="text-muted-foreground">Â·</span>
             <span className="text-muted-foreground">{modulesReady}/{modulesTotal} modules ready</span>
           </>
         ) : (
           <>
             <Loader2 className="w-4 h-4 text-muted-foreground animate-spin shrink-0" />
-            <span className="text-muted-foreground">Connecting to scanner…</span>
+            <span className="text-muted-foreground">Connecting to scannerâ¦</span>
           </>
         )}
       </div>
@@ -193,12 +193,12 @@ export default function Dashboard() {
               {isStopped && <Square className="w-4 h-4 text-muted-foreground" />}
               <span className="font-medium capitalize">{status.status}</span>
               {status.current_module && (
-                <span className="text-muted-foreground">— {status.current_module}</span>
+                <span className="text-muted-foreground">â {status.current_module}</span>
               )}
             </div>
             <span className="text-muted-foreground font-mono text-xs">
               {status.completed_modules?.length ?? 0}/{status.total_modules ?? 0} modules
-              {status.findings_count > 0 && ` · ${status.findings_count} findings`}
+              {status.findings_count > 0 && ` Â· ${status.findings_count} findings`}
             </span>
           </div>
           {/* Progress bar */}
