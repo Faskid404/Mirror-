@@ -10,7 +10,7 @@ from pathlib import Path
 from flask import Flask, request, jsonify, Blueprint
 from flask_cors import CORS
 
-# ─── Setup ────────────────────────────────────────────────────────────────────
+# âââ Setup ââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 SCANNER_ROOT = Path(__file__).parent.resolve()
 MODULES_DIR  = SCANNER_ROOT / "modules"
 REPORTS_DIR  = SCANNER_ROOT / "reports"
@@ -103,7 +103,7 @@ def run_module(job_id, abs_path, target):
             JOBS[job_id]["output"].append(f"[ERROR] {e}")
 
 
-# ─── Root route ───────────────────────────────────────────────────────────────
+# âââ Root route âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 
 @app.route("/")
 def index():
@@ -116,7 +116,7 @@ def index():
     })
 
 
-# ─── Routes (all mounted under SCANNER_BASE by blueprint) ─────────────────────
+# âââ Routes (all mounted under SCANNER_BASE by blueprint) âââââââââââââââââââââ
 
 @bp.route("/api/scan/start", methods=["POST"])
 def start_scan():
@@ -309,7 +309,37 @@ def health():
 
 app.register_blueprint(bp, url_prefix=SCANNER_BASE)
 
+  # ─── Serve built React frontend ───────────────────────────────────────────────
+  from flask import send_from_directory as _send_from_directory
+
+  FRONTEND_DIST = SCANNER_ROOT.parent / "artifacts" / "vulnscan" / "dist" / "public"
+
+  if FRONTEND_DIST.exists():
+      @app.route("/", defaults={"path": ""})
+      @app.route("/<path:path>")
+      def serve_frontend(path):
+          # Let the blueprint handle /scanner-api routes
+          if path.startswith("scanner-api"):
+              from flask import abort
+              abort(404)
+          static_file = FRONTEND_DIST / path
+          if path and static_file.exists() and static_file.is_file():
+              return _send_from_directory(str(FRONTEND_DIST), path)
+          # Fall back to index.html for React client-side routing
+          return _send_from_directory(str(FRONTEND_DIST), "index.html")
+  else:
+      @app.route("/")
+      def index():
+          return jsonify({
+              "name":    "Mirror Security Scanner API",
+              "status":  "running",
+              "base":    SCANNER_BASE,
+              "health":  f"{SCANNER_BASE}/api/health",
+              "modules": list(MODULE_PATHS.keys()),
+              "note":    "Frontend not built yet. Run: cd artifacts/vulnscan && npm install && npm run build",
+          })
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
-    print(f"[*] Scanner API → http://0.0.0.0:{port}{SCANNER_BASE}/api/health")
+    print(f"[*] Scanner API â http://0.0.0.0:{port}{SCANNER_BASE}/api/health")
     app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
