@@ -29,3 +29,15 @@ to = "/index.html"
 [services.env]
 PORT = "25957"
 BASE_PATH = "/"
+
+[[services]]
+name = "scanner-api"
+paths = [ "/scanner-api" ]
+localPort = 8000
+
+[services.development]
+run = "bash -c 'cd /home/runner/workspace && python scanner/app.py'"
+
+[services.env]
+PORT = "8000"
+SCANNER_BASE = "/scanner-api"

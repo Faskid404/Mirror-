@@ -43,16 +43,15 @@ function Sidebar() {
         {NAV.map(({ href, label, icon: Icon }) => {
           const active = href === "/" ? loc === "/" : loc.startsWith(href);
           return (
-            <Link key={href} href={href}>
-              <a className={`flex items-center gap-2.5 px-3 py-2 rounded-md text-sm transition-colors
+            <Link key={href} href={href}
+              className={`flex items-center gap-2.5 px-3 py-2 rounded-md text-sm transition-colors
                 ${active
                   ? "bg-sidebar-primary/15 text-sidebar-primary border border-sidebar-primary/20"
                   : "text-sidebar-foreground hover:bg-sidebar-accent hover:text-sidebar-accent-foreground"
                 }`}>
-                <Icon className="w-4 h-4 shrink-0" />
-                {label}
-                {active && <ChevronRight className="w-3 h-3 ml-auto" />}
-              </a>
+              <Icon className="w-4 h-4 shrink-0" />
+              {label}
+              {active && <ChevronRight className="w-3 h-3 ml-auto" />}
             </Link>
           );
         })}
