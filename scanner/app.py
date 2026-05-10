@@ -316,6 +316,25 @@ if FRONTEND_DIST.exists():
             return _send_from_directory(str(FRONTEND_DIST), path)
         return _send_from_directory(str(FRONTEND_DIST), 'index.html')
 
+# Keep-alive: ping health endpoint every 14 min to prevent Render free-tier sleep
+def _start_keepalive():
+    import threading, time, urllib.request
+    def _ping():
+        time.sleep(60)  # let gunicorn finish starting
+        while True:
+            try:
+                _port = int(os.environ.get("PORT", 8000))
+                urllib.request.urlopen(
+                    f"http://localhost:{_port}{SCANNER_BASE}/api/health",
+                    timeout=10
+                )
+            except Exception:
+                pass
+            time.sleep(840)  # 14 minutes
+    threading.Thread(target=_ping, daemon=True).start()
+
+_start_keepalive()
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     print(f"[*] Scanner API Ã¢ÂÂ http://0.0.0.0:{port}{SCANNER_BASE}/api/health")
