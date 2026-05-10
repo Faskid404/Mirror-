@@ -10,7 +10,7 @@ from pathlib import Path
 from flask import Flask, request, jsonify, Blueprint
 from flask_cors import CORS
 
-# âââ Setup ââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+# Ã¢ÂÂÃ¢ÂÂÃ¢ÂÂ Setup Ã¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂ
 SCANNER_ROOT = Path(__file__).parent.resolve()
 MODULES_DIR  = SCANNER_ROOT / "modules"
 REPORTS_DIR  = SCANNER_ROOT / "reports"
@@ -103,20 +103,10 @@ def run_module(job_id, abs_path, target):
             JOBS[job_id]["output"].append(f"[ERROR] {e}")
 
 
-# âââ Root route âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
-
-@app.route("/")
-def index():
-    return jsonify({
-        "name":    "Mirror Security Scanner API",
-        "status":  "running",
-        "base":    SCANNER_BASE,
-        "health":  f"{SCANNER_BASE}/api/health",
-        "modules": list(MODULE_PATHS.keys()),
-    })
+# Ã¢ÂÂÃ¢ÂÂÃ¢ÂÂ Root route Ã¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂ
 
 
-# âââ Routes (all mounted under SCANNER_BASE by blueprint) âââââââââââââââââââââ
+# Ã¢ÂÂÃ¢ÂÂÃ¢ÂÂ Routes (all mounted under SCANNER_BASE by blueprint) Ã¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂ
 
 @bp.route("/api/scan/start", methods=["POST"])
 def start_scan():
@@ -325,13 +315,8 @@ if FRONTEND_DIST.exists():
         if path and static_file.exists() and static_file.is_file():
             return _send_from_directory(str(FRONTEND_DIST), path)
         return _send_from_directory(str(FRONTEND_DIST), 'index.html')
-else:
-    @app.route('/')
-    def index():
-        return jsonify({'name': 'Mirror Scanner API', 'status': 'running'})
-
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
-    print(f"[*] Scanner API â http://0.0.0.0:{port}{SCANNER_BASE}/api/health")
+    print(f"[*] Scanner API Ã¢ÂÂ http://0.0.0.0:{port}{SCANNER_BASE}/api/health")
     app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
