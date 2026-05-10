@@ -530,69 +530,323 @@ for _cve, _major, _build, _desc, _chain in SHAREPOINT_CVES:
 # ─── Detection engine ─────────────────────────────────────────────────────────
 
 class CVEProbe:
-    # ── Evasion strategy definitions ─────────────────────────────────────────
+    # ── Path mutation helpers ─────────────────────────────────────────────────
+    @staticmethod
+    def _unicode_slash(p):
+        """Replace / with fullwidth Unicode slash %ef%bc%8f — bypasses regex WAF rules."""
+        return p.replace("/", "%ef%bc%8f", 1) if p.count("/") > 1 else p
+
+    @staticmethod
+    def _overlong_utf8(p):
+        """Overlong UTF-8 encoding: / → %c0%af  . → %c0%ae (bypasses older WAF decoders)."""
+        return p.replace("/", "%c0%af").replace(".", "%c0%ae")
+
+    @staticmethod
+    def _semicolon_inject(p):
+        """Java/Tomcat semicolon injection: /admin/page → /admin;x=y/page (Spring, Tomcat, JBoss)."""
+        parts = p.split("/")
+        if len(parts) > 2:
+            parts[1] = parts[1] + ";x=y"
+        return "/".join(parts)
+
+    @staticmethod
+    def _iis_backslash(p):
+        """IIS backslash confusion: /path/to → /path\\to (IIS normalises \\ to /)."""
+        return p.replace("/", "\\", 1) if p.count("/") > 1 else p
+
+    @staticmethod
+    def _double_slash(p):
+        """Double-slash: /path → //path — Apache/Nginx normalise away the extra slash, WAF may not."""
+        return "/" + p if p.startswith("/") else p
+
+    @staticmethod
+    def _tab_inject(p):
+        """Tab character injection: some WAFs split on whitespace, servers ignore %09."""
+        return p.replace("/", "/%09", 1) if "/" in p else p
+
+    @staticmethod
+    def _dot_segment(p):
+        """Dot-segment normalisation bypass: /a/b → /a/./b (RFC 3986 normalises, WAF may not)."""
+        parts = p.split("/")
+        if len(parts) > 2:
+            parts.insert(2, ".")
+        return "/".join(parts)
+
+    @staticmethod
+    def _triple_encode(p):
+        """Triple URL encode slashes: / → %25252f (WAF decodes once, server decodes three times)."""
+        return p.replace("/", "%25252f").replace(".", "%25252e")
+
+    @staticmethod
+    def _x_rewrite(p):
+        """Return path unchanged — evasion is in headers (X-Original-URL / X-Rewrite-URL)."""
+        return "/"
+
+    # ── Evasion strategy definitions (25 real-world techniques) ──────────────
     EVASION_STRATEGIES = [
-        # 0: baseline — no evasion
-        {"label": "baseline", "headers": {}, "path_fn": lambda p: p},
+        # ── GROUP 1: Baseline ────────────────────────────────────────────────
+        {
+            "label": "baseline",
+            "headers": {},
+            "path_fn": lambda p: p,
+        },
 
-        # 1: WAF IP spoof — pretend request originates from localhost
-        {"label": "ip_spoof", "headers": {
-            "X-Forwarded-For":        "127.0.0.1",
-            "X-Real-IP":              "127.0.0.1",
-            "X-Originating-IP":       "127.0.0.1",
-            "X-Remote-Addr":          "127.0.0.1",
-            "X-Client-IP":            "127.0.0.1",
-            "X-Host":                 "127.0.0.1",
-            "X-Custom-IP-Authorization": "127.0.0.1",
-        }, "path_fn": lambda p: p},
+        # ── GROUP 2: IP / Origin Spoofing ────────────────────────────────────
+        {
+            "label": "ip_spoof_localhost",
+            "headers": {
+                "X-Forwarded-For":           "127.0.0.1",
+                "X-Real-IP":                 "127.0.0.1",
+                "X-Originating-IP":          "127.0.0.1",
+                "X-Remote-Addr":             "127.0.0.1",
+                "X-Client-IP":               "127.0.0.1",
+                "X-Host":                    "127.0.0.1",
+                "X-Custom-IP-Authorization": "127.0.0.1",
+                "X-ProxyUser-Ip":            "127.0.0.1",
+                "Client-IP":                 "127.0.0.1",
+                "Forwarded":                 "for=127.0.0.1;proto=https;by=127.0.0.1",
+            },
+            "path_fn": lambda p: p,
+        },
+        {
+            "label": "ip_spoof_private",
+            "headers": {
+                "X-Forwarded-For": "10.0.0.1, 172.16.0.1, 192.168.1.1",
+                "X-Real-IP":       "192.168.0.1",
+                "X-Cluster-Client-IP": "10.10.10.10",
+                "True-Client-IP":  "10.0.0.1",
+                "CF-Connecting-IP":"10.0.0.1",
+            },
+            "path_fn": lambda p: p,
+        },
 
-        # 2: URL-encoded path — single %2f encoding on slashes
-        {"label": "url_encode", "headers": {}, "path_fn": lambda p: quote(p, safe=":?=&@!")},
+        # ── GROUP 3: CDN / Reverse-Proxy Header Bypass ───────────────────────
+        {
+            "label": "cdn_cloudflare_bypass",
+            "headers": {
+                "CF-Connecting-IP": "127.0.0.1",
+                "CF-IPCountry":     "US",
+                "CF-RAY":           "0000000000000000-IAD",
+                "CF-Visitor":       '{"scheme":"https"}',
+                "CF-Worker":        "bypass",
+                "X-Forwarded-For":  "127.0.0.1",
+            },
+            "path_fn": lambda p: p,
+        },
+        {
+            "label": "cdn_akamai_bypass",
+            "headers": {
+                "True-Client-IP":    "127.0.0.1",
+                "Akamai-Origin-Hop": "1",
+                "X-Check-Cacheable": "YES",
+                "X-Forwarded-For":   "127.0.0.1",
+                "X-Akamai-Edgescape": "georegion=246,country_code=US,city=ASHBURN",
+            },
+            "path_fn": lambda p: p,
+        },
+        {
+            "label": "cdn_fastly_bypass",
+            "headers": {
+                "Fastly-Client-IP":   "127.0.0.1",
+                "Fastly-FF":          "cache-iad-dulles1234-IAD",
+                "X-Forwarded-Server": "localhost",
+                "X-Forwarded-For":    "127.0.0.1",
+            },
+            "path_fn": lambda p: p,
+        },
 
-        # 3: Double URL encoding — %252f style
-        {"label": "double_encode", "headers": {}, "path_fn": lambda p: p.replace("/", "%252f").replace("..", "%252e%252e") if "/" in p else p},
+        # ── GROUP 4: Host / URL Rewrite Injection ────────────────────────────
+        {
+            "label": "x_original_url",
+            "headers": {
+                "X-Original-URL":  "_PROBE_PATH_",
+                "X-Rewrite-URL":   "_PROBE_PATH_",
+                "X-Forwarded-For": "127.0.0.1",
+            },
+            "path_fn": lambda p: "/",
+        },
+        {
+            "label": "forwarded_host_inject",
+            "headers": {
+                "X-Forwarded-Host":   "localhost",
+                "X-Forwarded-Proto":  "https",
+                "X-Forwarded-Scheme": "https",
+                "X-Forwarded-Port":   "443",
+            },
+            "path_fn": lambda p: p,
+        },
 
-        # 4: Case confusion — uppercase the path (works on case-insensitive servers)
-        {"label": "case_upper", "headers": {}, "path_fn": lambda p: p.upper() if p not in ["/", ""] else p},
+        # ── GROUP 5: Path Encoding Tricks ────────────────────────────────────
+        {
+            "label": "url_encode_single",
+            "headers": {},
+            "path_fn": lambda p: quote(p, safe=":?=&@!"),
+        },
+        {
+            "label": "double_url_encode",
+            "headers": {},
+            "path_fn": lambda p: p.replace("/", "%252f").replace(".", "%252e"),
+        },
+        {
+            "label": "triple_url_encode",
+            "headers": {},
+            "path_fn": lambda p: p.replace("/", "%25252f").replace(".", "%25252e"),
+        },
+        {
+            "label": "overlong_utf8",
+            "headers": {},
+            "path_fn": lambda p: p.replace("/", "%c0%af").replace(".", "%c0%ae"),
+        },
+        {
+            "label": "unicode_fullwidth_slash",
+            "headers": {},
+            "path_fn": lambda p: p.replace("/", "%ef%bc%8f", 1) if p.count("/") > 1 else p,
+        },
 
-        # 5: Path traversal prefix — prepend /./ to confuse normalisation
-        {"label": "dot_slash", "headers": {}, "path_fn": lambda p: "/." + p if p.startswith("/") else p},
+        # ── GROUP 6: Path Structure Confusion ────────────────────────────────
+        {
+            "label": "double_slash",
+            "headers": {},
+            "path_fn": lambda p: "/" + p if p.startswith("/") else p,
+        },
+        {
+            "label": "dot_segment",
+            "headers": {},
+            "path_fn": lambda p: p.replace("/", "/./", 1) if p.count("/") > 1 else p,
+        },
+        {
+            "label": "dot_slash_prefix",
+            "headers": {},
+            "path_fn": lambda p: "/." + p if p.startswith("/") else p,
+        },
+        {
+            "label": "null_byte",
+            "headers": {},
+            "path_fn": lambda p: p + "%00",
+        },
+        {
+            "label": "tab_inject",
+            "headers": {},
+            "path_fn": lambda p: p.replace("/", "/%09", 1) if "/" in p else p,
+        },
 
-        # 6: Null-byte suffix — some WAFs stop parsing at null byte
-        {"label": "null_suffix", "headers": {}, "path_fn": lambda p: p + "%00"},
+        # ── GROUP 7: Server-Specific Bypasses ────────────────────────────────
+        {
+            "label": "iis_backslash",
+            "headers": {},
+            "path_fn": lambda p: p.replace("/", "\\", 1) if p.count("/") > 1 else p,
+        },
+        {
+            "label": "tomcat_semicolon",
+            "headers": {},
+            "path_fn": lambda p: (
+                "/".join([parts[0]] + [parts[1] + ";jsessionid=x"] + parts[2:])
+                if len(parts := p.split("/")) > 2 else p
+            ),
+        },
+        {
+            "label": "spring_actuator_bypass",
+            "headers": {},
+            "path_fn": lambda p: (
+                "/".join([parts[0]] + [parts[1] + ";a=b"] + parts[2:])
+                if len(parts := p.split("/")) > 2 else p
+            ),
+        },
+        {
+            "label": "mixed_case_path",
+            "headers": {},
+            "path_fn": lambda p: "".join(
+                c.upper() if i % 2 == 0 else c.lower() for i, c in enumerate(p)
+            ),
+        },
 
-        # 7: Random case mix — alternate upper/lower chars
-        {"label": "mixed_case", "headers": {}, "path_fn": lambda p: "".join(
-            c.upper() if i % 2 == 0 else c.lower() for i, c in enumerate(p))},
+        # ── GROUP 8: HTTP Method / Protocol Confusion ────────────────────────
+        {
+            "label": "method_override",
+            "headers": {
+                "X-HTTP-Method-Override": "GET",
+                "X-Method-Override":      "GET",
+                "X-HTTP-Method":          "GET",
+            },
+            "path_fn": lambda p: p,
+        },
+        {
+            "label": "http10_keepalive_kill",
+            "headers": {
+                "Connection":      "close",
+                "Pragma":          "no-cache",
+                "Cache-Control":   "no-store",
+                "Accept-Encoding": "identity",
+            },
+            "path_fn": lambda p: p,
+        },
 
-        # 8: Full WAF bypass header pack with encoded path
-        {"label": "full_bypass", "headers": {
-            "X-Forwarded-For":      "127.0.0.1",
-            "X-Real-IP":            "127.0.0.1",
-            "X-Originating-IP":     "127.0.0.1",
-            "X-WAF-Bypass":         "1",
-            "X-Bypass":             "true",
-            "Forwarded":            "for=127.0.0.1;proto=https",
-            "Via":                  "1.1 trusted-proxy",
-            "CF-Connecting-IP":     "127.0.0.1",
-            "True-Client-IP":       "127.0.0.1",
-        }, "path_fn": lambda p: quote(p, safe=":?=&@!")},
+        # ── GROUP 9: Referer / Content-Type Spoofing ─────────────────────────
+        {
+            "label": "internal_referer",
+            "headers": {
+                "Referer":    "https://localhost/admin/",
+                "Origin":     "https://localhost",
+                "X-Forwarded-For": "127.0.0.1",
+            },
+            "path_fn": lambda p: p,
+        },
+        {
+            "label": "content_type_confusion",
+            "headers": {
+                "Content-Type": "application/x-www-form-urlencoded; charset=utf-7",
+                "Accept":       "*/*;q=0.1, text/html",
+            },
+            "path_fn": lambda p: p,
+        },
 
-        # 9: HTTP/1.0 downgrade via header (some WAFs inspect HTTP version)
-        {"label": "http10_downgrade", "headers": {
-            "Connection": "close",
-            "Pragma":     "no-cache",
-        }, "path_fn": lambda p: p},
+        # ── GROUP 10: Full combined nuclear bypass ───────────────────────────
+        {
+            "label": "nuclear_bypass",
+            "headers": {
+                "X-Forwarded-For":           "127.0.0.1",
+                "X-Real-IP":                 "127.0.0.1",
+                "X-Originating-IP":          "127.0.0.1",
+                "X-Remote-Addr":             "127.0.0.1",
+                "True-Client-IP":            "127.0.0.1",
+                "CF-Connecting-IP":          "127.0.0.1",
+                "X-Custom-IP-Authorization": "127.0.0.1",
+                "X-Forwarded-Host":          "localhost",
+                "X-Forwarded-Proto":         "https",
+                "X-Forwarded-Scheme":        "https",
+                "X-Forwarded-Port":          "443",
+                "Referer":                   "https://localhost/",
+                "Origin":                    "https://localhost",
+                "X-WAF-Bypass":              "true",
+                "X-Bypass":                  "1",
+                "Forwarded":                 "for=127.0.0.1;proto=https;by=127.0.0.1",
+                "Via":                       "1.1 trusted-internal-proxy",
+                "CF-RAY":                    "0000000000000000-IAD",
+                "CF-IPCountry":              "US",
+            },
+            "path_fn": lambda p: quote(p, safe=":?=&@!"),
+        },
     ]
 
     USER_AGENTS = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+        # Real browser UAs
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36 Edg/123.0.0.0",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Safari/605.1.15",
         "Mozilla/5.0 (X11; Linux x86_64; rv:125.0) Gecko/20100101 Firefox/125.0",
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Mobile/15E148 Safari/604.1",
+        # Crawlers / scanners that WAFs often whitelist
         "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+        "Mozilla/5.0 (compatible; bingbot/2.0; +http://www.bing.com/bingbot.htm)",
+        "Mozilla/5.0 (compatible; YandexBot/3.0; +http://yandex.com/bots)",
+        "Wget/1.21.4",
         "curl/8.7.1",
         "python-requests/2.31.0",
         "Go-http-client/1.1",
+        "Apache-HttpClient/4.5.14 (Java/17)",
+        # Security tools that are sometimes allowed through internal WAFs
+        "Nikto/2.1.6",
+        "OpenVAS/22.4",
     ]
 
     def __init__(self, target, use_evasion=True):
@@ -631,13 +885,18 @@ class CVEProbe:
         strategies = self.EVASION_STRATEGIES if self.use_evasion else self.EVASION_STRATEGIES[:1]
 
         for strat in strategies:
-            evasion_hdrs = {
-                "User-Agent": random.choice(self.USER_AGENTS),
-                **strat["headers"],
-                **probe_hdrs,
-            }
             path = strat["path_fn"](base_path)
             url  = self.target + path
+            # resolve _PROBE_PATH_ sentinel — used by x_original_url strategy
+            resolved_strat_hdrs = {
+                k: (base_path if v == "_PROBE_PATH_" else v)
+                for k, v in strat["headers"].items()
+            }
+            evasion_hdrs = {
+                "User-Agent": random.choice(self.USER_AGENTS),
+                **resolved_strat_hdrs,
+                **probe_hdrs,
+            }
 
             status, body_text = await self._request(sess, method, url, evasion_hdrs, body)
             if status is None:
