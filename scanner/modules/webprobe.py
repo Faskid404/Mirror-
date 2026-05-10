@@ -4,8 +4,11 @@ import aiohttp
 import json
 import re
 import time
+import sys
 from pathlib import Path
 from urllib.parse import urlparse, quote
+
+sys.path.insert(0, str(Path(__file__).parent))
 from smart_filter import (
     build_baseline_404, is_likely_real_vuln, is_reflected,
     confidence_score, confidence_label, severity_from_confidence,
