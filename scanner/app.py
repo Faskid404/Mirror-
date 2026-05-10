@@ -14,13 +14,16 @@ from flask_cors import CORS
 SCANNER_ROOT = Path(__file__).parent.resolve()
 MODULES_DIR  = SCANNER_ROOT / "modules"
 REPORTS_DIR  = SCANNER_ROOT / "reports"
-SCANNER_BASE = os.environ.get("SCANNER_BASE", "/scanner-api")  # proxy prefix
+SCANNER_BASE = os.environ.get("SCANNER_BASE", "/scanner-api")
+
+# Ensure reports directory exists at startup
+REPORTS_DIR.mkdir(exist_ok=True)
 
 app = Flask(__name__)
 CORS(app, origins="*")
 
-bp       = Blueprint("scanner", __name__)
-JOBS     = {}
+bp        = Blueprint("scanner", __name__)
+JOBS      = {}
 JOBS_LOCK = threading.Lock()
 
 
@@ -53,12 +56,12 @@ MODULE_PATHS = {
 
 def run_module(job_id, abs_path, target):
     with JOBS_LOCK:
-        job = JOBS[job_id]
-    job["status"] = "running"
-    job["output"] = []
-    job["findings"] = []
+        JOBS[job_id]["status"] = "running"
+        JOBS[job_id]["output"] = []
+        JOBS[job_id]["findings"] = []
+
     try:
-        env  = _make_env(target)
+        env = _make_env(target)
         REPORTS_DIR.mkdir(exist_ok=True)
         (REPORTS_DIR / "_target.txt").write_text(target)
 
@@ -67,26 +70,50 @@ def run_module(job_id, abs_path, target):
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, env=env, cwd=str(SCANNER_ROOT), bufsize=1,
         )
-        job["pid"] = proc.pid
+        with JOBS_LOCK:
+            JOBS[job_id]["pid"] = proc.pid
+
         for line in proc.stdout:
             line = line.rstrip()
             if line:
-                job["output"].append(line)
+                with JOBS_LOCK:
+                    JOBS[job_id]["output"].append(line)
+
         proc.wait()
-        job["returncode"] = proc.returncode
+
+        with JOBS_LOCK:
+            JOBS[job_id]["returncode"] = proc.returncode
 
         report_file = REPORTS_DIR / f"{Path(abs_path).stem}.json"
         if report_file.exists():
             try:
                 data = json.loads(report_file.read_text())
-                job["findings"] = data if isinstance(data, list) else []
+                with JOBS_LOCK:
+                    JOBS[job_id]["findings"] = data if isinstance(data, list) else []
             except Exception:
                 pass
-        job["status"] = "done"
+
+        with JOBS_LOCK:
+            JOBS[job_id]["status"] = "done"
+
     except Exception as e:
-        job["status"] = "error"
-        job["error"]  = str(e)
-        job["output"].append(f"[ERROR] {e}")
+        with JOBS_LOCK:
+            JOBS[job_id]["status"] = "error"
+            JOBS[job_id]["error"]  = str(e)
+            JOBS[job_id]["output"].append(f"[ERROR] {e}")
+
+
+# ─── Root route ───────────────────────────────────────────────────────────────
+
+@app.route("/")
+def index():
+    return jsonify({
+        "name":    "Mirror Security Scanner API",
+        "status":  "running",
+        "base":    SCANNER_BASE,
+        "health":  f"{SCANNER_BASE}/api/health",
+        "modules": list(MODULE_PATHS.keys()),
+    })
 
 
 # ─── Routes (all mounted under SCANNER_BASE by blueprint) ─────────────────────
@@ -196,21 +223,28 @@ def stop_scan(job_id):
         job = JOBS.get(job_id)
     if not job:
         return jsonify({"error": "Job not found"}), 404
-    job["stopped"] = True
-    job["status"]  = "stopped"
+    with JOBS_LOCK:
+        JOBS[job_id]["stopped"] = True
+        JOBS[job_id]["status"]  = "stopped"
     return jsonify({"status": "stopped"})
 
 
 @bp.route("/api/reports", methods=["GET"])
 def list_reports():
     reports = []
+    if not REPORTS_DIR.exists():
+        return jsonify(reports)
     for f in REPORTS_DIR.glob("*.json"):
         if f.name.startswith("_"):
             continue
         try:
             data = json.loads(f.read_text())
-            reports.append({"file": f.name, "count": len(data) if isinstance(data, list) else 0,
-                            "size": f.stat().st_size, "modified": f.stat().st_mtime})
+            reports.append({
+                "file": f.name,
+                "count": len(data) if isinstance(data, list) else 0,
+                "size": f.stat().st_size,
+                "modified": f.stat().st_mtime,
+            })
         except Exception:
             pass
     return jsonify(reports)
@@ -221,14 +255,18 @@ def get_report(name):
     p = REPORTS_DIR / name
     if not p.exists():
         return jsonify({"error": "Not found"}), 404
-    return jsonify(json.loads(p.read_text()))
+    try:
+        return jsonify(json.loads(p.read_text()))
+    except Exception as e:
+        return jsonify({"error": f"Failed to read report: {e}"}), 500
 
 
 @bp.route("/api/cves", methods=["GET"])
 def list_cves():
     try:
         sys.path.insert(0, str(MODULES_DIR))
-        import importlib, cveprobe
+        import importlib
+        import cveprobe
         importlib.reload(cveprobe)
         probes = cveprobe.CVE_PROBES
         platform_filter = request.args.get("platform", "").lower()
@@ -247,7 +285,8 @@ def list_cves():
 def list_chains():
     try:
         sys.path.insert(0, str(MODULES_DIR))
-        import importlib, rootchain
+        import importlib
+        import rootchain
         importlib.reload(rootchain)
         return jsonify({
             "total":  len(rootchain.NAMED_CHAINS),
@@ -271,7 +310,6 @@ def health():
 app.register_blueprint(bp, url_prefix=SCANNER_BASE)
 
 if __name__ == "__main__":
-    REPORTS_DIR.mkdir(exist_ok=True)
     port = int(os.environ.get("PORT", 8000))
     print(f"[*] Scanner API → http://0.0.0.0:{port}{SCANNER_BASE}/api/health")
     app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
