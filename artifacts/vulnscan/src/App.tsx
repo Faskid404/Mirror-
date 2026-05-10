@@ -2,6 +2,7 @@ import { Switch, Route, Router as WouterRouter, Link, useLocation } from "wouter
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { Toaster } from "@/components/ui/toaster";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { PasswordGate } from "@/components/PasswordGate";
 import Dashboard    from "@/pages/Dashboard";
 import CVEScanner   from "@/pages/CVEScanner";
 import AttackChains from "@/pages/AttackChains";
@@ -96,10 +97,12 @@ export default function App() {
   return (
     <QueryClientProvider client={queryClient}>
       <TooltipProvider>
-        <WouterRouter base={import.meta.env.BASE_URL.replace(/\/$/, "")}>
-          <Router />
-        </WouterRouter>
-        <Toaster />
+        <PasswordGate>
+          <WouterRouter base={import.meta.env.BASE_URL.replace(/\/$/, "")}>
+            <Router />
+          </WouterRouter>
+          <Toaster />
+        </PasswordGate>
       </TooltipProvider>
     </QueryClientProvider>
   );
