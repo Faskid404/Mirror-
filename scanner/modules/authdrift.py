@@ -5,7 +5,10 @@ import hashlib
 import json
 import os
 import re
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent))
 from smart_filter import REQUEST_DELAY, confidence_score, confidence_label, severity_from_confidence, is_demo_value
 
 DEFAULT_PATHS = [
