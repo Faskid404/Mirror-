@@ -11,7 +11,10 @@ import json
 import re
 from collections import Counter
 from urllib.parse import urljoin
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent))
 from smart_filter import REQUEST_DELAY
 
 WORDLIST = [
