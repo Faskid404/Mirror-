@@ -38,6 +38,9 @@ localPort = 8000
 [services.development]
 run = "bash -c 'cd /home/runner/workspace && python scanner/app.py'"
 
+[services.production]
+run = "bash -c 'cd /home/runner/workspace && gunicorn -w 2 -b 0.0.0.0:$PORT scanner.app:app'"
+
 [services.env]
 PORT = "8000"
 SCANNER_BASE = "/scanner-api"
