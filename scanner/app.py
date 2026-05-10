@@ -304,17 +304,19 @@ app.register_blueprint(bp, url_prefix=SCANNER_BASE)
 from flask import send_from_directory as _send_from_directory
 FRONTEND_DIST = SCANNER_ROOT.parent / 'artifacts' / 'vulnscan' / 'dist' / 'public'
 
-if FRONTEND_DIST.exists():
-    @app.route('/', defaults={'path': ''})
-    @app.route('/<path:path>')
-    def serve_frontend(path):
-        if path.startswith('scanner-api'):
-            from flask import abort
-            abort(404)
-        static_file = FRONTEND_DIST / path
-        if path and static_file.exists() and static_file.is_file():
-            return _send_from_directory(str(FRONTEND_DIST), path)
-        return _send_from_directory(str(FRONTEND_DIST), 'index.html')
+@app.route('/', defaults={'path': ''})
+@app.route('/<path:path>')
+def serve_frontend(path):
+    if path.startswith('scanner-api'):
+        from flask import abort
+        abort(404)
+    if not FRONTEND_DIST.exists():
+        import flask as _f
+        return _f.jsonify({'error': 'Frontend not built', 'path': str(FRONTEND_DIST)}), 503
+    static_file = FRONTEND_DIST / path
+    if path and static_file.exists() and static_file.is_file():
+        return _send_from_directory(str(FRONTEND_DIST), path)
+    return _send_from_directory(str(FRONTEND_DIST), 'index.html')
 
 # Keep-alive: ping health endpoint every 14 min to prevent Render free-tier sleep
 def _start_keepalive():
