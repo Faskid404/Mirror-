@@ -324,3 +324,27 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     print(f"[*] Scanner API → http://0.0.0.0:{port}{SCANNER_BASE}/api/health")
     app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
+
+
+# ─── Serve React frontend static files ────────────────────────────────────────
+from flask import send_from_directory, send_file
+
+STATIC_DIR = SCANNER_ROOT.parent / "artifacts" / "vulnscan" / "dist" / "public"
+
+@app.route("/assets/<path:filename>")
+def static_assets(filename):
+    return send_from_directory(STATIC_DIR / "assets", filename)
+
+@app.route("/", defaults={"path": ""})
+@app.route("/<path:path>")
+def serve_frontend(path):
+    # API routes are handled by the blueprint — don't catch them here
+    if path.startswith(SCANNER_BASE.lstrip("/")):
+        return jsonify({"error": "Not found"}), 404
+    file_path = STATIC_DIR / path
+    if path and file_path.exists() and file_path.is_file():
+        return send_from_directory(STATIC_DIR, path)
+    index = STATIC_DIR / "index.html"
+    if index.exists():
+        return send_file(index)
+    return jsonify({"error": "Frontend not built"}), 404
