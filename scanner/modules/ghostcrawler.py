@@ -8,7 +8,6 @@ v3 critical fixes:
   - Minimum confidence raised to 70 before reporting an admin panel
   - WAF/CDN detection result properly affects what we report
   - Proof requirement: must have body content, not just a status code
-  - Added proxy support via SCANNER_PROXY env var
 """
 import asyncio
 import aiohttp
@@ -24,7 +23,7 @@ from smart_filter import (
     build_baseline_404, is_truly_accessible, is_likely_real_vuln,
     delay, confidence_score, confidence_label, severity_from_confidence,
     detect_waf, detect_tech, meets_confidence_floor, get_relevant_paths,
-    status_explains_protection, random_ua, PROXY_URL, REQUEST_DELAY
+    status_explains_protection, random_ua, REQUEST_DELAY
 )
 
 MAX_PAGES    = 60
@@ -306,8 +305,6 @@ class GhostCrawler:
         timeout = aiohttp.ClientTimeout(total=60)
         sess_kwargs = {'connector': conn, 'timeout': timeout,
                        'headers': {'User-Agent': random_ua()}}
-        if PROXY_URL:
-            print(f"  [PROXY] Routing through: {PROXY_URL}")
 
         async with aiohttp.ClientSession(**sess_kwargs) as sess:
             print("[*] Building 404 baseline...")
