@@ -301,7 +301,7 @@ def list_chains():
         importlib.reload(rootchain)
         return jsonify({
             "total":  len(rootchain.NAMED_CHAINS),
-            "chains": list(rootchain.NAMED_CHAINS.values()),
+            "chains": [{"id": k, **v} for k, v in rootchain.NAMED_CHAINS.items()],
         })
     except Exception as e:
         return jsonify({"error": str(e), "chains": []}), 500
