@@ -93,8 +93,14 @@ def run_module(job_id, abs_path, target):
         if report_file.exists():
             try:
                 data = json.loads(report_file.read_text())
+                if isinstance(data, list):
+                    findings_list = data
+                elif isinstance(data, dict) and "findings" in data:
+                    findings_list = data["findings"]
+                else:
+                    findings_list = []
                 with JOBS_LOCK:
-                    JOBS[job_id]["findings"] = data if isinstance(data, list) else []
+                    JOBS[job_id]["findings"] = findings_list
             except Exception:
                 pass
 
@@ -246,7 +252,7 @@ def list_reports():
             data = json.loads(f.read_text())
             reports.append({
                 "file": f.name,
-                "count": len(data) if isinstance(data, list) else 0,
+                "count": len(data) if isinstance(data, list) else (len(data.get("findings", [])) if isinstance(data, dict) else 0),
                 "size": f.stat().st_size,
                 "modified": f.stat().st_mtime,
             })
