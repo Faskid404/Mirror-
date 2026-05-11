@@ -13,7 +13,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from smart_filter import (
     build_baseline_404, delay, confidence_score, confidence_label,
     severity_from_confidence, detect_waf, REQUEST_DELAY,
-    is_truly_accessible, meets_confidence_floor, random_ua, PROXY_URL
+    is_truly_accessible, meets_confidence_floor, random_ua
 )
 
 WAF_PROFILES = {
@@ -205,7 +205,6 @@ class WafShatter:
         print("="*60)
         conn = aiohttp.TCPConnector(limit=5, ssl=False)
         async with aiohttp.ClientSession(connector=conn, timeout=aiohttp.ClientTimeout(total=30),
-                proxy=PROXY_URL or None,
                 headers={"User-Agent": random_ua()}) as sess:
             print("[*] Building 404 baseline...")
             self.baseline_404 = await build_baseline_404(sess, self.target)
