@@ -1,10 +1,19 @@
 services:
-    - type: web
-      name: mirror
-      runtime: python
-      buildCommand: pip install -r scanner/requirements.txt && cd artifacts/vulnscan && npm install && npm run build
-      startCommand: cd scanner && gunicorn app:app
-      envVars:
-        - key: NODE_ENV
-          value: production
-  
+  - type: web
+    name: mirror
+    runtime: python
+    buildCommand: >
+      pip install -r scanner/requirements.txt &&
+      cd artifacts/vulnscan &&
+      npm install &&
+      BASE_PATH=/ PORT=3000 npm run build
+    startCommand: cd scanner && gunicorn app:app -c gunicorn.conf.py
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: BASE_PATH
+        value: /
+      - key: PORT
+        value: 10000
+      - key: SCANNER_BASE
+        value: /scanner-api
