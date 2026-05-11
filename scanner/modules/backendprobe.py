@@ -8,7 +8,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from smart_filter import (
     build_baseline_404, is_truly_accessible, is_likely_real_vuln,
     delay, confidence_score, confidence_label, severity_from_confidence,
-    meets_confidence_floor, random_ua, PROXY_URL, REQUEST_DELAY
+    meets_confidence_floor, random_ua, REQUEST_DELAY
 )
 
 EXPOSED_ADMIN_PATHS = [
@@ -127,7 +127,6 @@ class BackendProbe:
         conn = aiohttp.TCPConnector(limit=10, ssl=False)
         async with aiohttp.ClientSession(connector=conn,
                 timeout=aiohttp.ClientTimeout(total=60),
-                proxy=PROXY_URL or None,
                 headers={"User-Agent": random_ua()}) as sess:
             print("[*] Building 404 baseline...")
             self.baseline_404 = await build_baseline_404(sess, self.target)
