@@ -7,7 +7,7 @@ from urllib.parse import urlparse
 sys.path.insert(0, str(Path(__file__).parent))
 from smart_filter import (
     build_baseline_404, delay, confidence_score, confidence_label,
-    severity_from_confidence, meets_confidence_floor, random_ua, PROXY_URL, REQUEST_DELAY
+    severity_from_confidence, meets_confidence_floor, random_ua, REQUEST_DELAY
 )
 
 WEAK_CIPHERS = ['RC4','DES','3DES','NULL','EXPORT','anon','ADH','AECDH','MD5']
@@ -175,7 +175,6 @@ class CryptoHunter:
         conn = aiohttp.TCPConnector(limit=5, ssl=False)
         async with aiohttp.ClientSession(connector=conn,
                 timeout=aiohttp.ClientTimeout(total=30),
-                proxy=PROXY_URL or None,
                 headers={"User-Agent": random_ua()}) as sess:
             print("[*] Building 404 baseline...")
             self.baseline_404 = await build_baseline_404(sess, self.target)
