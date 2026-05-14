@@ -40,18 +40,25 @@ def _make_env(target=""):
 
 
 MODULE_PATHS = {
-    "ghostcrawler": "modules/ghostcrawler.py",
-    "wafshatter":   "modules/wafshatter.py",
-    "headerforge":  "modules/headerforge.py",
-    "timebleed":    "modules/timebleed.py",
-    "authdrift":    "modules/authdrift.py",
-    "tokensniper":  "modules/tokensniper.py",
-    "deeplogic":    "modules/deeplogic.py",
-    "cryptohunter": "modules/cryptohunter.py",
-    "backendprobe": "modules/backendprobe.py",
-    "webprobe":     "modules/webprobe.py",
-    "rootchain":    "modules/rootchain.py",
-    "cveprobe":     "modules/cveprobe.py",
+    # ── Reconnaissance & surface mapping ─────────────────────────────────────
+    "ghostcrawler":  "modules/ghostcrawler.py",
+    "wafshatter":    "modules/wafshatter.py",
+    "headerforge":   "modules/headerforge.py",
+    "timebleed":     "modules/timebleed.py",
+    "tokensniper":   "modules/tokensniper.py",
+    "cryptohunter":  "modules/cryptohunter.py",
+    "webprobe":      "modules/webprobe.py",
+    "cveprobe":      "modules/cveprobe.py",
+    "backendprobe":  "modules/backendprobe.py",
+    # ── Auth & session ────────────────────────────────────────────────────────
+    "authdrift":     "modules/authdrift.py",
+    "deeplogic":     "modules/deeplogic.py",
+    "rootchain":     "modules/rootchain.py",
+    # ── Exploit provers (confirmed PoC) ──────────────────────────────────────
+    "authbypass":    "modules/authbypass.py",
+    "idorhunter":    "modules/idorhunter.py",
+    "ssti_rce":      "modules/ssti_rce.py",
+    "secretharvest": "modules/secretharvest.py",
 }
 
 

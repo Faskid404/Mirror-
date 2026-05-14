@@ -130,34 +130,95 @@ MITRE_MAP = {
 }
 
 
-  def severity_sanity_check(finding: dict) -> dict:
-      """
-      Global false-positive guard: enforce severity caps based on evidence quality.
-      - CRITICAL requires confidence ≥ 95
-      - HIGH requires confidence ≥ 80
-      - Never allow 403/401/302 status alone to produce HIGH/CRITICAL
-      - Server-disclosure findings capped at INFO
-      """
-      sev = finding.get("severity", "INFO")
-      conf = finding.get("confidence", 0)
-      ftype = finding.get("type", "")
+def severity_sanity_check(finding: dict) -> dict:
+    """
+    Global false-positive guard: enforce severity caps based on evidence quality.
+    - CRITICAL requires confidence >= 95
+    - HIGH requires confidence >= 75
+    - Never allow 403/401/302 status alone to produce HIGH/CRITICAL
+    - Server-disclosure findings capped at INFO
+    """
+    sev   = finding.get("severity", "INFO")
+    conf  = finding.get("confidence", 0)
+    ftype = finding.get("type", "")
 
-      # Disclosure-only findings — cap at INFO
-      DISCLOSURE_TYPES = {
-          "SERVER_VERSION_DISCLOSURE", "SERVER_DISCLOSURE", "DNS_RESOLVED_IP",
-          "ENDPOINT_DISCOVERED", "RATE_LIMIT_ACTIVE",
-      }
-      if ftype in DISCLOSURE_TYPES and sev in ("HIGH", "CRITICAL", "MEDIUM"):
-          finding["severity"] = "INFO"
-          return finding
+    DISCLOSURE_TYPES = {
+        "SERVER_VERSION_DISCLOSURE", "SERVER_DISCLOSURE", "DNS_RESOLVED_IP",
+        "ENDPOINT_DISCOVERED", "RATE_LIMIT_ACTIVE",
+    }
+    if ftype in DISCLOSURE_TYPES and sev in ("HIGH", "CRITICAL", "MEDIUM"):
+        finding["severity"] = "INFO"
+        return finding
 
-      # CRITICAL requires very high confidence
-      if sev == "CRITICAL" and conf < 95:
-          finding["severity"] = "HIGH"
+    if sev == "CRITICAL" and conf < 95:
+        finding["severity"] = "HIGH"
 
-      # HIGH requires solid confidence
-      if sev == "HIGH" and conf < 75:
-          finding["severity"] = "MEDIUM"
+    if sev == "HIGH" and conf < 75:
+        finding["severity"] = "MEDIUM"
 
-      return finding
-  
+    return finding
+
+
+# Exploit-dimension metadata defaults per proof_type
+_PROOF_DEFAULTS = {
+    "CODE_EXECUTION": {
+        "exploitability": 10,
+        "impact": "Remote code execution — full server compromise.",
+        "auth_required": False,
+    },
+    "AUTH_BYPASS": {
+        "exploitability": 9,
+        "impact": "Authentication bypassed — protected resources accessible without credentials.",
+        "auth_required": False,
+    },
+    "ACCOUNT_TAKEOVER": {
+        "exploitability": 9,
+        "impact": "Account takeover — attacker gains control of user account.",
+        "auth_required": False,
+    },
+    "UNAUTHORIZED_ACCESS": {
+        "exploitability": 8,
+        "impact": "Unauthorized data access — private data readable without permission.",
+        "auth_required": True,
+    },
+    "SECRET_EXTRACTION": {
+        "exploitability": 10,
+        "impact": "Credentials/secrets exposed — all connected services compromised.",
+        "auth_required": False,
+    },
+    "DATA_MODIFICATION": {
+        "exploitability": 8,
+        "impact": "Data modification — attacker can alter server-side data.",
+        "auth_required": True,
+    },
+    "RECONNAISSANCE": {
+        "exploitability": 4,
+        "impact": "Information disclosure — aids further attacks.",
+        "auth_required": False,
+    },
+}
+
+
+def enrich_finding(finding: dict) -> dict:
+    """
+    Attach exploit-dimension metadata to any finding dict that doesn't already have it.
+    Safe to call on all legacy findings — only fills in missing fields.
+    """
+    proof_type = finding.get("proof_type", "RECONNAISSANCE")
+    defaults   = _PROOF_DEFAULTS.get(proof_type, _PROOF_DEFAULTS["RECONNAISSANCE"])
+
+    if "exploitability" not in finding:
+        finding["exploitability"] = defaults["exploitability"]
+    if "impact" not in finding:
+        finding["impact"] = defaults["impact"]
+    if "auth_required" not in finding:
+        finding["auth_required"] = defaults["auth_required"]
+    if "reproducibility" not in finding:
+        url = finding.get("url", "")
+        finding["reproducibility"] = f"curl -sv '{url}'" if url else "See proof field."
+    if "mitigation_layers" not in finding:
+        finding["mitigation_layers"] = []
+    if "proof_type" not in finding:
+        finding["proof_type"] = "RECONNAISSANCE"
+
+    return severity_sanity_check(finding)

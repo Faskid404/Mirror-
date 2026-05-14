@@ -790,12 +790,18 @@ def generate_html_report(target: str, findings: list, chains=None, meta=None) ->
             icon = MODULE_ICON.get(mod,"🔍")
             mod_btns += f'<button class="fbtn" data-type="mod" data-val="{mod}" onclick="setFilter(this,\'mod\')">{icon} {mod}</button>'
 
+        sev_btns = "".join(
+            f'<button class="fbtn" data-type="sev" data-val="{s}"'
+            f' onclick="setFilter(this,\'sev\')"'
+            f' style="color:{SEV_HEX[s]}">{s}</button>'
+            for s in SEV_ORDER if counts[s]
+        )
         controls = f"""
 <div class="controls">
   <input type="text" id="search" placeholder="🔍 Search findings…" oninput="applyFilters()">
   <div class="filter-grp">
     <button class="fbtn active" data-type="sev" data-val="ALL" onclick="setFilter(this,'sev')">All</button>
-    {''.join(f'<button class="fbtn" data-type="sev" data-val="{s}" onclick="setFilter(this,\'sev\')" style="color:{SEV_HEX[s]}">{s}</button>' for s in SEV_ORDER if counts[s])}
+    {sev_btns}
   </div>
   <div class="filter-grp">{mod_btns}</div>
   <div class="filter-grp">
