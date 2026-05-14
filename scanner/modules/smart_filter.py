@@ -29,7 +29,7 @@ WAF_BYPASS_HEADERS = {
     "Forwarded":         "for=127.0.0.1;proto=https",
 }
 
-CONFIDENCE_FLOOR = 60
+CONFIDENCE_FLOOR = 65  # raised from 60
 
 def random_ua():
     return random.choice(USER_AGENTS)
@@ -128,3 +128,36 @@ MITRE_MAP = {
     "CORS_MISCONFIGURED":("T1557", "Adversary-in-the-Middle"),
     "AUTH_BYPASS":       ("T1078", "Valid Accounts"),
 }
+
+
+  def severity_sanity_check(finding: dict) -> dict:
+      """
+      Global false-positive guard: enforce severity caps based on evidence quality.
+      - CRITICAL requires confidence ≥ 95
+      - HIGH requires confidence ≥ 80
+      - Never allow 403/401/302 status alone to produce HIGH/CRITICAL
+      - Server-disclosure findings capped at INFO
+      """
+      sev = finding.get("severity", "INFO")
+      conf = finding.get("confidence", 0)
+      ftype = finding.get("type", "")
+
+      # Disclosure-only findings — cap at INFO
+      DISCLOSURE_TYPES = {
+          "SERVER_VERSION_DISCLOSURE", "SERVER_DISCLOSURE", "DNS_RESOLVED_IP",
+          "ENDPOINT_DISCOVERED", "RATE_LIMIT_ACTIVE",
+      }
+      if ftype in DISCLOSURE_TYPES and sev in ("HIGH", "CRITICAL", "MEDIUM"):
+          finding["severity"] = "INFO"
+          return finding
+
+      # CRITICAL requires very high confidence
+      if sev == "CRITICAL" and conf < 95:
+          finding["severity"] = "HIGH"
+
+      # HIGH requires solid confidence
+      if sev == "HIGH" and conf < 75:
+          finding["severity"] = "MEDIUM"
+
+      return finding
+  

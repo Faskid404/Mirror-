@@ -345,26 +345,49 @@ class WebProbe:
                 continue
             # Check if poison value is reflected in response
             if poison_value.lower() in (body or "").lower():
+                # ── Stage 2: verify the poisoned value persists in a clean second request ──
+                # Without a second-request cache hit, this is just reflection — not poisoning.
+                await delay(0.5)
+                s2, body2, hdrs2 = await self._get(sess, url)
+                cache_status2 = (
+                    hdrs2.get("X-Cache", hdrs2.get("x-cache", "")) +
+                    hdrs2.get("CF-Cache-Status", hdrs2.get("cf-cache-status", ""))
+                ).lower()
+                age2 = hdrs2.get("age", hdrs2.get("Age", "0"))
+                is_cached = "hit" in cache_status2 or (str(age2).isdigit() and int(age2) > 0)
+                poison_persists = poison_value.lower() in (body2 or "").lower() and is_cached
+
+                if not poison_persists:
+                    print(f"  [SKIP] {poison_header} reflected but NOT cached — no poisoning (just reflection)")
+                    continue
+
                 cache_status = hdrs.get("X-Cache", hdrs.get("x-cache", hdrs.get("CF-Cache-Status", "")))
                 self.findings.append({
-                    "type": "WEB_CACHE_POISONING_INDICATOR",
+                    "type": "WEB_CACHE_POISONING_CONFIRMED",
                     "severity": "HIGH",
-                    "confidence": 72,
-                    "confidence_label": confidence_label(72),
+                    "confidence": 88,
+                    "confidence_label": confidence_label(88),
                     "url": url,
                     "poison_header": poison_header,
                     "poison_value": poison_value,
-                    "cache_status": cache_status,
-                    "proof": f"Header {poison_header}: {poison_value} reflected in HTTP {s} response body — cache poisoning indicator",
-                    "detail": f"Web cache poisoning indicator: {poison_header} value reflected",
+                    "cache_status_on_hit": cache_status2,
+                    "proof": (
+                        f"Stage 1 — {poison_header}: {poison_value} reflected in HTTP {s} response\n"
+                        f"Stage 2 — Second clean request received CACHED response (age={age2}, status={cache_status2})\n"
+                        f"         with poisoned value still present — cache poisoning CONFIRMED"
+                    ),
+                    "detail": (
+                        f"Web cache poisoning confirmed: {poison_header} value persists in cached response. "
+                        f"Any visitor to {url} will receive the poisoned content."
+                    ),
                     "remediation": (
-                        "1. Only include keyed parameters in cache keys. "
-                        "2. Validate/sanitize all headers before including in responses. "
-                        "3. Configure CDN/cache to not cache responses that include user-controlled headers. "
-                        "4. Use Vary header correctly."
+                        "1. Add this header to the cache key (Vary header or cache-key config).\n"
+                        "2. Strip/validate this header before it reaches the application.\n"
+                        "3. Configure CDN to not cache responses containing user-controlled header values.\n"
+                        "4. Review all unkeyed headers in your caching layer."
                     ),
                 })
-                print(f"  [HIGH] Cache poisoning indicator: {poison_header}: {poison_value} reflected")
+                print(f"  [HIGH] CACHE POISONING CONFIRMED: {poison_header}: {poison_value} — persists in cached response")
 
     # ── SRI check ─────────────────────────────────────────────────────────────
 

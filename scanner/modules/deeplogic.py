@@ -230,7 +230,11 @@ class DeepLogic:
                 if s in (200, 201) and body:
                     # Check if negative/zero price was accepted
                     body_lower = body.lower()
-                    if any(kw in body_lower for kw in ["success", "added", "created", "order_id", "checkout"]):
+                    # Require order/purchase confirmation keywords — "success" alone is too vague
+                    if any(kw in body_lower for kw in [
+                        "order_id", "order_number", "purchase", "confirmation",
+                        "receipt", "paid", "amount_paid", "transaction_id", "checkout_complete",
+                    ]):
                         self.findings.append({
                             "type": "PRICE_MANIPULATION",
                             "severity": "CRITICAL",
@@ -281,7 +285,7 @@ class DeepLogic:
 
             # Check for different status codes, body length, or timing
             status_diff = known.get("status") != fake.get("status")
-            body_diff = abs(known.get("body_len", 0) - fake.get("body_len", 0)) > 50
+            body_diff = abs(known.get("body_len", 0) - fake.get("body_len", 0)) > 200  # ≥200b diff = structural (not whitespace/timestamp)
             time_diff = abs(known.get("time", 0) - fake.get("time", 0)) > 0.3
 
             if status_diff or body_diff:

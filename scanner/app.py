@@ -271,6 +271,65 @@ def get_report(name):
         return jsonify({"error": f"Failed to read report: {e}"}), 500
 
 
+@bp.route("/api/reports/<name>/html", methods=["GET"])
+def get_report_html(name):
+    """Return a self-contained HTML report — downloadable on mobile browsers."""
+    p = REPORTS_DIR / name
+    if not p.exists():
+        return jsonify({"error": "Not found"}), 404
+    try:
+        sys.path.insert(0, str(MODULES_DIR))
+        from report_generator import generate_html_report
+        data = json.loads(p.read_text())
+        findings = data if isinstance(data, list) else data.get("findings", [])
+        target   = data.get("target", "Unknown") if isinstance(data, dict) else "Unknown"
+        html     = generate_html_report(target, findings)
+        resp = app.make_response(html)
+        resp.headers["Content-Type"] = "text/html; charset=utf-8"
+        resp.headers["Content-Disposition"] = f'attachment; filename="{name.replace(".json","")}-report.html"'
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
+    except Exception as e:
+        return jsonify({"error": f"Report generation failed: {e}"}), 500
+
+
+@bp.route("/api/reports/combined/html", methods=["GET"])
+def get_combined_html_report():
+    """Merge ALL scan JSON files into one HTML report — ideal for mobile download."""
+    try:
+        sys.path.insert(0, str(MODULES_DIR))
+        from report_generator import generate_html_report
+        all_findings = []
+        target = "Unknown"
+        for f in sorted(REPORTS_DIR.glob("*.json")):
+            if f.name.startswith("_"):
+                continue
+            try:
+                data = json.loads(f.read_text())
+                if isinstance(data, list):
+                    all_findings.extend(data)
+                elif isinstance(data, dict):
+                    all_findings.extend(data.get("findings", []))
+                    if data.get("target"):
+                        target = data["target"]
+            except Exception:
+                pass
+
+        # Read target from _target.txt if available
+        target_file = REPORTS_DIR / "_target.txt"
+        if target_file.exists():
+            target = target_file.read_text().strip()
+
+        html = generate_html_report(target, all_findings)
+        resp = app.make_response(html)
+        resp.headers["Content-Type"] = "text/html; charset=utf-8"
+        resp.headers["Content-Disposition"] = 'attachment; filename="mirror-full-report.html"'
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
+    except Exception as e:
+        return jsonify({"error": f"Combined report failed: {e}"}), 500
+
+
 @bp.route("/api/cves", methods=["GET"])
 def list_cves():
     try:

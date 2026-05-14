@@ -651,16 +651,36 @@ class CVEProbeEngine:
         if not match_body and not status_ok:
             return
 
+        # ── FALSE-POSITIVE FILTER ─────────────────────────────────────────────
+        # Status-only matches (no match_body defined) are unreliable — any server
+        # returning 200/404/400 on a probed path would be flagged regardless of
+        # whether it is actually running the vulnerable software.
+        # REQUIRE: body must contain non-trivial content (>100 bytes) for these.
+        if not match_body:
+            resp_len = len(resp_body or '')
+            if resp_len < 100:
+                # Tiny/empty body = generic server response, skip
+                return
+            # Also skip if body looks like a generic 200 OK / default page
+            body_sample = body_lower[:500]
+            GENERIC_SIGNALS = [
+                "it works", "default page", "welcome to nginx", "welcome to apache",
+                "test page", "index of /", "403 forbidden", "404 not found",
+                "page not found", "coming soon", "under construction",
+            ]
+            if any(sig in body_sample for sig in GENERIC_SIGNALS):
+                return
+
         # Evidence-based confidence
         conf = confidence_score({
             'status_match':    (status_ok, 50),
             'body_match':      (body_ok and bool(match_body), 40),
-            'body_size_ok':    (len(resp_body or '') > 50, 10),
+            'body_size_ok':    (len(resp_body or '') > 100, 10),
         })
 
         # Downgrade if only status matched (no body evidence)
         if not match_body:
-            conf = min(conf, 65)
+            conf = min(conf, 60)  # below smart_filter floor → will be suppressed
 
         sev = severity_from_confidence(probe['severity'], conf)
 

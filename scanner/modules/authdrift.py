@@ -226,9 +226,36 @@ class AuthDrift:
             await delay()
             cookies += self._get_set_cookie(login_hdrs)
 
+        # ── Tracking / analytics cookie allowlist ────────────────────────────────
+        # These cookies are set by third-party SDKs (PerimeterX, Google Analytics,
+        # Facebook, Hotjar, Amplitude) — they have NO security impact on the app.
+        TRACKING_PREFIXES = (
+            "_px", "_ga", "_gid", "_fbp", "_hjid", "__utm", "amp_", "pxvid",
+            "_clsk", "_clck", "AWSALB", "AWSALBCORS", "_dc_gtm",
+            "OptanonConsent", "CookieConsent", "intercom-", "_mkto_trk",
+        )
+
+        def _is_tracking(cname):
+            n = cname.lower()
+            return any(n.startswith(p.lower()) for p in TRACKING_PREFIXES)
+
         for cookie_str in cookies:
             cookie_lower = cookie_str.lower()
             name = cookie_str.split('=')[0].strip()
+
+            # Skip tracking/analytics cookies — not app session cookies
+            if _is_tracking(name):
+                print(f"  [SKIP] Third-party tracking cookie ignored: {name}")
+                continue
+
+            # Only flag cookies that look like session tokens (long random values)
+            # or whose name indicates they hold auth state
+            val_match = re.search(r'=([A-Za-z0-9+/=_\-]{20,})', cookie_str)
+            is_session_like = val_match or any(
+                kw in name.lower() for kw in ['sess', 'auth', 'token', 'sid', 'jwt', 'user']
+            )
+            if not is_session_like:
+                continue
 
             issues = []
             if 'httponly' not in cookie_lower:

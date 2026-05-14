@@ -312,24 +312,45 @@ class BackendProbe:
             await delay(0.05)
             if s is None or s == 404:
                 continue
-            severity = "CRITICAL" if s == 200 else "MEDIUM" if s == 401 else "INFO"
             ct = hdrs.get("content-type", hdrs.get("Content-Type", "")).lower()
-            if s in (200, 401, 403) or (s == 302 and "login" in hdrs.get("location", "").lower()):
-                self.findings.append({
-                    "type": "ADMIN_INTERFACE_FOUND",
-                    "severity": severity,
-                    "confidence": 88,
-                    "confidence_label": confidence_label(88),
-                    "url": url,
-                    "path": path,
-                    "status": s,
-                    "content_type": ct,
-                    "proof": f"HTTP {s} — Admin interface accessible at {path} ({ct[:40]})",
-                    "detail": f"Admin interface found at {path} (HTTP {s})",
-                    "remediation": "Restrict admin interfaces by IP allowlist. Require MFA. Move admin to separate non-public port or subdomain.",
-                    "mitre_technique": "T1133", "mitre_name": "External Remote Services",
-                })
-                print(f"  [{severity}] Admin interface: {path} (HTTP {s})")
+
+            # ── FALSE-POSITIVE FILTER ─────────────────────────────────────────
+            # 403/401 = server is PROTECTING this endpoint — correct behaviour.
+            # 302 to /login = protected correctly. NEVER flag these as findings.
+            # Only flag HTTP 200 responses with confirmed admin content in body.
+            if s not in (200, 201, 204):
+                continue
+
+            body_lower = (body or "").lower()
+            ADMIN_CONTENT_SIGNALS = [
+                "admin", "dashboard", "user management", "phpmyadmin", "swagger",
+                "graphiql", '"users":', '"roles":', '"permissions":', '"email":',
+                "configuration", "audit log", "management console", "control panel",
+                '"id":', '"token":', "session manager", "system info",
+            ]
+            has_admin_content = any(sig in body_lower for sig in ADMIN_CONTENT_SIGNALS)
+            if not has_admin_content and len(body or "") < 300:
+                print(f"  [SKIP] {path} HTTP 200 — no admin content signals ({len(body or '')}b) — soft-404")
+                continue
+
+            self.findings.append({
+                "type": "ADMIN_INTERFACE_OPEN",
+                "severity": "CRITICAL",
+                "confidence": 90,
+                "confidence_label": confidence_label(90),
+                "url": url,
+                "path": path,
+                "status": s,
+                "content_type": ct,
+                "proof": (
+                    f"HTTP {s} at {path} — admin content confirmed in response "
+                    f"({len(body or '')} bytes)\nPreview: {(body or '')[:300]}"
+                ),
+                "detail": f"Admin interface publicly accessible at {path} — no authentication required",
+                "remediation": "Restrict admin endpoints by IP allowlist. Require MFA. Move admin to a non-public port or internal network.",
+                "mitre_technique": "T1133", "mitre_name": "External Remote Services",
+            })
+            print(f"  [CRITICAL] Admin interface OPEN: {path} (HTTP {s})")
 
     # ── Internal service discovery ────────────────────────────────────────────
 
