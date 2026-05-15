@@ -322,11 +322,17 @@ class BackendProbe:
                 continue
 
             body_lower = (body or "").lower()
+            # Require specific high-confidence admin signals only.
+            # Generic words like "admin" appear on virtually every WordPress/CMS
+            # page ("Posted by admin", footer links, etc.) causing massive
+            # false positives. Only flag on unambiguous admin-interface content.
             ADMIN_CONTENT_SIGNALS = [
-                "admin", "dashboard", "user management", "phpmyadmin", "swagger",
-                "graphiql", '"users":', '"roles":', '"permissions":', '"email":',
-                "configuration", "audit log", "management console", "control panel",
-                '"id":', '"token":', "session manager", "system info",
+                "user management", "phpmyadmin", "swagger",
+                "graphiql", '"users":', '"roles":', '"permissions":',
+                "audit log", "management console", "control panel",
+                "session manager", "system info",
+                "wp-admin", "joomla administrator", "drupal admin",
+                '"is_admin":', '"admin_panel"', '"superuser"',
             ]
             has_admin_content = any(sig in body_lower for sig in ADMIN_CONTENT_SIGNALS)
             if not has_admin_content and len(body or "") < 300:
