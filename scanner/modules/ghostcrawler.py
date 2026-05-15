@@ -50,18 +50,18 @@ SENSITIVE_KEYWORDS = [
 
 # Patterns that constitute real data leaks
 BODY_LEAK_PATTERNS = [
-    (r'(?:password|passwd|pwd)\s*[:=]\s*["\'\']?([^\s"\'\']\{4,\})', "PASSWORD_IN_RESPONSE", "CRITICAL"),
-    (r'(?:api[_-]?key|apikey|api_secret)\s*[:=]\s*["\'\']?([A-Za-z0-9\-_]\{20,\})', "API_KEY_IN_RESPONSE", "CRITICAL"),
-    (r'AKIA[0-9A-Z]\{16\}', "AWS_ACCESS_KEY_EXPOSED", "CRITICAL"),
-    (r'(?:aws_secret|aws_access_key)[_-]?(?:id)?\s*[:=]\s*["\'\']?([A-Za-z0-9+/]\{40\})', "AWS_SECRET_KEY_EXPOSED", "CRITICAL"),
-    (r'sk_live_[0-9A-Za-z]\{24,\}', "STRIPE_LIVE_KEY_EXPOSED", "CRITICAL"),
-    (r'ghp_[A-Za-z0-9]\{36\}', "GITHUB_TOKEN_EXPOSED", "CRITICAL"),
-    (r'eyJ[A-Za-z0-9_-]\{20,\}\.[A-Za-z0-9_-]\{10,\}\.[A-Za-z0-9_-]\{10,\}', "JWT_TOKEN_EXPOSED", "HIGH"),
-    (r'"(?:email|username|user_name)"\s*:\s*"([^"@]\{2,\}@[^"]\{2,\})"', "PII_EMAIL_IN_RESPONSE", "HIGH"),
-    (r'(?:mysql_connect|mysqli_|pg_connect|sqlite3_|ORA-\d\{4,\})', "DATABASE_ERROR_LEAK", "HIGH"),
-    (r'(?:mongodb://|postgres://|mysql://|redis://|amqp://)[^\s"\'\']\{8,\}', "DB_CONNECTION_STRING", "CRITICAL"),
+    (r'(?:password|passwd|pwd)\s*[:=]\s*["\']?([^\s"\']{4,})', "PASSWORD_IN_RESPONSE", "CRITICAL"),
+    (r'(?:api[_-]?key|apikey|api_secret)\s*[:=]\s*["\']?([A-Za-z0-9\-_]{20,})', "API_KEY_IN_RESPONSE", "CRITICAL"),
+    (r'AKIA[0-9A-Z]{16}', "AWS_ACCESS_KEY_EXPOSED", "CRITICAL"),
+    (r'(?:aws_secret|aws_access_key)[_-]?(?:id)?\s*[:=]\s*["\']?([A-Za-z0-9+/]{40})', "AWS_SECRET_KEY_EXPOSED", "CRITICAL"),
+    (r'sk_live_[0-9A-Za-z]{24,}', "STRIPE_LIVE_KEY_EXPOSED", "CRITICAL"),
+    (r'gh[ps]_[A-Za-z0-9]{36,}', "GITHUB_TOKEN_EXPOSED", "CRITICAL"),
+    (r'eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}', "JWT_TOKEN_EXPOSED", "HIGH"),
+    (r'"(?:email|username|user_name)"\s*:\s*"([^"@]{2,}@[^"]{2,})"', "PII_EMAIL_IN_RESPONSE", "HIGH"),
+    (r'(?:mysql_connect|mysqli_|pg_connect|sqlite3_|ORA-\d{4,})', "DATABASE_ERROR_LEAK", "HIGH"),
+    (r'(?:mongodb://|postgres://|mysql://|redis://|amqp://)[^\s"\']{8,}', "DB_CONNECTION_STRING", "CRITICAL"),
     (r'(?:stack\s+trace|traceback\s+\(most recent call\)|at com\.|at org\.|at java\.|NullPointerException)', "STACK_TRACE_LEAK", "MEDIUM"),
-    (r'(?:private_key|private key|-----BEGIN (?:RSA|EC|PRIVATE))', "PRIVATE_KEY_EXPOSED", "CRITICAL"),
+    (r'(?:private_key|private key|-----BEGIN (?:RSA|EC|OPENSSH |)PRIVATE KEY)', "PRIVATE_KEY_EXPOSED", "CRITICAL"),
 ]
 
 
