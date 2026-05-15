@@ -1,8 +1,8 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import {
   Shield, Play, Square, AlertTriangle, CheckCircle,
-  Loader2, ChevronDown, ChevronUp, Clock, Download,
+  Loader2, ChevronDown, ChevronUp, Clock, Download, Zap,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -11,25 +11,27 @@ import { useToast } from "@/hooks/use-toast";
 const API = "/scanner-api/api";
 
 const RECON_MODULES = [
-  { id: "ghostcrawler",  label: "GhostCrawler",  desc: "Endpoint & token hunt",    cat: "recon" },
-  { id: "wafshatter",   label: "WAFShatter",     desc: "WAF/CDN bypass",           cat: "recon" },
-  { id: "headerforge",  label: "HeaderForge",    desc: "Security headers",         cat: "recon" },
-  { id: "timebleed",    label: "TimeBleed",      desc: "Timing injection",         cat: "recon" },
-  { id: "authdrift",    label: "AuthDrift",      desc: "Access control",           cat: "recon" },
-  { id: "tokensniper",  label: "TokenSniper",    desc: "JWT & API tokens",         cat: "recon" },
-  { id: "deeplogic",    label: "DeepLogic",      desc: "Business logic",           cat: "recon" },
-  { id: "cryptohunter", label: "CryptoHunter",   desc: "Crypto weaknesses",        cat: "recon" },
-  { id: "backendprobe", label: "BackendProbe",   desc: "Deep backend scan",        cat: "recon" },
-  { id: "webprobe",     label: "WebProbe",       desc: "Web vulnerabilities",      cat: "recon" },
-  { id: "cveprobe",     label: "CVEProbe",       desc: "197 CVE probes",           cat: "recon" },
-  { id: "rootchain",    label: "RootChain",      desc: "Attack chains",            cat: "recon" },
+  { id: "ghostcrawler",  label: "GhostCrawler",  desc: "Endpoint & token hunt"   },
+  { id: "wafshatter",   label: "WAFShatter",     desc: "WAF/CDN bypass"          },
+  { id: "headerforge",  label: "HeaderForge",    desc: "Security headers"        },
+  { id: "timebleed",    label: "TimeBleed",      desc: "Timing injection"        },
+  { id: "authdrift",    label: "AuthDrift",      desc: "Access control"          },
+  { id: "tokensniper",  label: "TokenSniper",    desc: "JWT & API tokens"        },
+  { id: "deeplogic",    label: "DeepLogic",      desc: "Business logic"          },
+  { id: "cryptohunter", label: "CryptoHunter",   desc: "Crypto weaknesses"       },
+  { id: "backendprobe", label: "BackendProbe",   desc: "Deep backend scan"       },
+  { id: "webprobe",     label: "WebProbe",       desc: "Web vulnerabilities"     },
+  { id: "cveprobe",     label: "CVEProbe",       desc: "197 CVE probes"          },
+  { id: "rootchain",    label: "RootChain",      desc: "Attack chains"           },
+  { id: "graphqlprobe", label: "GraphQLProbe",   desc: "GraphQL deep scan"       },
+  { id: "scan_diff",    label: "ScanDiff",       desc: "Change detection"        },
 ];
 
 const EXPLOIT_MODULES = [
-  { id: "authbypass",    label: "AuthBypass",    desc: "Auth bypass PoC",          cat: "exploit" },
-  { id: "idorhunter",   label: "IDORHunter",    desc: "BOLA/IDOR proof",          cat: "exploit" },
-  { id: "ssti_rce",     label: "SSTI/RCE",      desc: "Code execution proof",     cat: "exploit" },
-  { id: "secretharvest",label: "SecretHarvest", desc: "Credential extraction",    cat: "exploit" },
+  { id: "authbypass",    label: "AuthBypass",    desc: "Auth bypass PoC"         },
+  { id: "idorhunter",   label: "IDORHunter",    desc: "BOLA/IDOR proof"         },
+  { id: "ssti_rce",     label: "SSTI/RCE",      desc: "Code execution proof"    },
+  { id: "secretharvest",label: "SecretHarvest", desc: "Credential extraction"   },
 ];
 
 const ALL_MODULES = [...RECON_MODULES, ...EXPLOIT_MODULES];
@@ -41,6 +43,14 @@ const SEV_CONFIG = [
   { key: "LOW",      label: "Low",      bg: "bg-blue-500/15",   border: "border-blue-500/40",   text: "text-blue-400",   dot: "bg-blue-500"   },
 ];
 
+interface ScanStatus {
+  status: string;
+  current_module: string;
+  completed_modules: string[];
+  total_modules: number;
+  findings_count: number;
+}
+
 interface ScanResults {
   findings: any[];
   chains: any[];
@@ -50,18 +60,21 @@ interface ScanResults {
 
 export default function Dashboard() {
   const { toast } = useToast();
-  const [target, setTarget]          = useState("");
-  const [selected, setSelected]      = useState<string[]>(ALL_MODULES.map(m => m.id));
-  const [showModules, setShowModules] = useState(true);
-  const [jobId, setJobId]            = useState<string | null>(null);
-  const [status, setStatus]          = useState<any>(null);
-  const [lines, setLines]            = useState<string[]>([]);
-  const [results, setResults]        = useState<ScanResults | null>(null);
-  const [loadingResults, setLoadingResults] = useState(false);
-  const termRef  = useRef<HTMLDivElement>(null);
-  const pollRef  = useRef<ReturnType<typeof setInterval> | null>(null);
+  const [target, setTarget]                   = useState("");
+  const [selected, setSelected]               = useState<string[]>(ALL_MODULES.map(m => m.id));
+  const [showModules, setShowModules]         = useState(true);
+  const [jobId, setJobId]                     = useState<string | null>(null);
+  const [status, setStatus]                   = useState<ScanStatus | null>(null);
+  const [lines, setLines]                     = useState<string[]>([]);
+  const [results, setResults]                 = useState<ScanResults | null>(null);
+  const [loadingResults, setLoadingResults]   = useState(false);
+  const [liveFindings, setLiveFindings]       = useState<any[]>([]);
+  const [wsConnected, setWsConnected]         = useState(false);
+  const [showLivePanel, setShowLivePanel]     = useState(true);
 
-  // Use a ref for the output index so the polling interval never reads stale state
+  const termRef    = useRef<HTMLDivElement>(null);
+  const wsRef      = useRef<WebSocket | null>(null);
+  const pollRef    = useRef<ReturnType<typeof setInterval> | null>(null);
   const lineIdxRef = useRef(0);
 
   const { data: health } = useQuery({
@@ -70,6 +83,36 @@ export default function Dashboard() {
     refetchInterval: 15_000,
   });
 
+  // ── Polling fallback (activated if WebSocket is unavailable) ──────────────
+  const startPolling = useCallback((id: string) => {
+    if (pollRef.current) clearInterval(pollRef.current);
+    pollRef.current = setInterval(async () => {
+      try {
+        const res  = await fetch(`${API}/scan/status/${id}?since=${lineIdxRef.current}`);
+        if (!res.ok) return;
+        const data = await res.json();
+        setStatus(data);
+        if (data.new_output?.length) {
+          setLines(prev => [...prev, ...data.new_output]);
+          lineIdxRef.current = data.output_index;
+        }
+        if (["done", "error", "stopped"].includes(data.status)) {
+          if (pollRef.current) clearInterval(pollRef.current);
+          pollRef.current = null;
+          if (data.status === "done") {
+            setLoadingResults(true);
+            fetch(`${API}/scan/results/${id}`)
+              .then(r => r.json())
+              .then(rd => setResults(rd))
+              .catch(() => toast({ title: "Failed to load results", variant: "destructive" }))
+              .finally(() => setLoadingResults(false));
+          }
+        }
+      } catch (_) {}
+    }, 1200);
+  }, [toast]);
+
+  // ── Start mutation ─────────────────────────────────────────────────────────
   const startMut = useMutation({
     mutationFn: (body: object) =>
       fetch(`${API}/scan/start`, {
@@ -87,6 +130,8 @@ export default function Dashboard() {
       setLines([]);
       setStatus(null);
       setResults(null);
+      setLiveFindings([]);
+      setWsConnected(false);
     },
   });
 
@@ -95,60 +140,113 @@ export default function Dashboard() {
       fetch(`${API}/scan/stop/${id}`, { method: "POST" }).then(r => r.json()),
   });
 
-  // Polling — only depends on jobId; uses ref for index so no stale closure
+  // ── WebSocket — primary streaming connection ───────────────────────────────
   useEffect(() => {
     if (!jobId) return;
 
-    if (pollRef.current) clearInterval(pollRef.current);
+    // Tear down previous connections
+    if (wsRef.current) { wsRef.current.close(); wsRef.current = null; }
+    if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
 
-    pollRef.current = setInterval(async () => {
+    const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+    const wsUrl = `${proto}//${window.location.host}/scanner-api/api/scan/ws/${jobId}`;
+    const ws    = new WebSocket(wsUrl);
+    wsRef.current = ws;
+    let usedFallback = false;
+
+    const activateFallback = () => {
+      if (usedFallback) return;
+      usedFallback = true;
+      setWsConnected(false);
+      startPolling(jobId);
+    };
+
+    ws.onopen = () => setWsConnected(true);
+
+    ws.onerror = activateFallback;
+
+    ws.onclose = (e) => {
+      setWsConnected(false);
+      // Code 1000 = normal close. Anything else during an active scan → fallback.
+      if (e.code !== 1000 && e.code !== 1001) activateFallback();
+    };
+
+    ws.onmessage = (e) => {
       try {
-        const res  = await fetch(`${API}/scan/status/${jobId}?since=${lineIdxRef.current}`);
-        if (!res.ok) return;
-        const data = await res.json();
-        setStatus(data);
+        const evt = JSON.parse(e.data as string);
+        switch (evt.type) {
 
-        if (data.new_output?.length) {
-          setLines(prev => [...prev, ...data.new_output]);
-          lineIdxRef.current = data.output_index;
-        }
+          case "ping":
+            break; // keepalive — ignore
 
-        if (["done", "error", "stopped"].includes(data.status)) {
-          if (pollRef.current) clearInterval(pollRef.current);
-          pollRef.current = null;
+          case "log":
+            if (evt.data) setLines(prev => [...prev, evt.data as string]);
+            break;
 
-          if (data.status === "done") {
-            setLoadingResults(true);
-            try {
-              const rr = await fetch(`${API}/scan/results/${jobId}`);
-              if (rr.ok) {
-                const rd = await rr.json();
-                setResults(rd);
-              }
-            } catch (err) {
-              toast({ title: "Failed to load results", variant: "destructive" });
-            } finally {
-              setLoadingResults(false);
+          case "module_start":
+            setStatus(prev => ({
+              status:            "running",
+              current_module:    evt.module as string,
+              completed_modules: prev?.completed_modules ?? [],
+              total_modules:     (evt.total_modules as number) ?? (prev?.total_modules ?? 0),
+              findings_count:    prev?.findings_count ?? 0,
+            }));
+            break;
+
+          case "module_done":
+            setStatus(prev => prev ? {
+              ...prev,
+              current_module:    "",
+              completed_modules: [...(prev.completed_modules ?? []), evt.module as string],
+              findings_count:    (evt.total as number) ?? prev.findings_count,
+            } : prev);
+            if (Array.isArray(evt.findings) && evt.findings.length > 0) {
+              setLiveFindings(prev => [
+                ...prev,
+                ...(evt.findings as any[]).map(f => ({ ...f, _module: evt.module as string })),
+              ]);
+              setShowLivePanel(true);
             }
-          }
+            break;
+
+          case "done":
+            setWsConnected(false);
+            setStatus(prev => prev ? { ...prev, status: "done", current_module: "" } : null);
+            ws.close(1000);
+            setLoadingResults(true);
+            fetch(`${API}/scan/results/${jobId}`)
+              .then(r => r.json())
+              .then(rd => setResults(rd as ScanResults))
+              .catch(() => toast({ title: "Failed to load results", variant: "destructive" }))
+              .finally(() => setLoadingResults(false));
+            break;
+
+          case "stopped":
+            setWsConnected(false);
+            setStatus(prev => prev ? { ...prev, status: "stopped", current_module: "" } : null);
+            ws.close(1000);
+            break;
+
+          case "error":
+            toast({ title: "Scanner error", description: evt.data as string, variant: "destructive" });
+            break;
         }
-      } catch (_) {
-        // Network hiccup — keep polling
-      }
-    }, 1200);
+      } catch (_) {}
+    };
 
     return () => {
-      if (pollRef.current) {
-        clearInterval(pollRef.current);
-        pollRef.current = null;
-      }
+      ws.close();
+      wsRef.current = null;
+      if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
     };
-  }, [jobId]);
+  }, [jobId, startPolling, toast]);
 
+  // Auto-scroll terminal
   useEffect(() => {
     if (termRef.current) termRef.current.scrollTop = termRef.current.scrollHeight;
   }, [lines]);
 
+  // ── Derived state ──────────────────────────────────────────────────────────
   const isRunning = status?.status === "running" || status?.status === "queued";
   const isDone    = status?.status === "done";
   const isStopped = status?.status === "stopped";
@@ -194,6 +292,7 @@ export default function Dashboard() {
     a.click();
   }
 
+  // ── Render ─────────────────────────────────────────────────────────────────
   return (
     <div className="p-4 md:p-6 space-y-4 max-w-4xl mx-auto">
 
@@ -205,7 +304,7 @@ export default function Dashboard() {
         <p className="text-xs md:text-sm text-muted-foreground mt-0.5">Authorized testing only</p>
       </div>
 
-      {/* Scanner status */}
+      {/* Scanner status bar */}
       <div className="flex items-center gap-2 p-3 rounded-lg bg-card border border-card-border">
         {health ? (
           <>
@@ -221,12 +320,22 @@ export default function Dashboard() {
             <span className="text-sm text-muted-foreground">Connecting...</span>
           </>
         )}
+        {/* Live stream indicator */}
+        {wsConnected && (
+          <span className="ml-auto flex items-center gap-1.5 text-xs font-semibold text-green-400
+            bg-green-400/10 border border-green-400/25 px-2 py-0.5 rounded-full">
+            <span className="relative flex h-2 w-2">
+              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75" />
+              <span className="relative inline-flex rounded-full h-2 w-2 bg-green-400" />
+            </span>
+            Live stream
+          </span>
+        )}
       </div>
 
-      {/* ── RESULTS SUMMARY ─────────────────────────────────────────────── */}
+      {/* ── RESULTS SUMMARY ───────────────────────────────────────────────── */}
       {(loadingResults || results) && (
         <div className="rounded-xl border border-card-border bg-card overflow-hidden">
-          {/* Summary header */}
           <div className="px-4 py-3 border-b border-card-border bg-muted/20 flex items-center justify-between flex-wrap gap-2">
             <div className="flex items-center gap-2">
               {loadingResults
@@ -262,17 +371,12 @@ export default function Dashboard() {
             )}
           </div>
 
-          {/* Severity grid */}
           {sevCounts && (
             <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 p-4">
               {SEV_CONFIG.map(s => (
-                <div
-                  key={s.key}
-                  className={`rounded-lg border ${s.border} ${s.bg} p-3 flex flex-col items-center gap-1`}
-                >
-                  <span className={`text-2xl font-bold ${s.text}`}>
-                    {sevCounts[s.key] ?? 0}
-                  </span>
+                <div key={s.key}
+                  className={`rounded-lg border ${s.border} ${s.bg} p-3 flex flex-col items-center gap-1`}>
+                  <span className={`text-2xl font-bold ${s.text}`}>{sevCounts[s.key] ?? 0}</span>
                   <div className="flex items-center gap-1.5">
                     <div className={`w-2 h-2 rounded-full ${s.dot}`} />
                     <span className={`text-xs font-medium ${s.text}`}>{s.label}</span>
@@ -282,7 +386,6 @@ export default function Dashboard() {
             </div>
           )}
 
-          {/* Top findings list */}
           {results?.findings && results.findings.length > 0 && (
             <div className="border-t border-card-border px-4 pb-4">
               <p className="text-xs text-muted-foreground uppercase tracking-wider mt-3 mb-2 font-medium">
@@ -318,7 +421,7 @@ export default function Dashboard() {
                 })}
                 {results.findings.length > 5 && (
                   <p className="text-xs text-muted-foreground text-center py-1">
-                    + {results.findings.length - 5} more findings — download the full report
+                    + {results.findings.length - 5} more — download the full report
                   </p>
                 )}
               </div>
@@ -326,7 +429,6 @@ export default function Dashboard() {
           )}
         </div>
       )}
-      {/* ── END RESULTS ──────────────────────────────────────────────────── */}
 
       {/* Target input */}
       <div className="rounded-lg border border-card-border bg-card p-4 space-y-3">
@@ -361,7 +463,7 @@ export default function Dashboard() {
                 {startMut.isPending
                   ? <Loader2 className="w-3.5 h-3.5 mr-1.5 animate-spin" />
                   : <Shield className="w-3.5 h-3.5 mr-1.5" />}
-                Run All 16
+                Run All {ALL_MODULES.length}
               </Button>
             </>
           )}
@@ -398,13 +500,12 @@ export default function Dashboard() {
 
         {showModules && (
           <div className="px-4 pb-4 space-y-3">
-
             {/* Recon & Analysis */}
             <div>
               <p className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wider mb-2 flex items-center gap-1.5">
                 <span className="w-1.5 h-1.5 rounded-full bg-primary inline-block" />
                 Recon &amp; Analysis
-                <span className="ml-1 text-muted-foreground/60 font-normal normal-case">12 modules</span>
+                <span className="ml-1 text-muted-foreground/60 font-normal normal-case">{RECON_MODULES.length} modules</span>
               </p>
               <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-2">
                 {RECON_MODULES.map(m => {
@@ -425,7 +526,6 @@ export default function Dashboard() {
               </div>
             </div>
 
-            {/* Divider */}
             <div className="border-t border-border/50" />
 
             {/* Exploit Provers */}
@@ -433,7 +533,7 @@ export default function Dashboard() {
               <p className="text-[10px] font-semibold text-red-400/80 uppercase tracking-wider mb-2 flex items-center gap-1.5">
                 <span className="w-1.5 h-1.5 rounded-full bg-red-500 inline-block" />
                 Exploit Provers
-                <span className="ml-1 text-muted-foreground/60 font-normal normal-case text-muted-foreground">confirmed PoC — run on authorized targets only</span>
+                <span className="ml-1 text-muted-foreground/60 font-normal normal-case text-muted-foreground">confirmed PoC — authorized targets only</span>
               </p>
               <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-2">
                 {EXPLOIT_MODULES.map(m => {
@@ -453,7 +553,6 @@ export default function Dashboard() {
                 })}
               </div>
             </div>
-
           </div>
         )}
       </div>
@@ -484,6 +583,78 @@ export default function Dashboard() {
         </div>
       )}
 
+      {/* ── LIVE FINDINGS STREAM ──────────────────────────────────────────── */}
+      {liveFindings.length > 0 && (
+        <div className="rounded-xl border border-card-border bg-card overflow-hidden">
+          {/* Collapsible header */}
+          <button
+            className="w-full flex items-center justify-between px-4 py-2.5 border-b border-card-border bg-muted/20 hover:bg-muted/30 transition-colors"
+            onClick={() => setShowLivePanel(p => !p)}
+          >
+            <div className="flex items-center gap-2">
+              <Zap className="w-3.5 h-3.5 text-primary" />
+              <span className="text-sm font-semibold text-foreground">Live Findings</span>
+              <span className="text-xs text-muted-foreground">
+                {liveFindings.length} finding{liveFindings.length !== 1 ? "s" : ""}
+              </span>
+            </div>
+            <div className="flex items-center gap-2">
+              {wsConnected && (
+                <span className="flex items-center gap-1 text-[10px] font-semibold text-green-400
+                  bg-green-400/10 border border-green-400/25 px-1.5 py-0.5 rounded">
+                  <span className="relative flex h-1.5 w-1.5">
+                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75" />
+                    <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-green-400" />
+                  </span>
+                  LIVE
+                </span>
+              )}
+              {showLivePanel
+                ? <ChevronUp className="w-4 h-4 text-muted-foreground" />
+                : <ChevronDown className="w-4 h-4 text-muted-foreground" />}
+            </div>
+          </button>
+
+          {/* Findings list — newest first */}
+          {showLivePanel && (
+            <div className="max-h-80 overflow-y-auto p-3 space-y-1.5">
+              {[...liveFindings].reverse().map((f, i) => {
+                const sev = (f.severity || "LOW").toUpperCase();
+                const cfg = SEV_CONFIG.find(s => s.key === sev) ?? SEV_CONFIG[3];
+                return (
+                  <div
+                    key={`${f._module ?? ""}-${i}`}
+                    className={`flex items-start gap-2.5 p-2.5 rounded-lg border ${cfg.border} ${cfg.bg}
+                      transition-all duration-300`}
+                  >
+                    <span className={`text-[10px] px-1.5 py-0.5 rounded font-mono font-bold shrink-0 mt-0.5
+                      ${cfg.bg} ${cfg.text} border ${cfg.border}`}>
+                      {sev.slice(0, 4)}
+                    </span>
+                    <div className="min-w-0 flex-1">
+                      <p className="text-xs font-medium text-foreground truncate">
+                        {f.type || f.title || f.name || "Finding"}
+                      </p>
+                      {(f.url || f.detail || f.description) && (
+                        <p className="text-[10px] text-muted-foreground mt-0.5 line-clamp-1">
+                          {f.url || f.detail || f.description}
+                        </p>
+                      )}
+                    </div>
+                    {f._module && (
+                      <span className={`text-[10px] px-1.5 py-0.5 rounded shrink-0 font-mono ${cfg.bg} ${cfg.text}`}>
+                        {f._module}
+                      </span>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      )}
+      {/* ── END LIVE FINDINGS ─────────────────────────────────────────────── */}
+
       {/* Terminal output */}
       {lines.length > 0 && (
         <div className="rounded-lg border border-card-border overflow-hidden">
@@ -505,7 +676,7 @@ export default function Dashboard() {
         </div>
       )}
 
-      {/* Legal */}
+      {/* Legal notice */}
       <div className="flex items-start gap-2 text-xs text-muted-foreground border border-border/50 rounded-lg p-3 bg-muted/10">
         <AlertTriangle className="w-3.5 h-3.5 shrink-0 text-yellow-500 mt-0.5" />
         <span>Only scan systems you own or have explicit written permission to test. Unauthorized scanning is illegal.</span>
