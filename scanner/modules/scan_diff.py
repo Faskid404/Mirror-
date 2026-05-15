@@ -29,11 +29,15 @@ def finding_key(f: dict) -> str:
 
 
 def urlparse_host(url: str) -> str:
+    """Return a stable identifier: netloc + full path (no query string).
+    Previously truncated to 60 chars which caused two distinct paths to
+    hash identically if they shared a long common prefix."""
     try:
         from urllib.parse import urlparse
-        return urlparse(url).path[:60]
+        p = urlparse(url)
+        return f"{p.netloc}{p.path}"
     except Exception:
-        return url[:60]
+        return url
 
 
 def load_current() -> list:
