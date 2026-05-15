@@ -10,20 +10,29 @@ import { useState, useEffect, useRef } from "react";
 
   const API = "/scanner-api/api";
 
-  const ALL_MODULES = [
-    { id: "ghostcrawler",  label: "GhostCrawler",  desc: "Endpoint & token hunt" },
-    { id: "wafshatter",   label: "WAFShatter",     desc: "WAF/CDN bypass" },
-    { id: "headerforge",  label: "HeaderForge",    desc: "Security headers" },
-    { id: "timebleed",    label: "TimeBleed",      desc: "Timing injection" },
-    { id: "authdrift",    label: "AuthDrift",      desc: "Access control" },
-    { id: "tokensniper",  label: "TokenSniper",    desc: "JWT & API tokens" },
-    { id: "deeplogic",    label: "DeepLogic",      desc: "Business logic" },
-    { id: "cryptohunter", label: "CryptoHunter",   desc: "Crypto weaknesses" },
-    { id: "backendprobe", label: "BackendProbe",   desc: "Deep backend scan" },
-    { id: "webprobe",     label: "WebProbe",       desc: "Web vulnerabilities" },
-    { id: "cveprobe",     label: "CVEProbe",       desc: "197 CVE probes" },
-    { id: "rootchain",    label: "RootChain",      desc: "Attack chains" },
+  const RECON_MODULES = [
+    { id: "ghostcrawler",  label: "GhostCrawler",  desc: "Endpoint & token hunt",    cat: "recon" },
+    { id: "wafshatter",   label: "WAFShatter",     desc: "WAF/CDN bypass",           cat: "recon" },
+    { id: "headerforge",  label: "HeaderForge",    desc: "Security headers",         cat: "recon" },
+    { id: "timebleed",    label: "TimeBleed",      desc: "Timing injection",         cat: "recon" },
+    { id: "authdrift",    label: "AuthDrift",      desc: "Access control",           cat: "recon" },
+    { id: "tokensniper",  label: "TokenSniper",    desc: "JWT & API tokens",         cat: "recon" },
+    { id: "deeplogic",    label: "DeepLogic",      desc: "Business logic",           cat: "recon" },
+    { id: "cryptohunter", label: "CryptoHunter",   desc: "Crypto weaknesses",        cat: "recon" },
+    { id: "backendprobe", label: "BackendProbe",   desc: "Deep backend scan",        cat: "recon" },
+    { id: "webprobe",     label: "WebProbe",       desc: "Web vulnerabilities",      cat: "recon" },
+    { id: "cveprobe",     label: "CVEProbe",       desc: "197 CVE probes",           cat: "recon" },
+    { id: "rootchain",    label: "RootChain",      desc: "Attack chains",            cat: "recon" },
   ];
+
+  const EXPLOIT_MODULES = [
+    { id: "authbypass",    label: "AuthBypass",    desc: "Auth bypass PoC",          cat: "exploit" },
+    { id: "idorhunter",   label: "IDORHunter",    desc: "BOLA/IDOR proof",          cat: "exploit" },
+    { id: "ssti_rce",     label: "SSTI/RCE",      desc: "Code execution proof",     cat: "exploit" },
+    { id: "secretharvest",label: "SecretHarvest", desc: "Credential extraction",    cat: "exploit" },
+  ];
+
+  const ALL_MODULES = [...RECON_MODULES, ...EXPLOIT_MODULES];
 
   const SEV_CONFIG = [
     { key: "CRITICAL", label: "Critical", bg: "bg-red-500/15",    border: "border-red-500/40",    text: "text-red-400",    dot: "bg-red-500"    },
@@ -305,7 +314,7 @@ import { useState, useEffect, useRef } from "react";
                   {startMut.isPending
                     ? <Loader2 className="w-3.5 h-3.5 mr-1.5 animate-spin" />
                     : <Shield className="w-3.5 h-3.5 mr-1.5" />}
-                  Run All 12
+                  Run All 16
                 </Button>
               </>
             )}
@@ -339,23 +348,65 @@ import { useState, useEffect, useRef } from "react";
                 : <ChevronDown className="w-4 h-4 text-muted-foreground" />}
             </div>
           </button>
+
           {showModules && (
-            <div className="px-4 pb-4 grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-2">
-              {ALL_MODULES.map(m => {
-                const on = selected.includes(m.id);
-                return (
-                  <button key={m.id} onClick={() => toggleModule(m.id)}
-                    className={`text-left p-2.5 rounded-lg border transition-all active:scale-95
-                      ${on ? "border-primary/50 bg-primary/10 text-foreground"
-                            : "border-border bg-muted/20 text-muted-foreground"}`}>
-                    <div className="flex items-center gap-1.5 mb-0.5">
-                      <div className={`w-2 h-2 rounded-full shrink-0 ${on ? "bg-primary" : "bg-border"}`} />
-                      <p className="text-xs font-semibold truncate">{m.label}</p>
-                    </div>
-                    <p className="text-[10px] opacity-60 leading-tight pl-3.5 line-clamp-1">{m.desc}</p>
-                  </button>
-                );
-              })}
+            <div className="px-4 pb-4 space-y-3">
+
+              {/* Recon & Analysis */}
+              <div>
+                <p className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wider mb-2 flex items-center gap-1.5">
+                  <span className="w-1.5 h-1.5 rounded-full bg-primary inline-block" />
+                  Recon &amp; Analysis
+                  <span className="ml-1 text-muted-foreground/60 font-normal normal-case">12 modules</span>
+                </p>
+                <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-2">
+                  {RECON_MODULES.map(m => {
+                    const on = selected.includes(m.id);
+                    return (
+                      <button key={m.id} onClick={() => toggleModule(m.id)}
+                        className={`text-left p-2.5 rounded-lg border transition-all active:scale-95
+                          ${on ? "border-primary/50 bg-primary/10 text-foreground"
+                                : "border-border bg-muted/20 text-muted-foreground"}`}>
+                        <div className="flex items-center gap-1.5 mb-0.5">
+                          <div className={`w-2 h-2 rounded-full shrink-0 ${on ? "bg-primary" : "bg-border"}`} />
+                          <p className="text-xs font-semibold truncate">{m.label}</p>
+                        </div>
+                        <p className="text-[10px] opacity-60 leading-tight pl-3.5 line-clamp-1">{m.desc}</p>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* Divider */}
+              <div className="border-t border-border/50" />
+
+              {/* Exploit Provers */}
+              <div>
+                <p className="text-[10px] font-semibold text-red-400/80 uppercase tracking-wider mb-2 flex items-center gap-1.5">
+                  <span className="w-1.5 h-1.5 rounded-full bg-red-500 inline-block" />
+                  Exploit Provers
+                  <span className="ml-1 text-muted-foreground/60 font-normal normal-case text-muted-foreground">confirmed PoC — run on authorized targets only</span>
+                </p>
+                <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-2">
+                  {EXPLOIT_MODULES.map(m => {
+                    const on = selected.includes(m.id);
+                    return (
+                      <button key={m.id} onClick={() => toggleModule(m.id)}
+                        className={`text-left p-2.5 rounded-lg border transition-all active:scale-95
+                          ${on ? "border-red-500/50 bg-red-500/10 text-foreground"
+                                : "border-border bg-muted/20 text-muted-foreground"}`}>
+                        <div className="flex items-center gap-1.5 mb-0.5">
+                          <div className={`w-2 h-2 rounded-full shrink-0 ${on ? "bg-red-500" : "bg-border"}`} />
+                          <p className="text-xs font-semibold truncate">{m.label}</p>
+                        </div>
+                        <p className="text-[10px] opacity-60 leading-tight pl-3.5 line-clamp-1">{m.desc}</p>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
             </div>
           )}
         </div>

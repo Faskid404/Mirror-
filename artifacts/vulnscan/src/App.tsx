@@ -66,10 +66,10 @@ import { useState } from "react";
 
         <div className="p-3 border-t border-sidebar-border">
           <div className="text-[10px] text-muted-foreground space-y-0.5">
+            <p>16 modules (12 recon + 4 exploit)</p>
             <p>197 HTTP probes</p>
             <p>146 CVEs covered</p>
             <p>6 attack chains</p>
-            <p>70 platforms</p>
           </div>
         </div>
       </aside>
