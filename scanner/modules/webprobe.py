@@ -214,7 +214,14 @@ class WebProbe:
                 await delay(0.05)
                 if s in (301, 302, 303, 307, 308):
                     location = hdrs.get("Location", hdrs.get("location", ""))
-                    if location and ("evil.com" in location or "attacker" in location):
+                    # Guard against partial matches like "evil.com.victim.com" by
+                    # requiring the attacker domain to appear as a proper hostname boundary.
+                    def _is_attacker_domain(loc: str) -> bool:
+                        import re as _re
+                        return bool(_re.search(
+                            r'(?:https?://|^|[/@])(?:evil\.com|attacker\.com|attacker\.invalid)',
+                            loc, _re.I))
+                    if location and _is_attacker_domain(location):
                         key = f"redir_{param}_{payload[:20]}"
                         if key not in self._dedup:
                             self._dedup.add(key)
