@@ -59,6 +59,9 @@ MODULE_PATHS = {
     "idorhunter":    "modules/idorhunter.py",
     "ssti_rce":      "modules/ssti_rce.py",
     "secretharvest": "modules/secretharvest.py",
+    # ── Protocol-specific deep scanners ──────────────────────────────────────
+    "graphqlprobe":  "modules/graphqlprobe.py",
+    "scan_diff":     "modules/scan_diff.py",
 }
 
 
