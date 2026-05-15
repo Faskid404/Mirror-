@@ -6,9 +6,11 @@ import os
 import threading
 import time
 import uuid
+import queue
 from pathlib import Path
 from flask import Flask, request, jsonify, Blueprint, send_from_directory, send_file
 from flask_cors import CORS
+from flask_sock import Sock
 
 # ─── Setup ────────────────────────────────────────────────────────────────────
 SCANNER_ROOT = Path(__file__).parent.resolve()
@@ -17,11 +19,11 @@ REPORTS_DIR  = SCANNER_ROOT / "reports"
 STATIC_DIR   = SCANNER_ROOT.parent / "artifacts" / "vulnscan" / "dist" / "public"
 SCANNER_BASE = os.environ.get("SCANNER_BASE", "/scanner-api")
 
-# Ensure reports directory exists at startup
 REPORTS_DIR.mkdir(exist_ok=True)
 
-app = Flask(__name__)
+app  = Flask(__name__)
 CORS(app, origins="*")
+sock = Sock(app)
 
 bp        = Blueprint("scanner", __name__)
 JOBS      = {}
@@ -65,10 +67,31 @@ MODULE_PATHS = {
 }
 
 
-def run_module(job_id, abs_path, target):
+# ─── WebSocket event bus ──────────────────────────────────────────────────────
+
+def _emit_to_job(job_id: str, event: dict):
+    """Push a JSON event to all WebSocket clients subscribed to this job.
+    Also appends to the replay buffer so late-connecting clients get history."""
+    msg = json.dumps(event, default=str)
     with JOBS_LOCK:
-        JOBS[job_id]["status"] = "running"
-        JOBS[job_id]["output"] = []
+        job = JOBS.get(job_id)
+        if not job:
+            return
+        job["ws_events"].append(msg)
+        queues = list(job.get("ws_queues", []))
+    for q in queues:
+        try:
+            q.put_nowait(msg)
+        except Exception:
+            pass
+
+
+# ─── Module runner ────────────────────────────────────────────────────────────
+
+def run_module(job_id, abs_path, target, emit_fn=None):
+    with JOBS_LOCK:
+        JOBS[job_id]["status"]   = "running"
+        JOBS[job_id]["output"]   = []
         JOBS[job_id]["findings"] = []
 
     try:
@@ -89,16 +112,21 @@ def run_module(job_id, abs_path, target):
             if line:
                 with JOBS_LOCK:
                     JOBS[job_id]["output"].append(line)
+                if emit_fn:
+                    emit_fn({"type": "log", "data": line})
 
         proc.wait()
-
         returncode = proc.returncode
+
         with JOBS_LOCK:
             JOBS[job_id]["returncode"] = returncode
 
         if returncode != 0:
+            msg = f"[X] Module exited with error code {returncode}"
             with JOBS_LOCK:
-                JOBS[job_id]["output"].append(f"[X] Module exited with error code {returncode}")
+                JOBS[job_id]["output"].append(msg)
+            if emit_fn:
+                emit_fn({"type": "log", "data": msg})
 
         report_file = REPORTS_DIR / f"{Path(abs_path).stem}.json"
         if report_file.exists():
@@ -123,9 +151,11 @@ def run_module(job_id, abs_path, target):
             JOBS[job_id]["status"] = "error"
             JOBS[job_id]["error"]  = str(e)
             JOBS[job_id]["output"].append(f"[ERROR] {e}")
+        if emit_fn:
+            emit_fn({"type": "log", "data": f"[ERROR] {e}"})
 
 
-# ─── API Blueprint routes (all mounted under SCANNER_BASE) ────────────────────
+# ─── Blueprint routes ─────────────────────────────────────────────────────────
 
 @bp.route("/", methods=["GET"])
 def bp_index():
@@ -151,46 +181,87 @@ def start_scan():
     job_id = str(uuid.uuid4())[:8]
     with JOBS_LOCK:
         JOBS[job_id] = {
-            "id": job_id, "target": target, "modules": modules,
-            "status": "queued", "output": [], "findings": [],
-            "started": time.time(), "current_module": "",
-            "completed_modules": [], "all_findings": [],
+            "id":                job_id,
+            "target":            target,
+            "modules":           modules,
+            "status":            "queued",
+            "output":            [],
+            "findings":          [],
+            "started":           time.time(),
+            "current_module":    "",
+            "completed_modules": [],
+            "all_findings":      [],
+            "ws_events":         [],   # replay buffer for late-connecting WS clients
+            "ws_queues":         [],   # one queue per active WS connection
         }
 
     def run_all():
-        for mod_id in modules:
+        total_mods = len(modules)
+
+        def emit(event):
+            _emit_to_job(job_id, event)
+
+        for idx, mod_id in enumerate(modules):
             with JOBS_LOCK:
                 if JOBS[job_id].get("stopped"):
                     break
             rel = MODULE_PATHS.get(mod_id)
             if not rel:
+                msg = f"[X] Unknown module: {mod_id}"
                 with JOBS_LOCK:
-                    JOBS[job_id]["output"].append(f"[X] Unknown module: {mod_id}")
+                    JOBS[job_id]["output"].append(msg)
+                emit({"type": "log", "data": msg})
                 continue
             abs_path = SCANNER_ROOT / rel
             if not abs_path.exists():
+                msg = f"[X] Missing: {rel}"
                 with JOBS_LOCK:
-                    JOBS[job_id]["output"].append(f"[X] Missing: {rel}")
+                    JOBS[job_id]["output"].append(msg)
+                emit({"type": "log", "data": msg})
                 continue
+
+            separator = [f"\n{'='*50}", f"  Running: {mod_id}", f"{'='*50}"]
             with JOBS_LOCK:
                 JOBS[job_id]["current_module"] = mod_id
-                JOBS[job_id]["output"] += [f"\n{'='*50}", f"  Running: {mod_id}", f"{'='*50}"]
+                JOBS[job_id]["output"] += separator
+            for sep_line in separator:
+                emit({"type": "log", "data": sep_line})
+
+            emit({
+                "type":          "module_start",
+                "module":        mod_id,
+                "index":         idx,
+                "total_modules": total_mods,
+            })
 
             sub_id = f"{job_id}_{mod_id}"
             with JOBS_LOCK:
                 JOBS[sub_id] = {"status": "running", "output": [], "findings": []}
-            run_module(sub_id, abs_path, target)
+            run_module(sub_id, abs_path, target, emit_fn=emit)
 
             with JOBS_LOCK:
-                sub = JOBS[sub_id]
+                sub           = JOBS[sub_id]
+                findings      = sub.get("findings", [])
                 JOBS[job_id]["output"].extend(sub.get("output", []))
-                JOBS[job_id]["all_findings"].extend(sub.get("findings", []))
+                JOBS[job_id]["all_findings"].extend(findings)
                 JOBS[job_id]["completed_modules"].append(mod_id)
+                total_so_far  = len(JOBS[job_id]["all_findings"])
+
+            emit({
+                "type":     "module_done",
+                "module":   mod_id,
+                "count":    len(findings),
+                "total":    total_so_far,
+                "findings": findings,
+            })
 
         with JOBS_LOCK:
+            total_findings             = len(JOBS[job_id]["all_findings"])
             JOBS[job_id]["status"]         = "done"
             JOBS[job_id]["current_module"] = ""
             JOBS[job_id]["finished"]       = time.time()
+
+        emit({"type": "done", "total_findings": total_findings})
 
     threading.Thread(target=run_all, daemon=True).start()
     return jsonify({"job_id": job_id, "status": "started"})
@@ -205,14 +276,15 @@ def scan_status(job_id):
     since        = int(request.args.get("since", 0))
     output_slice = job["output"][since:]
     return jsonify({
-        "job_id": job_id, "status": job.get("status"),
-        "target": job.get("target"),
-        "current_module": job.get("current_module", ""),
+        "job_id":            job_id,
+        "status":            job.get("status"),
+        "target":            job.get("target"),
+        "current_module":    job.get("current_module", ""),
         "completed_modules": job.get("completed_modules", []),
-        "total_modules": len(job.get("modules", [])),
-        "findings_count": len(job.get("all_findings", [])),
-        "new_output": output_slice,
-        "output_index": since + len(output_slice),
+        "total_modules":     len(job.get("modules", [])),
+        "findings_count":    len(job.get("all_findings", [])),
+        "new_output":        output_slice,
+        "output_index":      since + len(output_slice),
     })
 
 
@@ -222,7 +294,7 @@ def scan_results(job_id):
         job = JOBS.get(job_id)
     if not job:
         return jsonify({"error": "Job not found"}), 404
-    chains = []
+    chains  = []
     rc_file = REPORTS_DIR / "rootchain_report.json"
     if rc_file.exists():
         try:
@@ -230,10 +302,13 @@ def scan_results(job_id):
         except Exception:
             pass
     return jsonify({
-        "job_id": job_id, "status": job.get("status"),
-        "target": job.get("target"), "findings": job.get("all_findings", []),
-        "chains": chains, "output": job.get("output", []),
-        "duration": round(job.get("finished", time.time()) - job.get("started", time.time()), 1),
+        "job_id":    job_id,
+        "status":    job.get("status"),
+        "target":    job.get("target"),
+        "findings":  job.get("all_findings", []),
+        "chains":    chains,
+        "output":    job.get("output", []),
+        "duration":  round(job.get("finished", time.time()) - job.get("started", time.time()), 1),
     })
 
 
@@ -246,6 +321,7 @@ def stop_scan(job_id):
     with JOBS_LOCK:
         JOBS[job_id]["stopped"] = True
         JOBS[job_id]["status"]  = "stopped"
+    _emit_to_job(job_id, {"type": "stopped"})
     return jsonify({"status": "stopped"})
 
 
@@ -260,9 +336,10 @@ def list_reports():
         try:
             data = json.loads(f.read_text())
             reports.append({
-                "file": f.name,
-                "count": len(data) if isinstance(data, list) else (len(data.get("findings", [])) if isinstance(data, dict) else 0),
-                "size": f.stat().st_size,
+                "file":     f.name,
+                "count":    len(data) if isinstance(data, list)
+                            else (len(data.get("findings", [])) if isinstance(data, dict) else 0),
+                "size":     f.stat().st_size,
                 "modified": f.stat().st_mtime,
             })
         except Exception:
@@ -283,21 +360,20 @@ def get_report(name):
 
 @bp.route("/api/reports/<name>/html", methods=["GET"])
 def get_report_html(name):
-    """Return a self-contained HTML report — downloadable on mobile browsers."""
     p = REPORTS_DIR / name
     if not p.exists():
         return jsonify({"error": "Not found"}), 404
     try:
         sys.path.insert(0, str(MODULES_DIR))
         from report_generator import generate_html_report
-        data = json.loads(p.read_text())
+        data     = json.loads(p.read_text())
         findings = data if isinstance(data, list) else data.get("findings", [])
         target   = data.get("target", "Unknown") if isinstance(data, dict) else "Unknown"
         html     = generate_html_report(target, findings)
         resp = app.make_response(html)
-        resp.headers["Content-Type"] = "text/html; charset=utf-8"
+        resp.headers["Content-Type"]        = "text/html; charset=utf-8"
         resp.headers["Content-Disposition"] = f'attachment; filename="{name.replace(".json","")}-report.html"'
-        resp.headers["Cache-Control"] = "no-store"
+        resp.headers["Cache-Control"]       = "no-store"
         return resp
     except Exception as e:
         return jsonify({"error": f"Report generation failed: {e}"}), 500
@@ -305,12 +381,11 @@ def get_report_html(name):
 
 @bp.route("/api/reports/combined/html", methods=["GET"])
 def get_combined_html_report():
-    """Merge ALL scan JSON files into one HTML report — ideal for mobile download."""
     try:
         sys.path.insert(0, str(MODULES_DIR))
         from report_generator import generate_html_report
         all_findings = []
-        target = "Unknown"
+        target       = "Unknown"
         for f in sorted(REPORTS_DIR.glob("*.json")):
             if f.name.startswith("_"):
                 continue
@@ -324,17 +399,14 @@ def get_combined_html_report():
                         target = data["target"]
             except Exception:
                 pass
-
-        # Read target from _target.txt if available
         target_file = REPORTS_DIR / "_target.txt"
         if target_file.exists():
             target = target_file.read_text().strip()
-
         html = generate_html_report(target, all_findings)
         resp = app.make_response(html)
-        resp.headers["Content-Type"] = "text/html; charset=utf-8"
+        resp.headers["Content-Type"]        = "text/html; charset=utf-8"
         resp.headers["Content-Disposition"] = 'attachment; filename="mirror-full-report.html"'
-        resp.headers["Cache-Control"] = "no-store"
+        resp.headers["Cache-Control"]       = "no-store"
         return resp
     except Exception as e:
         return jsonify({"error": f"Combined report failed: {e}"}), 500
@@ -347,7 +419,7 @@ def list_cves():
         import importlib
         import cveprobe
         importlib.reload(cveprobe)
-        probes = cveprobe.CVE_PROBES
+        probes          = cveprobe.CVE_PROBES
         platform_filter = request.args.get("platform", "").lower()
         if platform_filter:
             probes = [p for p in probes if p["platform"].lower() == platform_filter]
@@ -379,29 +451,98 @@ def list_chains():
 def health():
     modules = {m: (SCANNER_ROOT / f"modules/{m}.py").exists() for m in MODULE_PATHS}
     return jsonify({
-        "status": "ok",
-        "modules": modules,
-        "modules_ready": sum(modules.values()),
-        "modules_total": len(modules),
+        "status":         "ok",
+        "modules":        modules,
+        "modules_ready":  sum(modules.values()),
+        "modules_total":  len(modules),
     })
 
 
 app.register_blueprint(bp, url_prefix=SCANNER_BASE)
 
 
-# ─── Serve React frontend static files (catch-all — must be last) ─────────────
+# ─── WebSocket live-stream endpoint ──────────────────────────────────────────
+#
+#  Event protocol (newline-delimited JSON sent to the client):
+#    {type: "log",          data: "<terminal line>"}
+#    {type: "module_start", module: "<id>", index: N, total_modules: N}
+#    {type: "module_done",  module: "<id>", count: N, total: N, findings: [...]}
+#    {type: "done",         total_findings: N}
+#    {type: "stopped"}
+#    {type: "ping"}                           ← keepalive every 25 s
+#    {type: "error",        data: "<msg>"}
+#
+#  Late-connecting clients receive a full replay of past events before
+#  streaming continues, so page refresh during a scan works correctly.
+#
+@sock.route(SCANNER_BASE + "/api/scan/ws/<job_id>")
+def ws_scan_stream(ws, job_id):
+    my_q = queue.Queue()
+
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if not job:
+            try:
+                ws.send(json.dumps({"type": "error", "data": "Job not found"}))
+            except Exception:
+                pass
+            return
+        past_events  = list(job.get("ws_events", []))
+        already_done = job.get("status") in ("done", "error", "stopped")
+        job.setdefault("ws_queues", []).append(my_q)
+
+    try:
+        # Replay events that occurred before this connection was established
+        for msg in past_events:
+            ws.send(msg)
+
+        if already_done:
+            # If scan finished before we connected, ensure client gets a terminal event
+            terminal_types = ('"type": "done"', '"type":"done"',
+                              '"type": "stopped"', '"type":"stopped"')
+            if not any(t in m for m in past_events for t in terminal_types):
+                with JOBS_LOCK:
+                    total = len(JOBS.get(job_id, {}).get("all_findings", []))
+                ws.send(json.dumps({"type": "done", "total_findings": total}))
+            return
+
+        # Stream live events from the per-connection queue
+        while True:
+            try:
+                msg = my_q.get(timeout=25)
+            except queue.Empty:
+                # Keepalive so proxy/browser doesn't kill idle connection
+                ws.send(json.dumps({"type": "ping"}))
+                continue
+
+            ws.send(msg)
+
+            try:
+                if json.loads(msg).get("type") in ("done", "stopped", "error"):
+                    break
+            except Exception:
+                pass
+
+    except Exception:
+        pass
+    finally:
+        with JOBS_LOCK:
+            try:
+                JOBS[job_id]["ws_queues"].remove(my_q)
+            except Exception:
+                pass
+
+
+# ─── Serve React frontend (catch-all — must be last) ─────────────────────────
 
 @app.route("/", defaults={"path": ""})
 @app.route("/<path:path>")
 def serve_frontend(path):
-    # Let the blueprint handle any scanner-api routes
     if path.startswith(SCANNER_BASE.lstrip("/")):
         return jsonify({"error": "Not found"}), 404
-    # Serve static asset files directly
     file_path = STATIC_DIR / path
     if path and file_path.exists() and file_path.is_file():
         return send_from_directory(STATIC_DIR, path)
-    # Fall back to index.html for SPA client-side routing
     index = STATIC_DIR / "index.html"
     if index.exists():
         return send_file(index)
@@ -411,5 +552,6 @@ def serve_frontend(path):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     print(f"[*] Scanner API  → http://0.0.0.0:{port}{SCANNER_BASE}/api/health")
+    print(f"[*] WebSocket    → ws://0.0.0.0:{port}{SCANNER_BASE}/api/scan/ws/<job_id>")
     print(f"[*] Frontend     → http://0.0.0.0:{port}/")
     app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
