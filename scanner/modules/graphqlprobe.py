@@ -19,6 +19,7 @@ import re
 import sys
 import time
 from pathlib import Path
+from typing import Optional
 from urllib.parse import urlparse
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -194,7 +195,7 @@ class GraphQLProbe:
 
     # ── endpoint discovery ────────────────────────────────────────────────────
 
-    async def discover_endpoint(self, sess) -> str | None:
+    async def discover_endpoint(self, sess) -> Optional[str]:
         print("\n[*] GraphQLProbe: discovering endpoint...")
         tasks = [self._gql(sess, self.target + ep, PROBE_QUERY)
                  for ep in GRAPHQL_ENDPOINTS]
