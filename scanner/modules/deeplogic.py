@@ -377,21 +377,204 @@ class DeepLogic:
                 except Exception:
                     pass
 
+    # ── JWT expiry bypass ─────────────────────────────────────────────────────
+
+    async def test_jwt_expiry_bypass(self, sess):
+        """Send an obviously expired JWT and check if the server still accepts it."""
+        print("\n[*] Testing JWT expiry bypass...")
+        import base64 as _b64
+        # Build a clearly expired JWT: exp = Unix epoch 1 (1970-01-01 00:00:01)
+        header  = _b64.urlsafe_b64encode(b'{"alg":"HS256","typ":"JWT"}').rstrip(b'=').decode()
+        payload = _b64.urlsafe_b64encode(
+            b'{"sub":"1","role":"admin","iat":1,"exp":1}'
+        ).rstrip(b'=').decode()
+        expired_jwt = f"{header}.{payload}.invalidsignatureXXXXXXXXXXXX"
+
+        protected_paths = [
+            "/api/users", "/api/profile", "/api/me",
+            "/api/admin", "/api/v1/users", "/api/v1/profile",
+            "/api/dashboard", "/api/settings",
+        ]
+        for path in protected_paths:
+            s, body, hdrs = await self._get(
+                sess, self.target + path,
+                headers={"Authorization": f"Bearer {expired_jwt}"})
+            await delay(0.1)
+            if s in (200, 201) and body and len(body) > 50:
+                # Make sure unauthenticated baseline is different (actually protected)
+                s0, _, _ = await self._get(sess, self.target + path)
+                await delay(0.1)
+                if s0 in (401, 403):
+                    key = f"jwt_exp_{path}"
+                    if key not in self._dedup:
+                        self._dedup.add(key)
+                        self.findings.append({
+                            "type": "JWT_EXPIRY_NOT_ENFORCED",
+                            "severity": "CRITICAL",
+                            "confidence": 94,
+                            "confidence_label": "Confirmed",
+                            "url": self.target + path,
+                            "proof": (
+                                f"GET {path}\n"
+                                f"  Authorization: Bearer {expired_jwt[:60]}...\n"
+                                f"  HTTP {s} — server accepted JWT with exp=1 (1970)\n"
+                                f"  Without token: HTTP {s0} (protected)\n"
+                                f"  Body: {body[:300]}"
+                            ),
+                            "detail": (
+                                f"JWT expiry not enforced at {path}: "
+                                f"token with exp=1 (year 1970) accepted as valid. "
+                                f"Stolen tokens never expire."
+                            ),
+                            "remediation": (
+                                "1. Always validate the 'exp' claim server-side before processing the token.\n"
+                                "2. Use a well-maintained JWT library (PyJWT, jsonwebtoken) that validates exp.\n"
+                                "3. Set short token TTLs (15–60 minutes) and implement token rotation.\n"
+                                "4. Maintain a token revocation list (blocklist) for logout."
+                            ),
+                            "mitre_technique": "T1550.001",
+                            "mitre_name": "Use Alternate Authentication Material: Application Access Token",
+                        })
+                        print(f"  [CRITICAL] JWT expiry not enforced at {path}")
+
+    # ── HTTP verb tampering ───────────────────────────────────────────────────
+
+    async def test_verb_tampering(self, sess):
+        """Try accessing protected endpoints with uncommon HTTP verbs to bypass ACLs."""
+        print("\n[*] Testing HTTP verb tampering...")
+        targets = [
+            ("/api/admin", ["HEAD", "OPTIONS", "TRACE", "PUT", "PATCH"]),
+            ("/api/admin/users", ["HEAD", "OPTIONS", "TRACE"]),
+            ("/api/config",  ["HEAD", "OPTIONS", "TRACE", "PUT"]),
+            ("/api/env",     ["HEAD", "OPTIONS", "TRACE"]),
+            ("/api/debug",   ["HEAD", "OPTIONS", "TRACE"]),
+        ]
+        for path, verbs in targets:
+            url = self.target + path
+            # Establish GET baseline (should be 401/403 if protected)
+            s_get, _, _ = await self._get(sess, url)
+            await delay(0.05)
+            if s_get not in (401, 403):
+                continue  # Not protected — skip
+            for verb in verbs:
+                try:
+                    merged = {**WAF_BYPASS_HEADERS, "User-Agent": random_ua()}
+                    async with sess.request(
+                        verb, url, headers=merged, ssl=False,
+                        allow_redirects=False,
+                        timeout=aiohttp.ClientTimeout(total=8),
+                    ) as r:
+                        body = await r.text(errors="ignore")
+                        s = r.status
+                    await delay(0.05)
+                except Exception:
+                    continue
+                if s in (200, 201, 204):
+                    key = f"verb_{verb}_{path}"
+                    if key not in self._dedup:
+                        self._dedup.add(key)
+                        self.findings.append({
+                            "type": "HTTP_VERB_TAMPERING_BYPASS",
+                            "severity": "HIGH",
+                            "confidence": 88,
+                            "confidence_label": "High",
+                            "url": url,
+                            "verb": verb,
+                            "baseline_get_status": s_get,
+                            "bypass_status": s,
+                            "proof": (
+                                f"GET {path} → HTTP {s_get} (protected)\n"
+                                f"{verb} {path} → HTTP {s} (BYPASSED)\n"
+                                f"Body: {body[:200]}"
+                            ),
+                            "detail": (
+                                f"HTTP verb tampering: {verb} {path} returned HTTP {s} "
+                                f"while GET returns {s_get}. ACL only checks GET/POST."
+                            ),
+                            "remediation": (
+                                "1. Apply access controls at the URL/resource level, not per HTTP method.\n"
+                                "2. Explicitly deny all unlisted HTTP methods (return 405).\n"
+                                "3. Use an allowlist of permitted verbs per endpoint.\n"
+                                "4. Configure your web framework/proxy to block TRACE globally."
+                            ),
+                            "mitre_technique": "T1190",
+                            "mitre_name": "Exploit Public-Facing Application",
+                        })
+                        print(f"  [HIGH] Verb tampering: {verb} {path} → HTTP {s}")
+
+    # ── Workflow step bypass ──────────────────────────────────────────────────
+
+    async def test_workflow_bypass(self, sess):
+        """Try to jump directly to checkout/payment step without completing earlier steps."""
+        print("\n[*] Testing workflow step bypass (skip-to-payment)...")
+        final_steps = [
+            ("/api/checkout/confirm",  {"order_id": "1", "step": "3"}),
+            ("/api/order/complete",    {"cart_id":  "1", "step": "final"}),
+            ("/api/payment/process",   {"amount": 1, "currency": "USD"}),
+            ("/api/checkout/payment",  {"method": "card", "amount": 0.01}),
+            ("/api/purchase/confirm",  {"product_id": "1", "qty": 1}),
+        ]
+        for path, payload in final_steps:
+            s, body, _ = await self._post(sess, path, json_data=payload)
+            await delay(0.08)
+            if s in (200, 201) and body:
+                body_lower = body.lower()
+                if any(kw in body_lower for kw in [
+                    "order_id", "confirmation", "receipt",
+                    "transaction_id", "paid", "success", "approved",
+                ]):
+                    key = f"workflow_{path}"
+                    if key not in self._dedup:
+                        self._dedup.add(key)
+                        self.findings.append({
+                            "type": "WORKFLOW_BYPASS",
+                            "severity": "HIGH",
+                            "confidence": 80,
+                            "confidence_label": "High",
+                            "url": self.target + path,
+                            "payload": payload,
+                            "proof": (
+                                f"POST {path} {json.dumps(payload)}\n"
+                                f"  HTTP {s} — checkout step accepted without prior steps\n"
+                                f"  Body: {body[:300]}"
+                            ),
+                            "detail": (
+                                f"Workflow bypass: jumped directly to {path} "
+                                f"without completing earlier checkout/cart steps. "
+                                f"May allow zero-price or unauthorized purchases."
+                            ),
+                            "remediation": (
+                                "1. Enforce state machine on the server — validate that prior steps were completed.\n"
+                                "2. Store workflow state server-side, never trust client-supplied step numbers.\n"
+                                "3. Bind checkout sessions to a user's cart and validate lineage.\n"
+                                "4. Use signed workflow tokens to prevent step skipping."
+                            ),
+                            "mitre_technique": "T1565",
+                            "mitre_name": "Data Manipulation",
+                        })
+                        print(f"  [HIGH] Workflow bypass at {path}")
+
     # ── Main ─────────────────────────────────────────────────────────────────
 
     async def run(self):
         print("=" * 60)
-        print("  DeepLogic v5 — Business Logic Flaw Detector")
-        print("  Mass Assignment | Race Conditions | Price Manipulation | Enumeration")
+        print("  DeepLogic v6 — Business Logic Flaw Detector")
+        print("  Mass Assignment | Race Conditions | Price Manipulation")
+        print("  JWT Expiry | Verb Tampering | Workflow Bypass | Enumeration")
         print("=" * 60)
         conn = aiohttp.TCPConnector(limit=12, ssl=False)
-        async with aiohttp.ClientSession(connector=conn, timeout=aiohttp.ClientTimeout(total=120)) as sess:
+        async with aiohttp.ClientSession(
+            connector=conn, timeout=aiohttp.ClientTimeout(total=150)
+        ) as sess:
             await self.test_mass_assignment(sess)
             await self.test_race_condition(sess)
             await self.test_price_manipulation(sess)
             await self.test_account_enumeration(sess)
             await self.test_hpp(sess)
             await self.test_api_version_downgrade(sess)
+            await self.test_jwt_expiry_bypass(sess)
+            await self.test_verb_tampering(sess)
+            await self.test_workflow_bypass(sess)
         print(f"\n[+] DeepLogic complete: {len(self.findings)} findings")
         return self.findings
 
