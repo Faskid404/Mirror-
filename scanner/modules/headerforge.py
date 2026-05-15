@@ -29,9 +29,8 @@ CORS_TEST_ORIGINS = [
 SECURITY_HEADERS = {
     "Strict-Transport-Security": {
         "required": True, "severity": "HIGH",
-        "validate": lambda v: "max-age=" in v.lower() and int(
-            re.search(r'max-age=(\d+)', v, re.I).group(1)) >= 31536000
-            if re.search(r'max-age=(\d+)', v, re.I) else False,
+        "validate": lambda v: (lambda m: bool(m) and int(m.group(1)) >= 31536000)(
+            re.search(r'max-age=(\d+)', v, re.I)),
         "ideal": "max-age=63072000; includeSubDomains; preload",
         "detail": "Missing HSTS — browser allows HTTP downgrade, enables SSL stripping / MITM attacks",
     },
