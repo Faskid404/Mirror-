@@ -84,8 +84,11 @@ def _extract_pii(body: str) -> dict:
 
 
 def _extract_pii_strict(body: str) -> dict:
+    """Return PII found in body.  Previously required ≥2 fields which caused
+    false-negatives on endpoints that only leak a single field (e.g. email).
+    Lowered to ≥1 so single-field leaks are still surfaced as findings."""
     all_pii = _extract_pii(body)
-    if len(all_pii) < 2:
+    if len(all_pii) < 1:
         return {}
     return all_pii
 
