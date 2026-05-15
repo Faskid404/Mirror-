@@ -178,8 +178,11 @@ class WAFShatter:
             await delay(0.15)
             if s is None:
                 continue
-            # Bypass = WAF no longer returns its block response AND we get a structural response
-            if s not in (s_blocked, 429, 503) and s in (200, 201, 301, 302):
+            # Bypass = WAF no longer returns its block response AND we get a real content response.
+            # 301/302 are excluded: WAFs commonly redirect blocked requests to challenge pages,
+            # so a redirect with bypass headers is NOT a confirmed bypass — it is more likely
+            # the WAF routing to a CAPTCHA/JS-challenge page.
+            if s not in (s_blocked, 429, 503) and s in (200, 201):
                 # Verify body is different (not the same WAF block page)
                 if (body or "")[:100] == (body_blocked or "")[:100]:
                     continue
