@@ -311,6 +311,23 @@ def correlate(findings: list) -> list:
             for t in matched_types:
                 matched_findings.extend(by_type[t][:3])
 
+            # Same-host guard: when a chain requires ≥2 finding types,
+            # ensure the component findings share at least one common host.
+            # Without this, a WAF bypass on host-A and an XSS on host-B
+            # would incorrectly combine into an attack chain.
+            if len(matched_findings) > 1:
+                from urllib.parse import urlparse as _up
+                from collections import Counter as _Counter
+                hosts = [_up(f.get("url", "")).netloc for f in matched_findings if f.get("url")]
+                if hosts:
+                    top_host = _Counter(hosts).most_common(1)[0][0]
+                    same_host = [f for f in matched_findings
+                                 if _up(f.get("url", "")).netloc == top_host or not f.get("url")]
+                    # Require that the majority of matched findings share the top host
+                    if len(same_host) < max(1, len(matched_findings) // 2):
+                        continue
+                    matched_findings = same_host
+
             score = risk_score_chain(chain_def, matched_findings)
             kill_chain = chain_def.get("kill_chain", [])
             mitre_stages = [
