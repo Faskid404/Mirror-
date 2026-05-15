@@ -75,7 +75,7 @@ class CryptoHunter:
                 ctx.verify_mode    = ssl.CERT_NONE
                 ctx.maximum_version = ssl_ver
                 ctx.minimum_version = ssl_ver
-                loop = asyncio.get_event_loop()
+                loop = asyncio.get_running_loop()
                 def _connect():
                     with socket.create_connection((self.host, self.port), timeout=5) as sock:
                         with ctx.wrap_socket(sock, server_hostname=self.host) as ssock:
@@ -112,7 +112,7 @@ class CryptoHunter:
             ctx = ssl.create_default_context()
             ctx.check_hostname = False
             ctx.verify_mode    = ssl.CERT_NONE
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
 
             def _get_cert():
                 with socket.create_connection((self.host, self.port), timeout=8) as sock:
