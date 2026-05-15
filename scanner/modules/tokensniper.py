@@ -215,17 +215,19 @@ class TokenSniper:
                 timeout=aiohttp.ClientTimeout(total=60),
                 headers={"User-Agent": random_ua()}) as sess:
 
-            # Scan known source paths
+            # Scan known source paths — parallelise in batches of 8
             print("\n[*] Scanning known source/config paths...")
-            for path in SOURCE_PATHS:
-                await self.scan_url(sess, self.target + path)
+            source_tasks = [self.scan_url(sess, self.target + p) for p in SOURCE_PATHS]
+            for i in range(0, len(source_tasks), 8):
+                await asyncio.gather(*source_tasks[i:i + 8])
 
-            # Discover and scan JS bundles
+            # Discover and scan JS bundles — parallelise all bundles at once
             print("\n[*] Discovering and scanning JS bundles...")
             js_urls = await self._get_js_bundle_urls(sess, self.target)
             print(f"  Found {len(js_urls)} JS bundle(s)")
-            for js_url in js_urls[:20]:  # limit to avoid runaway
-                await self.scan_url(sess, js_url)
+            bundle_tasks = [self.scan_url(sess, u) for u in js_urls[:20]]
+            if bundle_tasks:
+                await asyncio.gather(*bundle_tasks)
 
         total = len(self.findings)
         critical = sum(1 for f in self.findings if f['severity'] == 'CRITICAL')
