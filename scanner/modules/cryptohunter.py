@@ -50,7 +50,7 @@ from urllib.parse import urlparse
 sys.path.insert(0, str(Path(__file__).parent))
 from smart_filter import (
     delay, confidence_label, meets_confidence_floor,
-    random_ua, WAF_BYPASS_HEADERS, shannon_entropy,
+    random_ua, WAF_BYPASS_HEADERS, shannon_entropy, gen_bypass_attempts,
 )
 
 CONCURRENCY = 6
@@ -119,26 +119,38 @@ class CryptoHunter:
 
     async def _get(self, sess, url, headers=None, timeout=15):
         async with self._sem:
-            h = {**WAF_BYPASS_HEADERS, "User-Agent": random_ua(), **(headers or {})}
-            try:
-                async with sess.get(url, headers=h, ssl=False, allow_redirects=True,
-                                    timeout=aiohttp.ClientTimeout(total=timeout, connect=10)) as r:
-                    body = await r.text(errors="ignore")
-                    return r.status, body, dict(r.headers)
-            except Exception:
-                return None, "", {}
+            last: tuple = (None, "", {})
+            for attempt_h in gen_bypass_attempts(extra_headers=headers):
+                try:
+                    async with sess.get(
+                        url, headers=attempt_h, ssl=False, allow_redirects=True,
+                        timeout=aiohttp.ClientTimeout(total=timeout, connect=10),
+                    ) as r:
+                        body = await r.text(errors="ignore")
+                        last = (r.status, body, dict(r.headers))
+                        if r.status not in (401, 403, 405, 429, 503):
+                            return last
+                except Exception:
+                    pass
+            return last
 
     async def _post(self, sess, url, data=None, headers=None, timeout=15):
         async with self._sem:
-            h = {**WAF_BYPASS_HEADERS, "User-Agent": random_ua(), **(headers or {})}
-            try:
-                async with sess.post(url, json=data, headers=h, ssl=False,
-                                     allow_redirects=True,
-                                     timeout=aiohttp.ClientTimeout(total=timeout, connect=10)) as r:
-                    body = await r.text(errors="ignore")
-                    return r.status, body, dict(r.headers)
-            except Exception:
-                return None, "", {}
+            last: tuple = (None, "", {})
+            for attempt_h in gen_bypass_attempts(extra_headers=headers):
+                try:
+                    async with sess.post(
+                        url, json=data, headers=attempt_h, ssl=False,
+                        allow_redirects=True,
+                        timeout=aiohttp.ClientTimeout(total=timeout, connect=10),
+                    ) as r:
+                        body = await r.text(errors="ignore")
+                        last = (r.status, body, dict(r.headers))
+                        if r.status not in (401, 403, 405, 429, 503):
+                            return last
+                except Exception:
+                    pass
+            return last
 
     # ── TLS Certificate Analysis ─────────────────────────────────────────────
 

@@ -41,7 +41,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from smart_filter import (
     delay, confidence_label, meets_confidence_floor,
     random_ua, REQUEST_DELAY, WAF_BYPASS_HEADERS, make_bypass_headers,
-    PATH_BYPASS_VARIANTS,
+    PATH_BYPASS_VARIANTS, gen_bypass_attempts,
 )
 
 SEED = "MIRROR" + "".join(random.choices(string.ascii_uppercase, k=4))
@@ -386,31 +386,39 @@ class SSTIScanner:
 
     async def _get(self, sess, url, params=None, headers=None, timeout=14):
         async with self._sem:
-            h = {**WAF_BYPASS_HEADERS, "User-Agent": random_ua(), **(headers or {})}
-            try:
-                async with sess.get(
-                    url, params=params or {}, headers=h, ssl=False,
-                    timeout=aiohttp.ClientTimeout(total=timeout),
-                    allow_redirects=True,
-                ) as r:
-                    body = await r.text(errors="ignore")
-                    return r.status, body, dict(r.headers)
-            except Exception:
-                return None, "", {}
+            last: tuple = (None, "", {})
+            for attempt_h in gen_bypass_attempts(extra_headers=headers):
+                try:
+                    async with sess.get(
+                        url, params=params or {}, headers=attempt_h, ssl=False,
+                        timeout=aiohttp.ClientTimeout(total=timeout, connect=8),
+                        allow_redirects=True,
+                    ) as r:
+                        body = await r.text(errors="ignore")
+                        last = (r.status, body, dict(r.headers))
+                        if r.status not in (401, 403, 405, 429, 503):
+                            return last
+                except Exception:
+                    pass
+            return last
 
     async def _post(self, sess, url, json_data=None, data=None, headers=None, timeout=14):
         async with self._sem:
-            h = {**WAF_BYPASS_HEADERS, "User-Agent": random_ua(), **(headers or {})}
-            try:
-                async with sess.post(
-                    url, json=json_data, data=data, headers=h, ssl=False,
-                    timeout=aiohttp.ClientTimeout(total=timeout),
-                    allow_redirects=True,
-                ) as r:
-                    body = await r.text(errors="ignore")
-                    return r.status, body, dict(r.headers)
-            except Exception:
-                return None, "", {}
+            last: tuple = (None, "", {})
+            for attempt_h in gen_bypass_attempts(extra_headers=headers):
+                try:
+                    async with sess.post(
+                        url, json=json_data, data=data, headers=attempt_h, ssl=False,
+                        timeout=aiohttp.ClientTimeout(total=timeout, connect=8),
+                        allow_redirects=True,
+                    ) as r:
+                        body = await r.text(errors="ignore")
+                        last = (r.status, body, dict(r.headers))
+                        if r.status not in (401, 403, 405, 429, 503):
+                            return last
+                except Exception:
+                    pass
+            return last
 
     def _is_reflected(self, payload: str, body: str, expected: str) -> bool:
         if not body or not expected:

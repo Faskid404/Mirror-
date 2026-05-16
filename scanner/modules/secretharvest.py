@@ -35,7 +35,7 @@ from urllib.parse import urlparse, urljoin
 sys.path.insert(0, str(Path(__file__).parent))
 from smart_filter import (
     delay, confidence_label, meets_confidence_floor,
-    random_ua, shannon_entropy, WAF_BYPASS_HEADERS,
+    random_ua, shannon_entropy, WAF_BYPASS_HEADERS, gen_bypass_attempts,
 )
 
 CONCURRENCY = 12
@@ -239,21 +239,25 @@ class SecretHarvest:
     async def _get(self, sess, url: str, headers: dict | None = None,
                    retries: int = 2) -> tuple[int | None, str, dict]:
         async with self._sem:
-            h = {**WAF_BYPASS_HEADERS, "User-Agent": random_ua(), **(headers or {})}
-            for attempt in range(retries + 1):
-                try:
-                    async with sess.get(
-                        url, headers=h, ssl=False, allow_redirects=True,
-                        timeout=aiohttp.ClientTimeout(total=18, connect=10),
-                    ) as r:
-                        body = await r.text(errors="ignore")
-                        return r.status, body, dict(r.headers)
-                except (asyncio.TimeoutError, aiohttp.ClientError):
-                    if attempt < retries:
-                        await asyncio.sleep(0.5)
-                except Exception:
-                    break
-            return None, "", {}
+            last: tuple = (None, "", {})
+            for attempt_h in gen_bypass_attempts(extra_headers=headers):
+                for attempt in range(retries + 1):
+                    try:
+                        async with sess.get(
+                            url, headers=attempt_h, ssl=False, allow_redirects=True,
+                            timeout=aiohttp.ClientTimeout(total=18, connect=10),
+                        ) as r:
+                            body = await r.text(errors="ignore")
+                            last = (r.status, body, dict(r.headers))
+                            if r.status not in (401, 403, 405, 429, 503):
+                                return last
+                            break  # blocked — try next bypass sequence
+                    except (asyncio.TimeoutError, aiohttp.ClientError):
+                        if attempt < retries:
+                            await asyncio.sleep(0.4)
+                    except Exception:
+                        break
+            return last
 
     def _scan_body(self, body: str, url: str) -> list[dict]:
         """Scan response body for all secret patterns."""

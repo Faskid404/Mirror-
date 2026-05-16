@@ -56,7 +56,7 @@ from urllib.parse import urlparse, quote, urljoin
 sys.path.insert(0, str(Path(__file__).parent))
 from smart_filter import (
     build_baseline_404, delay, confidence_label, meets_confidence_floor,
-    random_ua, WAF_BYPASS_HEADERS,
+    random_ua, WAF_BYPASS_HEADERS, gen_bypass_attempts,
 )
 
 CONCURRENCY = 8
@@ -241,34 +241,50 @@ class BackendProbe:
 
     async def _get(self, sess, url, params=None, headers=None, timeout=18):
         async with self._sem:
-            h = {**WAF_BYPASS_HEADERS, "User-Agent": random_ua(), **(headers or {})}
-            try:
-                async with sess.get(url, params=params or {}, headers=h, ssl=False,
-                                    allow_redirects=True,
-                                    timeout=aiohttp.ClientTimeout(total=timeout, connect=10)) as r:
-                    body = await r.text(errors="ignore")
-                    return r.status, body, dict(r.headers)
-            except Exception:
-                return None, "", {}
+            last: tuple = (None, "", {})
+            for attempt_h in gen_bypass_attempts(extra_headers=headers):
+                try:
+                    async with sess.get(
+                        url, params=params or {}, headers=attempt_h, ssl=False,
+                        allow_redirects=True,
+                        timeout=aiohttp.ClientTimeout(total=timeout, connect=10),
+                    ) as r:
+                        body = await r.text(errors="ignore")
+                        last = (r.status, body, dict(r.headers))
+                        if r.status not in (401, 403, 405, 429, 503):
+                            return last
+                except Exception:
+                    pass
+            return last
 
     async def _post(self, sess, url, data=None, raw=None, headers=None, timeout=18):
         async with self._sem:
-            h = {**WAF_BYPASS_HEADERS, "User-Agent": random_ua(), **(headers or {})}
-            try:
-                if raw is not None:
-                    async with sess.post(url, data=raw, headers=h, ssl=False,
-                                         allow_redirects=True,
-                                         timeout=aiohttp.ClientTimeout(total=timeout, connect=10)) as r:
-                        body = await r.text(errors="ignore")
-                        return r.status, body, dict(r.headers)
-                else:
-                    async with sess.post(url, json=data, headers=h, ssl=False,
-                                         allow_redirects=True,
-                                         timeout=aiohttp.ClientTimeout(total=timeout, connect=10)) as r:
-                        body = await r.text(errors="ignore")
-                        return r.status, body, dict(r.headers)
-            except Exception:
-                return None, "", {}
+            last: tuple = (None, "", {})
+            for attempt_h in gen_bypass_attempts(extra_headers=headers):
+                try:
+                    if raw is not None:
+                        async with sess.post(
+                            url, data=raw, headers=attempt_h, ssl=False,
+                            allow_redirects=True,
+                            timeout=aiohttp.ClientTimeout(total=timeout, connect=10),
+                        ) as r:
+                            body = await r.text(errors="ignore")
+                            last = (r.status, body, dict(r.headers))
+                            if r.status not in (401, 403, 405, 429, 503):
+                                return last
+                    else:
+                        async with sess.post(
+                            url, json=data, headers=attempt_h, ssl=False,
+                            allow_redirects=True,
+                            timeout=aiohttp.ClientTimeout(total=timeout, connect=10),
+                        ) as r:
+                            body = await r.text(errors="ignore")
+                            last = (r.status, body, dict(r.headers))
+                            if r.status not in (401, 403, 405, 429, 503):
+                                return last
+                except Exception:
+                    pass
+            return last
 
     # ── SSRF ────────────────────────────────────────────────────────────────
 

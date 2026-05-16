@@ -30,6 +30,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from smart_filter import (
     REQUEST_DELAY, confidence_score, confidence_label, severity_from_confidence,
     random_ua, WAF_BYPASS_HEADERS, make_bypass_headers, meets_confidence_floor,
+    gen_bypass_attempts,
 )
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -505,29 +506,29 @@ class CVEProbeEngine:
     # ── HTTP ──────────────────────────────────────────────────────────────────
 
     async def _request(self, sess, method, url, headers=None, body=None, retries=2):
-        """Send HTTP request with retry on timeout, WAF evasion headers."""
-        merged_headers = {**WAF_BYPASS_HEADERS,
-                         "User-Agent": random_ua()}
-        if headers:
-            merged_headers.update(headers)
-
-        for attempt in range(retries + 1):
-            try:
-                timeout = aiohttp.ClientTimeout(total=12)
-                kw = dict(headers=merged_headers, ssl=False,
-                          timeout=timeout, allow_redirects=False)
-                if body:
-                    kw['data'] = body
-                async with sess.request(method, url, **kw) as r:
-                    text = await r.text(errors='ignore')
-                    return r.status, text, dict(r.headers)
-            except asyncio.TimeoutError:
-                if attempt < retries:
-                    await asyncio.sleep(1.0)
-                continue
-            except Exception:
-                return None, None, {}
-        return None, None, {}
+        """Send HTTP request with full bypass retry arsenal on 403/401/429."""
+        last: tuple = (None, None, {})
+        for attempt_h in gen_bypass_attempts(extra_headers=headers):
+            for attempt in range(retries + 1):
+                try:
+                    to = aiohttp.ClientTimeout(total=12, connect=8)
+                    kw: dict = dict(headers=attempt_h, ssl=False,
+                                    timeout=to, allow_redirects=False)
+                    if body:
+                        kw["data"] = body
+                    async with sess.request(method, url, **kw) as r:
+                        text = await r.text(errors="ignore")
+                        last = (r.status, text, dict(r.headers))
+                        if r.status not in (401, 403, 405, 429, 503):
+                            return last
+                        break  # blocked — try next bypass sequence
+                except asyncio.TimeoutError:
+                    if attempt < retries:
+                        await asyncio.sleep(0.8)
+                    continue
+                except Exception:
+                    return None, None, {}
+        return last
 
     # ── Technology fingerprinting ─────────────────────────────────────────────
 

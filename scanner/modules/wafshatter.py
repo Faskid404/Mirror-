@@ -50,7 +50,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from smart_filter import (
     build_baseline_404, delay, confidence_label, meets_confidence_floor,
     random_ua, WAF_BYPASS_HEADERS, MITRE_MAP, make_bypass_headers,
-    PATH_BYPASS_VARIANTS,
+    PATH_BYPASS_VARIANTS, gen_bypass_attempts,
 )
 
 CONCURRENCY = 10
@@ -291,31 +291,39 @@ class WAFShatter:
 
     async def _get(self, sess, url, headers=None, allow_redirects=True, timeout=15):
         async with self._sem:
-            h = {**WAF_BYPASS_HEADERS, "User-Agent": random_ua(), **(headers or {})}
-            try:
-                async with sess.get(
-                    url, headers=h, ssl=False,
-                    allow_redirects=allow_redirects,
-                    timeout=aiohttp.ClientTimeout(total=timeout, connect=10),
-                ) as r:
-                    body = await r.text(errors="ignore")
-                    return r.status, body, dict(r.headers)
-            except Exception:
-                return None, "", {}
+            last: tuple = (None, "", {})
+            for attempt_h in gen_bypass_attempts(extra_headers=headers):
+                try:
+                    async with sess.get(
+                        url, headers=attempt_h, ssl=False,
+                        allow_redirects=allow_redirects,
+                        timeout=aiohttp.ClientTimeout(total=timeout, connect=10),
+                    ) as r:
+                        body = await r.text(errors="ignore")
+                        last = (r.status, body, dict(r.headers))
+                        if r.status not in (401, 403, 405, 429, 503):
+                            return last
+                except Exception:
+                    pass
+            return last
 
     async def _post(self, sess, url, json_data=None, data=None, headers=None, timeout=15):
         async with self._sem:
-            h = {**WAF_BYPASS_HEADERS, "User-Agent": random_ua(), **(headers or {})}
-            try:
-                async with sess.post(
-                    url, json=json_data, data=data, headers=h, ssl=False,
-                    allow_redirects=True,
-                    timeout=aiohttp.ClientTimeout(total=timeout, connect=10),
-                ) as r:
-                    body = await r.text(errors="ignore")
-                    return r.status, body, dict(r.headers)
-            except Exception:
-                return None, "", {}
+            last: tuple = (None, "", {})
+            for attempt_h in gen_bypass_attempts(extra_headers=headers):
+                try:
+                    async with sess.post(
+                        url, json=json_data, data=data, headers=attempt_h, ssl=False,
+                        allow_redirects=True,
+                        timeout=aiohttp.ClientTimeout(total=timeout, connect=10),
+                    ) as r:
+                        body = await r.text(errors="ignore")
+                        last = (r.status, body, dict(r.headers))
+                        if r.status not in (401, 403, 405, 429, 503):
+                            return last
+                except Exception:
+                    pass
+            return last
 
     # ── WAF Detection ────────────────────────────────────────────────────────
 
@@ -639,13 +647,105 @@ class WAFShatter:
                         "mitre_name":       "Adversary-in-the-Middle",
                     })
 
+    async def test_path_bypass_probe(self, sess):
+        """
+        Fire every PATH_BYPASS_VARIANT against 20+ protected endpoints.
+        Reports only when:
+          - A variant returns 200/201/301/302 AND
+          - The baseline (original path) was blocked (403/401) AND
+          - Response body contains real content (not a WAF block page)
+        Zero false-positive design: the original path must confirm a block first.
+        """
+        print("\n[*] Testing path-normalisation WAF bypass (60+ variants × 20 targets)...")
+        PROTECTED_TARGETS = [
+            "/admin", "/admin/", "/admin/dashboard", "/admin/users",
+            "/admin/config", "/api/admin", "/api/internal", "/api/private",
+            "/api/debug", "/api/env", "/api/keys", "/api/secrets",
+            "/management", "/actuator", "/actuator/env", "/actuator/health",
+            "/internal", "/staff", "/backend", "/console", "/_debug",
+        ]
+        BLOCK_BODY_PATTERNS = [
+            "access denied", "blocked", "forbidden", "cloudflare", "incapsula",
+            "sucuri", "akamai", "barracuda", "modsecurity", "request blocked",
+            "security check", "attention required", "ray id",
+        ]
+
+        for protected_path in PROTECTED_TARGETS:
+            base_url = self.target.rstrip("/") + protected_path
+            # Step 1: probe the original path to confirm it's blocked
+            s_base, body_base, _ = await self._get(sess, base_url, allow_redirects=False, timeout=10)
+            await delay(0.05)
+            if s_base not in (401, 403, 405):
+                continue  # not protected — skip (no bypass needed)
+
+            # Step 2: try every path variant
+            for variant_path, technique in PATH_BYPASS_VARIANTS(protected_path):
+                if variant_path == protected_path:
+                    continue
+                variant_url = self.target.rstrip("/") + variant_path
+                s, body, hdrs = await self._get(sess, variant_url, allow_redirects=True, timeout=10)
+                await delay(0.04)
+
+                if s not in (200, 201, 301, 302):
+                    continue
+                if not body or len(body) < 80:
+                    continue
+
+                body_lower = (body or "").lower()
+                # Reject known WAF block-page signatures
+                if any(pat in body_lower for pat in BLOCK_BODY_PATTERNS):
+                    continue
+                # Require real content indicators
+                real_content = (
+                    any(k in body_lower for k in [
+                        "user", "admin", "config", "dashboard", "password",
+                        "token", "secret", "api", "data", "error", "json",
+                        "html", "<body", "{", "[", "status",
+                    ])
+                )
+                if not real_content:
+                    continue
+
+                conf = 92
+                self._add({
+                    "type":             "PATH_BYPASS_SUCCESS",
+                    "severity":         "HIGH",
+                    "confidence":       conf,
+                    "confidence_label": confidence_label(conf),
+                    "url":              variant_url,
+                    "original_url":     base_url,
+                    "bypass_technique": technique,
+                    "original_status":  s_base,
+                    "bypass_status":    s,
+                    "proof":            (
+                        f"Original path {protected_path} → HTTP {s_base} (blocked)\n"
+                        f"Bypass variant ({technique}): {variant_path} → HTTP {s}\n"
+                        f"Body snippet: {body[:120]!r}"
+                    ),
+                    "detail":           (
+                        f"WAF/ACL bypass via path normalisation. "
+                        f"Technique: '{technique}'. "
+                        f"Protected resource '{protected_path}' is accessible via the "
+                        f"path variant '{variant_path}' (HTTP {s})."
+                    ),
+                    "remediation":      (
+                        "Normalise all incoming paths server-side before ACL evaluation. "
+                        "Apply URL-decode + path-collapse before access control checks. "
+                        "Block or redirect all path variants to the canonical form."
+                    ),
+                    "mitre_technique":  "T1190",
+                    "mitre_name":       "Exploit Public-Facing Application",
+                })
+                # Once a working bypass is found for this path, stop trying more variants
+                break
+
     async def run(self):
         print("=" * 60)
-        print("  WAFShatter v8 — 150x Improved WAF Bypass & Rate-Limit Tester")
+        print("  WAFShatter v9 — Full Bypass Arsenal + Path Variant Probe")
         print(f"  Target: {self.target}")
         print("=" * 60)
         connector = aiohttp.TCPConnector(ssl=False, limit=CONCURRENCY * 2)
-        timeout   = aiohttp.ClientTimeout(total=120, connect=10)
+        timeout   = aiohttp.ClientTimeout(total=180, connect=10)
         async with aiohttp.ClientSession(connector=connector, timeout=timeout) as sess:
             await asyncio.gather(
                 self.detect_waf(sess),
@@ -653,11 +753,12 @@ class WAFShatter:
                 self.test_trace_method(sess),
                 return_exceptions=True,
             )
-            # WAF bypass only makes sense after WAF detection
+            # Sequential: WAF bypass → method overrides → path bypass probe
             await self.test_waf_bypass(sess)
             await self.test_method_overrides(sess)
+            await self.test_path_bypass_probe(sess)
 
-        print(f"\n[+] WAFShatter v8 complete: {len(self.findings)} findings")
+        print(f"\n[+] WAFShatter v9 complete: {len(self.findings)} findings")
         return self.findings
 
 

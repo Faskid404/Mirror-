@@ -74,7 +74,7 @@ from urllib.parse import urlparse, quote, urljoin, parse_qs, urlencode
 sys.path.insert(0, str(Path(__file__).parent))
 from smart_filter import (
     build_baseline_404, delay, confidence_label, meets_confidence_floor,
-    random_ua, WAF_BYPASS_HEADERS, REQUEST_DELAY,
+    random_ua, WAF_BYPASS_HEADERS, REQUEST_DELAY, gen_bypass_attempts,
 )
 
 CONCURRENCY = 10
@@ -339,35 +339,39 @@ class WebProbe:
 
     async def _get(self, sess, url, params=None, headers=None, allow_redirects=False, timeout=12):
         async with self._sem:
-            merged = {**WAF_BYPASS_HEADERS, "User-Agent": random_ua()}
-            if headers:
-                merged.update(headers)
-            try:
-                async with sess.get(
-                    url, params=params or {}, headers=merged, ssl=False,
-                    timeout=aiohttp.ClientTimeout(total=timeout),
-                    allow_redirects=allow_redirects,
-                ) as r:
-                    body = await r.text(errors="ignore")
-                    return r.status, body, dict(r.headers)
-            except Exception:
-                return None, None, {}
+            last: tuple = (None, None, {})
+            for attempt_h in gen_bypass_attempts(extra_headers=headers):
+                try:
+                    async with sess.get(
+                        url, params=params or {}, headers=attempt_h, ssl=False,
+                        timeout=aiohttp.ClientTimeout(total=timeout, connect=8),
+                        allow_redirects=allow_redirects,
+                    ) as r:
+                        body = await r.text(errors="ignore")
+                        last = (r.status, body, dict(r.headers))
+                        if r.status not in (401, 403, 405, 429, 503):
+                            return last
+                except Exception:
+                    pass
+            return last
 
     async def _post(self, sess, url, data=None, json_data=None, headers=None, timeout=14):
         async with self._sem:
-            merged = {**WAF_BYPASS_HEADERS, "User-Agent": random_ua()}
-            if headers:
-                merged.update(headers)
-            try:
-                async with sess.post(
-                    url, data=data, json=json_data, headers=merged, ssl=False,
-                    timeout=aiohttp.ClientTimeout(total=timeout),
-                    allow_redirects=True,
-                ) as r:
-                    body = await r.text(errors="ignore")
-                    return r.status, body, dict(r.headers)
-            except Exception:
-                return None, None, {}
+            last: tuple = (None, None, {})
+            for attempt_h in gen_bypass_attempts(extra_headers=headers):
+                try:
+                    async with sess.post(
+                        url, data=data, json=json_data, headers=attempt_h, ssl=False,
+                        timeout=aiohttp.ClientTimeout(total=timeout, connect=8),
+                        allow_redirects=True,
+                    ) as r:
+                        body = await r.text(errors="ignore")
+                        last = (r.status, body, dict(r.headers))
+                        if r.status not in (401, 403, 405, 429, 503):
+                            return last
+                except Exception:
+                    pass
+            return last
 
     def _is_escaped(self, payload: str, body: str) -> bool:
         escaped = [

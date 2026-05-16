@@ -61,7 +61,7 @@ from urllib.parse import urlparse
 sys.path.insert(0, str(Path(__file__).parent))
 from smart_filter import (
     delay, confidence_label, meets_confidence_floor,
-    random_ua, WAF_BYPASS_HEADERS,
+    random_ua, WAF_BYPASS_HEADERS, gen_bypass_attempts,
 )
 
 CONCURRENCY = 8
@@ -232,36 +232,40 @@ class GraphQLProbe:
 
     async def _post(self, sess, url, payload, headers=None, timeout=18):
         async with self._sem:
-            h = {
-                **WAF_BYPASS_HEADERS,
-                "User-Agent": random_ua(),
-                "Content-Type": "application/json",
-                **(headers or {}),
-            }
-            try:
-                async with sess.post(
-                    url, json=payload, headers=h, ssl=False,
-                    allow_redirects=True,
-                    timeout=aiohttp.ClientTimeout(total=timeout, connect=10),
-                ) as r:
-                    body = await r.text(errors="ignore")
-                    return r.status, body, dict(r.headers)
-            except Exception:
-                return None, "", {}
+            last: tuple = (None, "", {})
+            gql_extra = {"Content-Type": "application/json", **(headers or {})}
+            for attempt_h in gen_bypass_attempts(extra_headers=gql_extra):
+                try:
+                    async with sess.post(
+                        url, json=payload, headers=attempt_h, ssl=False,
+                        allow_redirects=True,
+                        timeout=aiohttp.ClientTimeout(total=timeout, connect=10),
+                    ) as r:
+                        body = await r.text(errors="ignore")
+                        last = (r.status, body, dict(r.headers))
+                        if r.status not in (401, 403, 405, 429, 503):
+                            return last
+                except Exception:
+                    pass
+            return last
 
     async def _get(self, sess, url, params=None, headers=None, timeout=15):
         async with self._sem:
-            h = {**WAF_BYPASS_HEADERS, "User-Agent": random_ua(), **(headers or {})}
-            try:
-                async with sess.get(
-                    url, params=params or {}, headers=h, ssl=False,
-                    allow_redirects=True,
-                    timeout=aiohttp.ClientTimeout(total=timeout, connect=10),
-                ) as r:
-                    body = await r.text(errors="ignore")
-                    return r.status, body, dict(r.headers)
-            except Exception:
-                return None, "", {}
+            last: tuple = (None, "", {})
+            for attempt_h in gen_bypass_attempts(extra_headers=headers):
+                try:
+                    async with sess.get(
+                        url, params=params or {}, headers=attempt_h, ssl=False,
+                        allow_redirects=True,
+                        timeout=aiohttp.ClientTimeout(total=timeout, connect=10),
+                    ) as r:
+                        body = await r.text(errors="ignore")
+                        last = (r.status, body, dict(r.headers))
+                        if r.status not in (401, 403, 405, 429, 503):
+                            return last
+                except Exception:
+                    pass
+            return last
 
     # ── Endpoint Discovery ─────────────────────────────────────────────────────
 

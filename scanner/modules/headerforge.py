@@ -56,7 +56,7 @@ from urllib.parse import urlparse
 sys.path.insert(0, str(Path(__file__).parent))
 from smart_filter import (
     build_baseline_404, delay, confidence_label, meets_confidence_floor,
-    random_ua, REQUEST_DELAY, WAF_BYPASS_HEADERS,
+    random_ua, REQUEST_DELAY, WAF_BYPASS_HEADERS, gen_bypass_attempts,
 )
 
 CONCURRENCY = 10
@@ -190,16 +190,21 @@ class HeaderForge:
 
     async def _get(self, sess, url, headers=None, allow_redirects=True, timeout=15):
         async with self._sem:
-            h = {**WAF_BYPASS_HEADERS, "User-Agent": random_ua(), **(headers or {})}
-            try:
-                async with sess.get(
-                    url, headers=h, ssl=False, allow_redirects=allow_redirects,
-                    timeout=aiohttp.ClientTimeout(total=timeout, connect=10),
-                ) as r:
-                    body = await r.text(errors="ignore")
-                    return r.status, body, dict(r.headers)
-            except Exception:
-                return None, "", {}
+            last: tuple = (None, "", {})
+            for attempt_h in gen_bypass_attempts(extra_headers=headers):
+                try:
+                    async with sess.get(
+                        url, headers=attempt_h, ssl=False,
+                        allow_redirects=allow_redirects,
+                        timeout=aiohttp.ClientTimeout(total=timeout, connect=10),
+                    ) as r:
+                        body = await r.text(errors="ignore")
+                        last = (r.status, body, dict(r.headers))
+                        if r.status not in (401, 403, 405, 429, 503):
+                            return last
+                except Exception:
+                    pass
+            return last
 
     async def _options(self, sess, url, headers=None):
         async with self._sem:
