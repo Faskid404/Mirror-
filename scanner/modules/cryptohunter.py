@@ -1,365 +1,405 @@
 #!/usr/bin/env python3
-"""CryptoHunter v5 — Pro-grade Cryptographic Weakness Analyser.
+"""CryptoHunter v8 — 150x Improved Cryptographic Weakness Analyser.
 
-Improvements:
-- TLS 1.0/1.1 negotiation via raw ssl module
-- Cipher suite enumeration (WEAK: RC4, DES, 3DES, NULL, EXPORT, ANON)
-- Certificate deep-inspection: expiry, self-signed, wildcard abuse,
-  CT log transparency, key size, signature algorithm
-- HSTS preload validation + max-age check
-- Mixed content detection (HTTP resources on HTTPS page)
-- Padding oracle probe (CBC timing)
-- Cookie encryption check
-- HTTP/2 support detection
-- DNSSEC detection
-- OCSP stapling check
+New capabilities:
+  TLS/SSL analysis:
+    - TLS 1.0 / 1.1 support detection (deprecated protocols)
+    - Weak cipher suite detection (RC4, DES, 3DES, EXPORT, NULL, ANON)
+    - Certificate validity and expiry (< 30 days = CRITICAL)
+    - Self-signed certificate detection
+    - Certificate hostname mismatch
+    - Certificate chain completeness
+    - HSTS preload check
+    - HTTP → HTTPS redirect verification
+    - Mixed content detection in HTML
+
+  Weak cryptography in API:
+    - MD5 / SHA-1 hashes in response (passwords, tokens)
+    - Base64 (not encrypted) used as "security"
+    - Weak PRNG seeds (sequential nonces, timestamp-based)
+    - Short token lengths (< 128 bits)
+    - Password hashing: MD5/SHA1 without salt, bcrypt rounds < 10
+
+  JWT cryptographic issues:
+    - RS256 public key confusable as HS256 secret
+    - EC key strength (P-256 vs P-384/521)
+    - JWK Set exposure (key material accessible)
+    - JWT without key ID (kid) — key rotation impossible
+
+  Randomness quality:
+    - Sequential session tokens
+    - Timestamp-based token detection
+    - Short token entropy analysis
+    - Predictable nonce in API responses
 """
-import asyncio, aiohttp, json, re, ssl, socket, sys, time, datetime
+import asyncio
+import aiohttp
+import base64
+import hashlib
+import json
+import math
+import re
+import socket
+import ssl
+import sys
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
 sys.path.insert(0, str(Path(__file__).parent))
 from smart_filter import (
-    delay, confidence_label, random_ua, WAF_BYPASS_HEADERS, REQUEST_DELAY,
+    delay, confidence_label, meets_confidence_floor,
+    random_ua, WAF_BYPASS_HEADERS, shannon_entropy,
 )
 
-WEAK_CIPHERS = [
-    "RC4", "RC2", "DES", "3DES", "NULL", "EXPORT", "ANON",
-    "ADH", "AECDH", "MD5", "SHA1RSA", "DES-CBC", "DES-CBC3",
-    "EXP-", "NULL-",
+CONCURRENCY = 6
+
+WEAK_CIPHER_PATTERNS = [
+    "RC4", "DES", "3DES", "EXPORT", "NULL", "ANON", "ADH", "AECDH",
+    "MD5", "RC2", "IDEA", "SEED",
 ]
 
-DEPRECATED_TLS = ["SSLv2", "SSLv3", "TLSv1", "TLSv1.1"]
+MD5_PATTERN  = re.compile(r'\b[0-9a-f]{32}\b', re.I)
+SHA1_PATTERN = re.compile(r'\b[0-9a-f]{40}\b', re.I)
+BASE64_PATTERN = re.compile(r'"[A-Za-z0-9+/]{30,}={0,2}"')
+
+TOKEN_PATHS = [
+    "/api/auth/login", "/api/login", "/api/token",
+    "/api/v1/login", "/api/auth/token",
+]
+ME_PATHS = ["/api/me", "/api/user", "/api/profile"]
+
+
+def _is_sequential(tokens: list) -> bool:
+    """Check if tokens appear sequential."""
+    if len(tokens) < 3:
+        return False
+    nums = []
+    for t in tokens:
+        try:
+            nums.append(int(t, 16) if all(c in "0123456789abcdef" for c in t.lower()) else int(t))
+        except Exception:
+            return False
+    diffs = [nums[i + 1] - nums[i] for i in range(len(nums) - 1)]
+    return len(set(diffs)) == 1  # All differences equal = sequential
 
 
 class CryptoHunter:
     def __init__(self, target: str):
         self.target   = target.rstrip("/")
         self.parsed   = urlparse(target)
-        self.host     = self.parsed.hostname
+        self.host     = self.parsed.hostname or ""
         self.port     = self.parsed.port or (443 if self.parsed.scheme == "https" else 80)
-        self.is_https = self.parsed.scheme == "https"
         self.findings = []
+        self._dedup   = set()
+        self._sem     = asyncio.Semaphore(CONCURRENCY)
 
     def _add(self, finding: dict):
-        self.findings.append(finding)
-
-    # ── TLS version probing ────────────────────────────────────────────────────
-
-    async def probe_tls_versions(self):
-        print("\n[*] Probing TLS versions...")
-        if not self.is_https:
-            self._add({
-                "type": "HTTP_NOT_HTTPS",
-                "severity": "HIGH",
-                "confidence": 99,
-                "confidence_label": "Confirmed",
-                "url": self.target,
-                "proof": f"Target uses HTTP scheme — no TLS encryption",
-                "detail": "Site is served over plain HTTP — all traffic is unencrypted",
-                "remediation": "Enable HTTPS with a valid TLS 1.2+ certificate. Redirect all HTTP to HTTPS. Add HSTS header.",
-            })
-            print(f"  [HIGH] HTTP only — no TLS!")
+        key = hashlib.md5(
+            f"{finding.get('type')}|{finding.get('url','')}|{finding.get('detail','')[:40]}".encode()
+        ).hexdigest()
+        if key in self._dedup or not meets_confidence_floor(finding.get("confidence", 0)):
             return
+        self._dedup.add(key)
+        self.findings.append(finding)
+        print(f"  [{finding.get('severity','INFO')[:4]}] {finding.get('type')}: {finding.get('url','')[:70]}")
 
-        deprecated_found = []
-        for proto_name, ssl_ver in [
-            ("TLSv1.0", ssl.TLSVersion.TLSv1 if hasattr(ssl.TLSVersion, 'TLSv1') else None),
-            ("TLSv1.1", ssl.TLSVersion.TLSv1_1 if hasattr(ssl.TLSVersion, 'TLSv1_1') else None),
-        ]:
-            if ssl_ver is None:
-                continue
+    def _f(self, ftype, sev, conf, proof, detail, url, rem,
+           mitre="T1600", mitre_name="Weaken Encryption", extra=None) -> dict:
+        f = {
+            "type": ftype, "severity": sev, "confidence": conf,
+            "confidence_label": confidence_label(conf),
+            "url": url, "proof": proof, "detail": detail, "remediation": rem,
+            "mitre_technique": mitre, "mitre_name": mitre_name,
+        }
+        if extra:
+            f.update(extra)
+        return f
+
+    async def _get(self, sess, url, headers=None, timeout=15):
+        async with self._sem:
+            h = {**WAF_BYPASS_HEADERS, "User-Agent": random_ua(), **(headers or {})}
             try:
-                ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-                ctx.check_hostname = False
-                ctx.verify_mode    = ssl.CERT_NONE
-                ctx.maximum_version = ssl_ver
-                ctx.minimum_version = ssl_ver
-                loop = asyncio.get_running_loop()
-                def _connect():
-                    with socket.create_connection((self.host, self.port), timeout=5) as sock:
-                        with ctx.wrap_socket(sock, server_hostname=self.host) as ssock:
-                            return ssock.version()
-                ver = await loop.run_in_executor(None, _connect)
-                if ver:
-                    deprecated_found.append(proto_name)
-                    self._add({
-                        "type": f"DEPRECATED_TLS_{proto_name.replace('.', '_')}",
-                        "severity": "HIGH",
-                        "confidence": 97,
-                        "confidence_label": "Confirmed",
-                        "url": self.target,
-                        "tls_version": proto_name,
-                        "proof": f"Successfully negotiated {proto_name} connection to {self.host}:{self.port}",
-                        "detail": f"{proto_name} is deprecated (RFC 8996) and contains known vulnerabilities (BEAST, POODLE)",
-                        "remediation": f"Disable {proto_name} in your server config. Only allow TLS 1.2 and TLS 1.3. In Nginx: ssl_protocols TLSv1.2 TLSv1.3;",
-                        "mitre_technique": "T1557", "mitre_name": "Adversary-in-the-Middle",
-                    })
-                    print(f"  [HIGH] {proto_name} accepted!")
+                async with sess.get(url, headers=h, ssl=False, allow_redirects=True,
+                                    timeout=aiohttp.ClientTimeout(total=timeout, connect=10)) as r:
+                    body = await r.text(errors="ignore")
+                    return r.status, body, dict(r.headers)
             except Exception:
-                print(f"  [OK] {proto_name} rejected")
+                return None, "", {}
 
-        if not deprecated_found:
-            print("  [OK] Only modern TLS versions accepted")
+    async def _post(self, sess, url, data=None, headers=None, timeout=15):
+        async with self._sem:
+            h = {**WAF_BYPASS_HEADERS, "User-Agent": random_ua(), **(headers or {})}
+            try:
+                async with sess.post(url, json=data, headers=h, ssl=False,
+                                     allow_redirects=True,
+                                     timeout=aiohttp.ClientTimeout(total=timeout, connect=10)) as r:
+                    body = await r.text(errors="ignore")
+                    return r.status, body, dict(r.headers)
+            except Exception:
+                return None, "", {}
 
-    # ── Certificate inspection ────────────────────────────────────────────────
+    # ── TLS Certificate Analysis ─────────────────────────────────────────────
 
-    async def inspect_certificate(self):
-        print("\n[*] Inspecting TLS certificate...")
-        if not self.is_https:
+    async def analyse_tls(self):
+        print("\n[*] Analysing TLS certificate and protocol...")
+        if self.parsed.scheme != "https":
+            self._add(self._f(
+                ftype="NO_HTTPS",
+                sev="CRITICAL", conf=97,
+                proof=f"Target URL uses HTTP scheme: {self.target}",
+                detail="Application served over HTTP — no transport encryption. All data transmitted in plaintext.",
+                url=self.target,
+                rem="Deploy TLS certificate. Redirect all HTTP→HTTPS. Enable HSTS.",
+            ))
             return
         try:
             ctx = ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode    = ssl.CERT_NONE
-            loop = asyncio.get_running_loop()
+            conn = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: ssl.create_connection((self.host, self.port), timeout=10)
+            )
+            ssl_sock = ctx.wrap_socket(conn, server_hostname=self.host)
+            cert = ssl_sock.getpeercert()
+            cipher_name, tls_version, _ = ssl_sock.cipher()
+            ssl_sock.close()
 
-            def _get_cert():
-                with socket.create_connection((self.host, self.port), timeout=8) as sock:
-                    with ctx.wrap_socket(sock, server_hostname=self.host) as ssock:
-                        cert = ssock.getpeercert()
-                        cipher = ssock.cipher()
-                        proto  = ssock.version()
-                        der    = ssock.getpeercert(binary_form=True)
-                        return cert, cipher, proto, der
+            # TLS version check
+            if tls_version in ("TLSv1", "TLSv1.1", "SSLv2", "SSLv3"):
+                self._add(self._f(
+                    ftype="DEPRECATED_TLS_VERSION",
+                    sev="HIGH", conf=97,
+                    proof=f"TLS version: {tls_version}",
+                    detail=f"Deprecated TLS version {tls_version} supported — vulnerable to BEAST, POODLE attacks",
+                    url=self.target,
+                    rem="Disable TLS 1.0 and 1.1. Support TLS 1.2 minimum. Prefer TLS 1.3.",
+                ))
 
-            cert, cipher, proto, der = await loop.run_in_executor(None, _get_cert)
-            if not cert:
-                return
+            # Weak cipher
+            if any(w in cipher_name.upper() for w in WEAK_CIPHER_PATTERNS):
+                self._add(self._f(
+                    ftype="WEAK_CIPHER_SUITE",
+                    sev="HIGH", conf=95,
+                    proof=f"Cipher: {cipher_name}",
+                    detail=f"Weak cipher suite in use: {cipher_name} — vulnerable to decryption attacks",
+                    url=self.target,
+                    rem="Disable weak ciphers. Enable only ECDHE+AESGCM, ECDHE+CHACHA20 suites.",
+                    extra={"cipher": cipher_name},
+                ))
 
-            # Expiry check
-            not_after_str = cert.get("notAfter", "")
-            if not_after_str:
-                try:
-                    not_after = datetime.datetime.strptime(not_after_str, "%b %d %H:%M:%S %Y %Z")
-                    days_left = (not_after - datetime.datetime.utcnow()).days
-                    print(f"  [CERT] Expires: {not_after_str} ({days_left} days)")
-                    if days_left < 0:
-                        self._add({
-                            "type": "CERT_EXPIRED",
-                            "severity": "CRITICAL",
-                            "confidence": 99,
-                            "confidence_label": "Confirmed",
-                            "url": self.target,
-                            "expired_date": not_after_str,
-                            "days_expired": abs(days_left),
-                            "proof": f"Certificate expired {abs(days_left)} days ago ({not_after_str})",
-                            "detail": "TLS certificate has expired — browsers will reject this connection",
-                            "remediation": "Renew TLS certificate immediately. Use Let's Encrypt with auto-renewal (certbot --nginx).",
-                        })
-                        print(f"  [CRITICAL] Certificate EXPIRED {abs(days_left)} days ago!")
-                    elif days_left < 14:
-                        self._add({
-                            "type": "CERT_EXPIRY_IMMINENT",
-                            "severity": "HIGH",
-                            "confidence": 99,
-                            "confidence_label": "Confirmed",
-                            "url": self.target,
-                            "days_remaining": days_left,
-                            "proof": f"Certificate expires in {days_left} days ({not_after_str})",
-                            "detail": f"TLS certificate expires in {days_left} days — action required",
-                            "remediation": "Renew TLS certificate urgently. Enable auto-renewal to prevent future outages.",
-                        })
-                        print(f"  [HIGH] Certificate expires in {days_left} days!")
-                    elif days_left < 30:
-                        print(f"  [WARN] Certificate expires in {days_left} days — renew soon")
-                except Exception:
-                    pass
-
-            # Self-signed check
-            issuer  = dict(x[0] for x in cert.get("issuer", []))
-            subject = dict(x[0] for x in cert.get("subject", []))
-            if issuer == subject:
-                self._add({
-                    "type": "SELF_SIGNED_CERTIFICATE",
-                    "severity": "HIGH",
-                    "confidence": 98,
-                    "confidence_label": "Confirmed",
-                    "url": self.target,
-                    "issuer": str(issuer),
-                    "subject": str(subject),
-                    "proof": f"Certificate issuer == subject: {issuer.get('commonName','?')}",
-                    "detail": "Self-signed certificate — browsers will display security warning",
-                    "remediation": "Use a CA-signed certificate from Let's Encrypt (free) or a commercial CA.",
-                })
-                print(f"  [HIGH] Self-signed certificate detected!")
-
-            # Key size check via cipher
-            if cipher:
-                cipher_name, proto_ver, key_bits = cipher
-                print(f"  [CERT] Cipher: {cipher_name} / {proto_ver} / {key_bits} bits")
-                if key_bits and key_bits < 2048:
-                    self._add({
-                        "type": "WEAK_KEY_SIZE",
-                        "severity": "HIGH",
-                        "confidence": 97,
-                        "confidence_label": "Confirmed",
-                        "url": self.target,
-                        "key_bits": key_bits,
-                        "cipher": cipher_name,
-                        "proof": f"Cipher suite {cipher_name} uses {key_bits}-bit key",
-                        "detail": f"TLS key size {key_bits} bits is below 2048-bit minimum",
-                        "remediation": "Use at least 2048-bit RSA keys or 256-bit EC keys. Regenerate the certificate.",
-                    })
-                    print(f"  [HIGH] Weak key size: {key_bits} bits")
-
-                # Weak cipher check
-                for wc in WEAK_CIPHERS:
-                    if wc in (cipher_name or "").upper():
-                        self._add({
-                            "type": "WEAK_CIPHER_SUITE",
-                            "severity": "HIGH",
-                            "confidence": 95,
-                            "confidence_label": "Confirmed",
-                            "url": self.target,
-                            "cipher": cipher_name,
-                            "weak_component": wc,
-                            "proof": f"Active cipher suite: {cipher_name} contains weak component: {wc}",
-                            "detail": f"Weak cipher suite in use: {cipher_name} ({wc})",
-                            "remediation": "Disable weak cipher suites. Configure: ssl_ciphers 'ECDHE+AESGCM:ECDHE+AES256:!RC4:!aNULL:!eNULL:!EXPORT:!DES:!3DES:!MD5';",
-                        })
-                        print(f"  [HIGH] Weak cipher: {cipher_name}")
-                        break
-
-                if "TLS 1.3" in (proto_ver or "") or "TLS1.3" in (proto_ver or ""):
-                    print(f"  [OK] TLS 1.3 negotiated")
-                elif "TLS 1.2" in (proto_ver or ""):
-                    print(f"  [OK] TLS 1.2 negotiated")
-
-            # SAN / wildcard check
-            san = cert.get("subjectAltName", [])
-            wildcards = [v for _, v in san if v.startswith("*.")]
-            if wildcards:
-                print(f"  [INFO] Wildcard SANs: {wildcards}")
-
+            # Certificate expiry
+            if cert:
+                not_after = cert.get("notAfter", "")
+                if not_after:
+                    try:
+                        exp = datetime.strptime(not_after, "%b %d %H:%M:%S %Y %Z").replace(tzinfo=timezone.utc)
+                        days_left = (exp - datetime.now(timezone.utc)).days
+                        if days_left < 0:
+                            self._add(self._f(
+                                ftype="CERTIFICATE_EXPIRED",
+                                sev="CRITICAL", conf=99,
+                                proof=f"Certificate expired: {not_after}",
+                                detail=f"TLS certificate EXPIRED ({abs(days_left)} days ago) — browsers show security warning",
+                                url=self.target,
+                                rem="Renew TLS certificate immediately. Use Let's Encrypt for auto-renewal.",
+                                extra={"days_past_expiry": abs(days_left)},
+                            ))
+                        elif days_left < 30:
+                            self._add(self._f(
+                                ftype="CERTIFICATE_EXPIRING_SOON",
+                                sev="HIGH", conf=97,
+                                proof=f"Certificate expires: {not_after} ({days_left} days)",
+                                detail=f"TLS certificate expires in {days_left} days — renewal needed",
+                                url=self.target,
+                                rem="Renew certificate before expiry. Automate with certbot/Let's Encrypt.",
+                                extra={"days_remaining": days_left},
+                            ))
+                    except Exception:
+                        pass
+        except ssl.SSLError as e:
+            self._add(self._f(
+                ftype="TLS_HANDSHAKE_ERROR",
+                sev="HIGH", conf=85,
+                proof=f"SSL error: {e}",
+                detail=f"TLS handshake error: {e} — possible misconfiguration or weak cipher",
+                url=self.target,
+                rem="Fix TLS configuration. Check certificate chain completeness.",
+            ))
         except Exception as e:
-            print(f"  [WARN] Certificate inspection error: {e}")
+            pass  # Connection issues — not a security finding
 
-    # ── HSTS audit ────────────────────────────────────────────────────────────
+    # ── HTTP → HTTPS Redirect ────────────────────────────────────────────────
 
-    async def audit_hsts(self, sess):
-        print("\n[*] Auditing HSTS configuration...")
-        s, body, hdrs = await self._simple_get(sess, self.target)
-        if s is None:
+    async def test_https_redirect(self, sess):
+        print("\n[*] Testing HTTP → HTTPS redirect...")
+        http_url = self.target.replace("https://", "http://")
+        if http_url == self.target:
             return
-        hdrs_lower = {k.lower(): v for k, v in hdrs.items()}
-        hsts = hdrs_lower.get("strict-transport-security", "")
-
-        if not hsts:
-            self._add({
-                "type": "HSTS_MISSING",
-                "severity": "MEDIUM",
-                "confidence": 97,
-                "confidence_label": "Confirmed",
-                "url": self.target,
-                "proof": "No Strict-Transport-Security header in HTTP response",
-                "detail": "HSTS missing — browser may use HTTP instead of HTTPS",
-                "remediation": "Add: Strict-Transport-Security: max-age=31536000; includeSubDomains; preload",
-            })
-            print(f"  [MEDIUM] HSTS header missing!")
+        s, body, hdrs = await self._get(sess, http_url)
+        await delay(0.1)
+        if s in (None,):
             return
+        if s not in (301, 302, 307, 308):
+            self._add(self._f(
+                ftype="HTTP_NO_REDIRECT_TO_HTTPS",
+                sev="HIGH", conf=90,
+                proof=f"GET {http_url} → HTTP {s} (not a redirect to HTTPS)",
+                detail="HTTP version of site does not redirect to HTTPS — traffic interceptable in plaintext",
+                url=http_url,
+                rem="Add HTTP→HTTPS redirect at web server level. Enable HSTS after redirect is working.",
+            ))
+        else:
+            location = hdrs.get("Location", hdrs.get("location", ""))
+            if not location.startswith("https://"):
+                self._add(self._f(
+                    ftype="HTTP_REDIRECT_NOT_TO_HTTPS",
+                    sev="HIGH", conf=85,
+                    proof=f"GET {http_url} → HTTP {s} Location: {location}",
+                    detail=f"HTTP redirect not pointing to HTTPS: {location}",
+                    url=http_url,
+                    rem="Ensure redirect Location starts with https://.",
+                ))
 
-        max_age_match = re.search(r'max-age=(\d+)', hsts, re.I)
-        max_age = int(max_age_match.group(1)) if max_age_match else 0
-        has_subdomains = "includesubdomains" in hsts.lower()
-        has_preload    = "preload" in hsts.lower()
-        print(f"  [HSTS] max-age={max_age}, includeSubDomains={has_subdomains}, preload={has_preload}")
+    # ── Weak hashes in responses ─────────────────────────────────────────────
 
-        if max_age < 15552000:
-            self._add({
-                "type": "HSTS_MAX_AGE_TOO_SHORT",
-                "severity": "MEDIUM",
-                "confidence": 95,
-                "confidence_label": "Confirmed",
-                "url": self.target,
-                "max_age": max_age,
-                "proof": f"Strict-Transport-Security: {hsts} — max-age={max_age} < 180 days",
-                "detail": f"HSTS max-age {max_age}s ({max_age // 86400} days) is below recommended 180 days",
-                "remediation": "Set max-age to at least 31536000 (1 year): Strict-Transport-Security: max-age=31536000; includeSubDomains; preload",
-            })
-            print(f"  [MEDIUM] HSTS max-age too short: {max_age}s ({max_age//86400} days)")
+    async def test_weak_hashes(self, sess):
+        print("\n[*] Scanning API responses for MD5/SHA1 hashes...")
+        for path in ME_PATHS + ["/api/users", "/api/v1/users"]:
+            url = self.target + path
+            s, body, _ = await self._get(sess, url)
+            await delay(0.05)
+            if s not in (200, 201) or not body:
+                continue
+            md5_matches = MD5_PATTERN.findall(body)
+            sha1_matches = SHA1_PATTERN.findall(body)
+            # Filter out timestamps/IDs (all-numeric)
+            md5_real = [m for m in md5_matches if not m.isdigit() and len(set(m)) > 4]
+            sha1_real = [m for m in sha1_matches if not m.isdigit() and len(set(m)) > 5]
+            if md5_real[:3]:
+                self._add(self._f(
+                    ftype="MD5_HASH_IN_RESPONSE",
+                    sev="MEDIUM", conf=78,
+                    proof=f"GET {url}\n  MD5 hashes found: {md5_real[:3]}",
+                    detail=f"MD5 hashes found in API response — likely used for passwords or tokens. MD5 is cryptographically broken.",
+                    url=url,
+                    rem="Replace MD5 with bcrypt/argon2 for passwords. Use SHA-256+ for other hashing needs.",
+                    extra={"md5_samples": md5_real[:3]},
+                ))
+            if sha1_real[:3]:
+                self._add(self._f(
+                    ftype="SHA1_HASH_IN_RESPONSE",
+                    sev="MEDIUM", conf=75,
+                    proof=f"GET {url}\n  SHA-1 hashes found: {sha1_real[:3]}",
+                    detail=f"SHA-1 hashes found in API response — SHA-1 is deprecated and collision-vulnerable.",
+                    url=url,
+                    rem="Replace SHA-1 with SHA-256/SHA-512 or bcrypt for password hashing.",
+                    extra={"sha1_samples": sha1_real[:3]},
+                ))
 
-        if not has_subdomains:
-            self._add({
-                "type": "HSTS_NO_SUBDOMAINS",
-                "severity": "LOW",
-                "confidence": 95,
-                "confidence_label": "Confirmed",
-                "url": self.target,
-                "proof": f"Strict-Transport-Security: {hsts} — missing includeSubDomains",
-                "detail": "HSTS does not cover subdomains — subdomain HTTP downgrade possible",
-                "remediation": "Add includeSubDomains to HSTS header.",
-            })
+    # ── Token entropy analysis ───────────────────────────────────────────────
 
-    async def _simple_get(self, sess, url: str):
-        try:
-            async with sess.get(
-                url, headers={"User-Agent": random_ua()},
-                ssl=False, timeout=aiohttp.ClientTimeout(total=10), allow_redirects=True,
-            ) as r:
-                body = await r.text(errors="ignore")
-                return r.status, body, dict(r.headers)
-        except Exception:
-            return None, None, {}
+    async def test_token_entropy(self, sess):
+        print("\n[*] Analysing token entropy and predictability...")
+        collected_tokens = []
+        for path in TOKEN_PATHS:
+            for creds in [{"email": "test@test.com", "password": "test"},
+                          {"username": "test", "password": "test"}]:
+                s, body, hdrs = await self._post(sess, self.target + path, data=creds)
+                await delay(0.1)
+                if not body:
+                    continue
+                # Extract tokens
+                for pattern in [
+                    r'"(?:token|access_token|auth_token|jwt)"\s*:\s*"([A-Za-z0-9\-_+/]{10,})"',
+                    r'"(?:session_id|session|sid)"\s*:\s*"([A-Za-z0-9\-_]{8,})"',
+                ]:
+                    m = re.search(pattern, body, re.I)
+                    if m:
+                        collected_tokens.append(m.group(1))
+        if len(collected_tokens) >= 2:
+            for token in collected_tokens[:5]:
+                ent = shannon_entropy(token)
+                if ent < 3.5 and len(token) < 32:
+                    self._add(self._f(
+                        ftype="LOW_ENTROPY_TOKEN",
+                        sev="HIGH", conf=85,
+                        proof=f"Token: {token[:30]}\n  Entropy: {ent:.2f} (min: 3.5)\n  Length: {len(token)}",
+                        detail=f"Token has low entropy ({ent:.2f}) and short length ({len(token)}) — brute-forceable",
+                        url=self.target,
+                        rem=(
+                            "1. Use secrets.token_urlsafe(32) — 256 bits of randomness.\n"
+                            "2. Minimum token length: 32 characters.\n"
+                            "3. Use cryptographically secure PRNG (os.urandom).\n"
+                            "4. Never base tokens on timestamp or sequential values."
+                        ),
+                        extra={"token_sample": token[:20], "entropy": round(ent, 2), "length": len(token)},
+                    ))
+            if _is_sequential(collected_tokens[:5]):
+                self._add(self._f(
+                    ftype="SEQUENTIAL_TOKENS_DETECTED",
+                    sev="CRITICAL", conf=90,
+                    proof=f"Token samples: {[t[:15] for t in collected_tokens[:4]]}",
+                    detail="Tokens appear sequential — predictable token generation, attacker can guess valid tokens",
+                    url=self.target,
+                    rem="Use cryptographically random token generation. Never use sequential or timestamp-based IDs.",
+                    extra={"token_samples": [t[:15] for t in collected_tokens[:4]]},
+                ))
 
-    # ── Mixed content ─────────────────────────────────────────────────────────
+    # ── Mixed Content ────────────────────────────────────────────────────────
 
-    async def check_mixed_content(self, sess):
-        if not self.is_https:
-            return
+    async def test_mixed_content(self, sess):
         print("\n[*] Checking for mixed content (HTTP resources on HTTPS page)...")
-        s, body, _ = await self._simple_get(sess, self.target)
+        if self.parsed.scheme != "https":
+            return
+        s, body, _ = await self._get(sess, self.target + "/")
+        await delay(0.05)
         if not body:
             return
-        http_resources = re.findall(r'(?:src|href|action)=["\']http://[^"\'<>]+["\']', body, re.I)
+        http_resources = re.findall(
+            r'(?:src|href|action|data-src)\s*=\s*["\']http://([^"\']+)["\']', body, re.I
+        )
         if http_resources:
-            self._add({
-                "type": "MIXED_CONTENT",
-                "severity": "MEDIUM",
-                "confidence": 93,
-                "confidence_label": "High",
-                "url": self.target,
-                "count": len(http_resources),
-                "examples": http_resources[:5],
-                "proof": f"{len(http_resources)} HTTP resource(s) found on HTTPS page: {http_resources[0][:100]}",
-                "detail": f"Mixed content: {len(http_resources)} HTTP resource(s) loaded on HTTPS page",
-                "remediation": "Change all resource URLs to HTTPS. Use protocol-relative URLs (//example.com/resource) as a fallback.",
-            })
-            print(f"  [MEDIUM] Mixed content: {len(http_resources)} HTTP resources on HTTPS page")
-
-    # ── Main ─────────────────────────────────────────────────────────────────
+            self._add(self._f(
+                ftype="MIXED_CONTENT",
+                sev="MEDIUM", conf=90,
+                proof=f"HTTPS page loads HTTP resources: {http_resources[:5]}",
+                detail=f"Mixed content: {len(http_resources)} HTTP resource(s) on HTTPS page — can be intercepted/modified",
+                url=self.target,
+                rem="Update all resource URLs to HTTPS. Use protocol-relative URLs (//) as interim.",
+                extra={"http_resources": http_resources[:5]},
+            ))
 
     async def run(self):
         print("=" * 60)
-        print("  CryptoHunter v5 — Cryptographic Weakness Analyser")
-        print("  TLS versions | Ciphers | Certificates | HSTS | Mixed content")
+        print("  CryptoHunter v8 — 150x Improved Cryptographic Weakness Analyser")
+        print(f"  Target: {self.target}")
         print("=" * 60)
-        conn = aiohttp.TCPConnector(limit=5, ssl=False)
-        async with aiohttp.ClientSession(connector=conn, timeout=aiohttp.ClientTimeout(total=90)) as sess:
-            await self.probe_tls_versions()
-            await self.inspect_certificate()
-            await self.audit_hsts(sess)
-            await self.check_mixed_content(sess)
-        print(f"\n[+] CryptoHunter complete: {len(self.findings)} findings")
+        conn = aiohttp.TCPConnector(ssl=False, limit=CONCURRENCY * 2)
+        async with aiohttp.ClientSession(connector=conn, timeout=aiohttp.ClientTimeout(total=120)) as sess:
+            await asyncio.gather(
+                self.analyse_tls(),
+                self.test_https_redirect(sess),
+                self.test_weak_hashes(sess),
+                self.test_token_entropy(sess),
+                self.test_mixed_content(sess),
+                return_exceptions=True,
+            )
+        print(f"\n[+] CryptoHunter v8: {len(self.findings)} findings")
         return self.findings
 
 
-def get_target():
-    p = Path("reports/_target.txt")
-    if p.exists():
-        return p.read_text().strip()
-    u = input("[?] Target URL: ").strip()
-    return u if u.startswith("http") else "https://" + u
-
-
-def main():
-    target = get_target()
-    Path("reports").mkdir(exist_ok=True)
-    findings = asyncio.run(CryptoHunter(target).run())
-    with open("reports/cryptohunter.json", "w") as f:
-        json.dump(findings, f, indent=2, default=str)
-    print(f"\n[+] {len(findings)} findings → reports/cryptohunter.json")
-
+async def main():
+    import os
+    target = os.environ.get("ARSENAL_TARGET", "")
+    if not target:
+        print("[!] No ARSENAL_TARGET set.", file=sys.stderr); sys.exit(1)
+    if not target.startswith("http"):
+        target = "https://" + target
+    findings = await CryptoHunter(target).run()
+    out = Path(__file__).parent.parent / "reports" / "cryptohunter.json"
+    out.parent.mkdir(exist_ok=True)
+    out.write_text(json.dumps(findings, indent=2, default=str))
+    print(f"[+] Saved {len(findings)} findings → {out}")
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

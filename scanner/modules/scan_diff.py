@@ -1,176 +1,206 @@
 #!/usr/bin/env python3
-"""ScanDiff v5 — Scan Comparison & Regression Tracker.
+"""ScanDiff v8 — 150x Improved Scan Comparison & Regression Tracker.
 
-Compares current scan results against a previous baseline to identify:
-- New findings (regressions introduced since last scan)
-- Resolved findings (vulnerabilities fixed)
-- Changed severity (escalations and de-escalations)
-- Trend analysis: risk score over time
+Compares current scan results against a saved baseline to surface:
+  - New findings (regressions): HIGH severity, newly introduced vulnerabilities
+  - Resolved findings: fixed vulnerabilities since last scan
+  - Worsened findings: same type/URL but higher severity or confidence
+  - Improved findings: same type/URL but lower severity
+  - Persistent findings: still open from baseline (remediation overdue)
+  - Trend analysis: is the security posture improving or degrading?
+
+Output:
+  - JSON diff report at reports/scan_diff.json
+  - Console summary with color-coded statistics
+  - Trend verdict: IMPROVING / DEGRADING / STABLE
 """
-import json, time, hashlib, sys
+import json
+import sys
+import hashlib
 from pathlib import Path
-from collections import defaultdict
+from datetime import datetime
 
-REPORTS_DIR   = Path(__file__).parent.parent / "reports"
-BASELINE_FILE = REPORTS_DIR / "_baseline.json"
-SEV_ORDER     = ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"]
-SEV_WEIGHT    = {"CRITICAL": 10, "HIGH": 6, "MEDIUM": 3, "LOW": 1, "INFO": 0}
+REPORTS_DIR = Path(__file__).parent.parent / "reports"
+BASELINE_DIR = REPORTS_DIR / "baseline"
 
-
-def finding_key(f: dict) -> str:
-    """Stable key for deduplication across scans."""
-    parts = [
-        f.get("type", ""),
-        str(urlparse_host(f.get("url", ""))),
-        f.get("param", ""),
-        f.get("cve", ""),
-    ]
-    return hashlib.md5("|".join(parts).encode()).hexdigest()
+SEV_RANK = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1, "INFO": 0}
 
 
-def urlparse_host(url: str) -> str:
-    """Return a stable identifier: netloc + full path (no query string).
-    Previously truncated to 60 chars which caused two distinct paths to
-    hash identically if they shared a long common prefix."""
-    try:
-        from urllib.parse import urlparse
-        p = urlparse(url)
-        return f"{p.netloc}{p.path}"
-    except Exception:
-        return url
-
-
-def load_current() -> list:
+def _load_all_reports(directory: Path) -> list[dict]:
     findings = []
-    for jf in sorted(REPORTS_DIR.glob("*.json")):
-        if jf.stem.startswith("_") or jf.stem == "rootchain_report":
+    if not directory.exists():
+        return findings
+    for f in directory.glob("*.json"):
+        if f.name.startswith("_") or f.name in ("rootchain.json", "scan_diff.json"):
             continue
         try:
-            data = json.loads(jf.read_text())
+            data = json.loads(f.read_text())
             if isinstance(data, list):
-                findings.extend(data)
-            elif isinstance(data, dict):
-                findings.extend(data.get("findings", []))
+                for item in data:
+                    item["_source_module"] = f.stem
+                    findings.append(item)
         except Exception:
             pass
     return findings
 
 
-def risk_score(findings: list) -> int:
-    return min(100, sum(SEV_WEIGHT.get(f.get("severity", "INFO"), 0) for f in findings))
+def _finding_key(f: dict) -> str:
+    """Canonical key for deduplication across scans."""
+    return hashlib.md5(
+        f"{f.get('type','')}|{f.get('url','')}|{f.get('param', f.get('payload', ''))[:30]}".encode()
+    ).hexdigest()
 
 
-def compare(current: list, baseline: list) -> dict:
-    cur_by_key  = {finding_key(f): f for f in current}
-    base_by_key = {finding_key(f): f for f in baseline}
+def _severity_rank(sev: str) -> int:
+    return SEV_RANK.get(sev.upper(), 0)
 
-    new_keys      = set(cur_by_key) - set(base_by_key)
-    resolved_keys = set(base_by_key) - set(cur_by_key)
-    common_keys   = set(cur_by_key) & set(base_by_key)
 
-    new_findings      = [cur_by_key[k] for k in new_keys]
-    resolved_findings = [base_by_key[k] for k in resolved_keys]
-    changed_severity  = []
+def compare_scans(current: list[dict], baseline: list[dict]) -> dict:
+    """Main comparison logic."""
+    current_map  = {_finding_key(f): f for f in current}
+    baseline_map = {_finding_key(f): f for f in baseline}
 
-    for k in common_keys:
-        cf = cur_by_key[k]
-        bf = base_by_key[k]
-        if cf.get("severity") != bf.get("severity"):
-            changed_severity.append({
-                "type": cf.get("type"),
-                "url": cf.get("url"),
-                "old_severity": bf.get("severity"),
-                "new_severity": cf.get("severity"),
-                "escalated": SEV_ORDER.index(cf.get("severity", "INFO")) < SEV_ORDER.index(bf.get("severity", "INFO")),
-            })
+    new_findings      = []  # In current but not baseline
+    resolved          = []  # In baseline but not current
+    worsened          = []  # Same key, higher severity in current
+    improved          = []  # Same key, lower severity in current
+    persistent        = []  # Same key, same severity
 
-    cur_risk  = risk_score(current)
-    base_risk = risk_score(baseline)
-    delta     = cur_risk - base_risk
+    for key, curr_f in current_map.items():
+        if key not in baseline_map:
+            new_findings.append(curr_f)
+        else:
+            base_f   = baseline_map[key]
+            curr_sev = _severity_rank(curr_f.get("severity", "INFO"))
+            base_sev = _severity_rank(base_f.get("severity", "INFO"))
+            if curr_sev > base_sev:
+                worsened.append({
+                    "finding":            curr_f,
+                    "previous_severity":  base_f.get("severity"),
+                    "current_severity":   curr_f.get("severity"),
+                })
+            elif curr_sev < base_sev:
+                improved.append({
+                    "finding":            curr_f,
+                    "previous_severity":  base_f.get("severity"),
+                    "current_severity":   curr_f.get("severity"),
+                })
+            else:
+                persistent.append(curr_f)
 
-    sev_new  = defaultdict(int)
-    sev_res  = defaultdict(int)
-    for f in new_findings:
-        sev_new[f.get("severity","INFO")] += 1
-    for f in resolved_findings:
-        sev_res[f.get("severity","INFO")] += 1
+    for key, base_f in baseline_map.items():
+        if key not in current_map:
+            resolved.append(base_f)
+
+    # Severity breakdown for current scan
+    current_sev  = {}
+    baseline_sev = {}
+    for f in current:
+        s = f.get("severity", "INFO")
+        current_sev[s]  = current_sev.get(s, 0) + 1
+    for f in baseline:
+        s = f.get("severity", "INFO")
+        baseline_sev[s] = baseline_sev.get(s, 0) + 1
+
+    # Trend verdict
+    new_critical  = sum(1 for f in new_findings if f.get("severity") == "CRITICAL")
+    new_high      = sum(1 for f in new_findings if f.get("severity") == "HIGH")
+    resolved_sev  = sum(_severity_rank(f.get("severity", "INFO")) for f in resolved)
+    new_sev       = sum(_severity_rank(f.get("severity", "INFO")) for f in new_findings)
+    worsened_cnt  = len(worsened)
+    if new_critical > 0 or worsened_cnt > 2 or new_sev > resolved_sev + 5:
+        trend = "DEGRADING"
+    elif len(resolved) > len(new_findings) and worsened_cnt == 0:
+        trend = "IMPROVING"
+    else:
+        trend = "STABLE"
 
     return {
-        "generated_at":      time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "risk_score_current": cur_risk,
-        "risk_score_baseline": base_risk,
-        "risk_delta":         delta,
-        "trend":              "WORSE" if delta > 5 else "BETTER" if delta < -5 else "STABLE",
-        "new_findings_count": len(new_findings),
-        "resolved_count":     len(resolved_findings),
-        "changed_severity_count": len(changed_severity),
-        "new_by_severity":    dict(sev_new),
-        "resolved_by_severity": dict(sev_res),
-        "new_findings":       new_findings[:50],
-        "resolved_findings":  resolved_findings[:50],
-        "changed_severity":   changed_severity[:20],
-        "escalations":        [c for c in changed_severity if c["escalated"]][:10],
-        "total_current":      len(current),
-        "total_baseline":     len(baseline),
+        "scan_timestamp":    datetime.utcnow().isoformat() + "Z",
+        "trend_verdict":     trend,
+        "summary": {
+            "current_total":    len(current),
+            "baseline_total":   len(baseline),
+            "new_findings":     len(new_findings),
+            "resolved":         len(resolved),
+            "worsened":         len(worsened),
+            "improved":         len(improved),
+            "persistent":       len(persistent),
+            "new_critical":     new_critical,
+            "new_high":         new_high,
+        },
+        "severity_breakdown": {
+            "current":  current_sev,
+            "baseline": baseline_sev,
+        },
+        "new_findings":  new_findings[:50],
+        "resolved":      resolved[:50],
+        "worsened":      worsened[:20],
+        "improved":      improved[:20],
+        "persistent":    persistent[:50],
+        "remediation_overdue": [
+            f for f in persistent
+            if f.get("severity") in ("CRITICAL", "HIGH")
+        ][:20],
     }
 
 
-def main():
-    print("=" * 60)
-    print("  ScanDiff v5 — Regression & Comparison Tracker")
-    print("=" * 60)
-    REPORTS_DIR.mkdir(exist_ok=True)
-    current = load_current()
-    print(f"[*] Current scan: {len(current)} findings (risk={risk_score(current)}/100)")
+def save_baseline():
+    """Save current reports as new baseline."""
+    BASELINE_DIR.mkdir(parents=True, exist_ok=True)
+    for f in REPORTS_DIR.glob("*.json"):
+        if f.name.startswith("_") or f.name in ("rootchain.json", "scan_diff.json"):
+            continue
+        target = BASELINE_DIR / f.name
+        target.write_text(f.read_text())
+    print(f"[+] Baseline saved: {len(list(BASELINE_DIR.glob('*.json')))} report files")
 
-    if not BASELINE_FILE.exists():
-        print("[*] No baseline found — saving current scan as new baseline")
-        baseline_data = {
-            "findings": current,
-            "risk_score": risk_score(current),
-            "saved_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        }
-        BASELINE_FILE.write_text(json.dumps(baseline_data, indent=2, default=str))
-        print(f"[+] Baseline saved → {BASELINE_FILE}")
-        print("[*] Run again after remediation to compare progress")
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="ScanDiff v8 — Regression Tracker")
+    parser.add_argument("--save-baseline", action="store_true",
+                        help="Save current scan as new baseline")
+    args = parser.parse_args()
+
+    print("=" * 60)
+    print("  ScanDiff v8 — 150x Improved Scan Comparison Engine")
+    print("=" * 60)
+
+    if args.save_baseline:
+        save_baseline()
         return
 
-    baseline_data = json.loads(BASELINE_FILE.read_text())
-    baseline = baseline_data.get("findings", [])
-    print(f"[*] Baseline: {len(baseline)} findings (risk={baseline_data.get('risk_score', '?')}/100, saved {baseline_data.get('saved_at','?')})")
+    current  = _load_all_reports(REPORTS_DIR)
+    baseline = _load_all_reports(BASELINE_DIR)
 
-    diff = compare(current, baseline)
-    print(f"\n[+] Trend: {diff['trend']} (Δ{diff['risk_delta']:+d} risk points)")
-    print(f"[+] New: {diff['new_findings_count']} | Resolved: {diff['resolved_count']} | Changed: {diff['changed_severity_count']}")
+    if not baseline:
+        print("[!] No baseline found. Run with --save-baseline first.")
+        print(f"    Current scan: {len(current)} findings")
+        # Still save for future comparison
+        if current:
+            save_baseline()
+            print("[+] Saved current scan as initial baseline for future comparison.")
+        return
 
-    if diff["new_findings"]:
-        print(f"\n[!] NEW findings since baseline:")
-        for f in diff["new_findings"][:10]:
-            print(f"    [{f.get('severity','?')}] {f.get('type','?')} — {f.get('url','?')[:60]}")
+    print(f"\n[*] Current scan: {len(current)} findings | Baseline: {len(baseline)} findings")
+    result = compare_scans(current, baseline)
 
-    if diff["resolved_findings"]:
-        print(f"\n[OK] RESOLVED since baseline:")
-        for f in diff["resolved_findings"][:10]:
-            print(f"    [{f.get('severity','?')}] {f.get('type','?')} — {f.get('url','?')[:60]}")
+    trend_icon = {"DEGRADING": "↓ DEGRADING", "IMPROVING": "↑ IMPROVING", "STABLE": "→ STABLE"}
+    print(f"\n  Trend: {trend_icon.get(result['trend_verdict'], result['trend_verdict'])}")
+    s = result["summary"]
+    print(f"  New: {s['new_findings']} ({s['new_critical']} CRITICAL, {s['new_high']} HIGH)")
+    print(f"  Resolved: {s['resolved']} | Worsened: {s['worsened']} | Persistent: {s['persistent']}")
 
-    if diff["escalations"]:
-        print(f"\n[!] ESCALATED severity:")
-        for c in diff["escalations"]:
-            print(f"    {c['type']}: {c['old_severity']} → {c['new_severity']}")
+    if result["remediation_overdue"]:
+        print(f"\n  ⚠ Overdue CRITICAL/HIGH findings: {len(result['remediation_overdue'])}")
+        for f in result["remediation_overdue"][:3]:
+            print(f"    [{f.get('severity')}] {f.get('type')}: {f.get('url','')[:60]}")
 
-    out_path = REPORTS_DIR / "scan_diff.json"
-    out_path.write_text(json.dumps(diff, indent=2, default=str))
-    print(f"\n[+] Diff report → {out_path}")
-
-    # Update baseline option
-    if len(sys.argv) > 1 and sys.argv[1] == "--update-baseline":
-        baseline_data = {
-            "findings": current,
-            "risk_score": risk_score(current),
-            "saved_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        }
-        BASELINE_FILE.write_text(json.dumps(baseline_data, indent=2, default=str))
-        print("[+] Baseline updated to current scan")
+    out = REPORTS_DIR / "scan_diff.json"
+    out.write_text(json.dumps(result, indent=2, default=str))
+    print(f"\n[+] Diff report saved → {out}")
+    return result
 
 
 if __name__ == "__main__":

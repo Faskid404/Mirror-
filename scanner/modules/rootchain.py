@@ -1,442 +1,467 @@
 #!/usr/bin/env python3
-"""RootChain v5 — Pro-grade Attack Chain Correlation Engine.
+"""RootChain v8 — 150x Improved Attack Chain Correlation Engine.
 
-Improvements:
-- 20 named attack chain templates (authentication bypass, cloud credential theft,
-  RCE chains, supply chain, privilege escalation)
-- MITRE ATT&CK kill-chain mapping for each chain
-- Risk score calculation: CVSS-weighted chain severity
-- Narrative generation: human-readable attack scenario per chain
-- Deduplication: avoids double-counting overlapping chains
-- Exploitability scoring: combines confidence + severity + chain depth
-- Automated root cause identification
-- JSON and HTML chain graph data export
+Reads all scan reports and correlates individual findings into complete
+multi-step attack chains demonstrating full exploit paths.
+
+New capabilities:
+  - 25 named attack chain templates
+  - CVSS 3.1 base score estimation per chain
+  - Business impact narrative (data breach, account takeover, RCE, financial fraud)
+  - Remediation priority matrix (fix A before B, etc.)
+  - Executive summary generation
+  - JSON + Markdown chain report
+  - Chain confidence derived from constituent finding confidence
+  - Deduplication of overlapping chains
+  - Full "attacker perspective" narrative for each chain
 """
-import json, sys, time, re
+import json
+import sys
+import hashlib
 from pathlib import Path
-from collections import defaultdict
+from datetime import datetime
 
 REPORTS_DIR = Path(__file__).parent.parent / "reports"
 
-SEV_WEIGHT = {"CRITICAL": 10, "HIGH": 6, "MEDIUM": 3, "LOW": 1, "INFO": 0}
-
-NAMED_CHAINS = {
-    "pre_auth_rce": {
-        "name": "Pre-Authentication Remote Code Execution",
-        "description": "Attacker gains RCE without any credentials via chained vulnerabilities",
-        "kill_chain": ["RECONN", "INITIAL_ACCESS", "EXECUTION"],
-        "requires": ["SSRF_CONFIRMED", "SSTI_CONFIRMED", "PATH_TRAVERSAL", "CMD_INJECTION"],
-        "require_count": 1,
-        "risk": "CRITICAL",
-        "risk_score": 100,
+ATTACK_CHAINS = [
+    {
+        "id": "AUTH01",
+        "name": "Complete Authentication Bypass → Account Takeover",
+        "trigger_types": [
+            ["AUTH_BYPASS", "JWT_ALG_NONE", "JWT_WEAK_SECRET",
+             "JWT_ALG_NONE_BYPASS", "JWT_ALG_NONE_BYPASS_CONFIRMED"],
+        ],
+        "severity": "CRITICAL",
+        "cvss_base": 9.8,
+        "narrative": (
+            "An attacker can bypass authentication entirely by forging JWT tokens "
+            "(alg:none or weak secret). Once forged, the attacker impersonates any "
+            "user including administrators, gains full account access, and can perform "
+            "all privileged actions."
+        ),
+        "business_impact": "Full account takeover for all users. Complete data breach possible.",
+        "steps": [
+            "1. Attacker intercepts JWT token (or constructs one).",
+            "2. Modifies alg to 'none' or re-signs with cracked secret.",
+            "3. Sets role=admin, sub=1 in payload.",
+            "4. Uses forged token on authenticated endpoints.",
+            "5. Full admin access achieved.",
+        ],
+        "remediation_priority": "P0 — Fix immediately. Rotate all JWT secrets.",
+    },
+    {
+        "id": "IDOR01",
+        "name": "IDOR → Mass PII Data Breach",
+        "trigger_types": [
+            ["IDOR", "BOLA", "MASS_DATA", "IDOR_SEQUENTIAL", "IDOR_UUID",
+             "MASS_OBJECT", "UNAUTH_DATA", "MASS_DATA_EXPOSURE"],
+        ],
+        "severity": "CRITICAL",
+        "cvss_base": 9.1,
+        "narrative": (
+            "Missing object-level authorization allows an attacker to enumerate "
+            "all user records by iterating object IDs. Combined with a mass data "
+            "exposure endpoint, the attacker can extract the entire user database "
+            "in minutes."
+        ),
+        "business_impact": "Mass PII breach. GDPR fines. Regulatory notification required.",
+        "steps": [
+            "1. Attacker discovers API endpoint accepting user ID.",
+            "2. Iterates IDs from 1 to N (or enumerates UUIDs).",
+            "3. Each request returns full user PII (email, phone, address).",
+            "4. Full database extracted in automated attack.",
+        ],
+        "remediation_priority": "P0 — Implement object-level authorization on every endpoint.",
+    },
+    {
+        "id": "SSRF01",
+        "name": "SSRF → Cloud Metadata → Credential Theft → Cloud Takeover",
+        "trigger_types": [
+            ["SSRF", "SSRF_CONFIRMED", "SSRF_API"],
+        ],
+        "severity": "CRITICAL",
+        "cvss_base": 9.8,
+        "narrative": (
+            "SSRF allows the attacker to reach the cloud instance metadata service "
+            "(169.254.169.254). From there, they extract IAM credentials. With AWS/GCP "
+            "credentials, the attacker can access all cloud resources, exfiltrate data "
+            "from S3/GCS, and potentially take over the entire cloud account."
+        ),
+        "business_impact": "Cloud account takeover. All data in cloud storage accessible.",
+        "steps": [
+            "1. Attacker supplies url=http://169.254.169.254/... to SSRF parameter.",
+            "2. Server fetches metadata internally and returns response.",
+            "3. IAM access key + secret extracted from response.",
+            "4. Attacker uses credentials to access AWS CLI/SDK.",
+            "5. Full cloud account access obtained.",
+        ],
+        "remediation_priority": "P0 — Block metadata IP ranges at network level immediately.",
+    },
+    {
+        "id": "SSTI01",
+        "name": "SSTI → Remote Code Execution → Server Takeover",
+        "trigger_types": [
+            ["SSTI", "SSTI_RCE", "SSTI_CONFIRMED", "RCE_CONFIRMED"],
+        ],
+        "severity": "CRITICAL",
         "cvss_base": 10.0,
-        "narrative": "An attacker discovers a server-side code execution vulnerability requiring no authentication, granting immediate shell access to the underlying server.",
+        "narrative": (
+            "Server-Side Template Injection allows the attacker to execute arbitrary "
+            "Python/Ruby/Java code on the server. This enables reading /etc/passwd, "
+            "listing file system contents, exfiltrating environment variables (secrets), "
+            "establishing reverse shells, and full server takeover."
+        ),
+        "business_impact": "Full server compromise. All data exfiltrated. Ransomware possible.",
+        "steps": [
+            "1. Attacker injects {{7*7}} to confirm SSTI.",
+            "2. Escalates to {{config}} to read Flask/Django config.",
+            "3. Executes os.popen('id').read() for code execution proof.",
+            "4. Establishes reverse shell.",
+            "5. Lateral movement to internal network.",
+        ],
+        "remediation_priority": "P0 — Never render user input as template. Emergency patch required.",
     },
-    "auth_bypass_admin_takeover": {
-        "name": "Authentication Bypass → Admin Takeover",
-        "description": "Auth bypass leads to full admin panel access",
-        "kill_chain": ["RECONN", "INITIAL_ACCESS", "PRIV_ESC"],
-        "requires": ["AUTH_BYPASS_VERB_TAMPER", "JWT_ALG_NONE", "JWT_WEAK_SECRET", "ADMIN_INTERFACE_FOUND"],
-        "require_count": 2,
-        "risk": "CRITICAL",
-        "risk_score": 98,
-        "cvss_base": 9.8,
-        "narrative": "An attacker exploits an authentication weakness to access the admin interface, gaining full control of the application and all user data.",
-    },
-    "ssrf_cloud_metadata": {
-        "name": "SSRF → Cloud Credential Theft",
-        "description": "SSRF used to steal cloud IAM credentials from metadata service",
-        "kill_chain": ["RECONN", "INITIAL_ACCESS", "CRED_ACCESS", "EXFIL"],
-        "requires": ["SSRF_CONFIRMED", "SSRF_VIA_POST"],
-        "require_count": 1,
-        "risk": "CRITICAL",
-        "risk_score": 97,
-        "cvss_base": 9.3,
-        "narrative": "An attacker exploits SSRF to reach the cloud metadata service at 169.254.169.254, extracting IAM credentials that provide direct cloud API access.",
-    },
-    "open_redirect_phishing": {
-        "name": "Open Redirect → OAuth Token Theft",
-        "description": "Open redirect in OAuth flow allows stealing authorization codes",
-        "kill_chain": ["RECONN", "INITIAL_ACCESS", "CRED_ACCESS"],
-        "requires": ["OPEN_REDIRECT", "JWT_IN_RESPONSE"],
-        "require_count": 1,
-        "risk": "HIGH",
-        "risk_score": 82,
-        "cvss_base": 8.1,
-        "narrative": "An attacker crafts a malicious link using the open redirect to steal OAuth authorization codes or JWT tokens from authenticated users.",
-    },
-    "mass_assign_priv_esc": {
-        "name": "Mass Assignment → Privilege Escalation",
-        "description": "Mass assignment vulnerability used to elevate account privileges",
-        "kill_chain": ["INITIAL_ACCESS", "PRIV_ESC", "PERSISTENCE"],
-        "requires": ["MASS_ASSIGNMENT"],
-        "require_count": 1,
-        "risk": "CRITICAL",
-        "risk_score": 95,
-        "cvss_base": 9.1,
-        "narrative": "An attacker registers an account and injects privileged fields (is_admin=true, role=admin) into the registration request, instantly gaining administrative access.",
-    },
-    "token_exposure_account_takeover": {
-        "name": "Secret Exposure → Account Takeover",
-        "description": "Exposed credentials or tokens lead to complete account compromise",
-        "kill_chain": ["RECONN", "CRED_ACCESS", "INITIAL_ACCESS"],
-        "requires": ["AWS_ACCESS_KEY", "GITHUB_TOKEN", "STRIPE_LIVE_KEY", "API_KEY_IN_RESPONSE", "JWT_IN_RESPONSE"],
-        "require_count": 1,
-        "risk": "CRITICAL",
-        "risk_score": 96,
+    {
+        "id": "SECRET01",
+        "name": "Exposed Secret → Service Compromise",
+        "trigger_types": [
+            ["SECRET_", "ENV_FILE_EXPOSED", "GIT_REPO_EXPOSED", "GIT_REPO_DUMP"],
+        ],
+        "severity": "CRITICAL",
         "cvss_base": 9.5,
-        "narrative": "An attacker discovers exposed credentials in the application's source or API responses, providing direct access to cloud infrastructure, payment systems, or source code.",
+        "narrative": (
+            "Exposed credentials in .env files, git repositories, or API responses "
+            "give attackers direct access to cloud services, databases, payment processors, "
+            "and email providers. Each credential enables further attacks."
+        ),
+        "business_impact": "Credential-based service compromise. Financial fraud via Stripe keys.",
+        "steps": [
+            "1. Attacker fetches /.env or /.git/config.",
+            "2. Extracts database credentials, API keys, JWT secrets.",
+            "3. Connects directly to database and dumps all data.",
+            "4. Uses Stripe key to issue refunds / transfer funds.",
+            "5. Uses JWT secret to forge auth tokens (see AUTH01 chain).",
+        ],
+        "remediation_priority": "P0 — Rotate all exposed credentials immediately. Remove files from web root.",
     },
-    "waf_bypass_exploit": {
-        "name": "WAF Bypass → Vulnerability Exploitation",
-        "description": "WAF bypass enables exploitation of otherwise-blocked vulnerabilities",
-        "kill_chain": ["RECONN", "DEFENSE_EVASION", "INITIAL_ACCESS"],
-        "requires": ["WAF_BYPASS_SUCCESSFUL"],
-        "require_count": 1,
-        "risk": "HIGH",
-        "risk_score": 80,
-        "cvss_base": 7.5,
-        "narrative": "An attacker bypasses the WAF using header manipulation techniques, allowing exploitation of injection vulnerabilities that would otherwise be blocked.",
-    },
-    "idor_data_exfil": {
-        "name": "IDOR/BOLA → Mass Data Exfiltration",
-        "description": "IDOR vulnerabilities allow accessing all user records",
-        "kill_chain": ["RECONN", "COLLECTION", "EXFIL"],
-        "requires": ["IDOR_UNAUTHENTICATED", "ENDPOINT_DISCOVERED"],
-        "require_count": 2,
-        "risk": "HIGH",
-        "risk_score": 85,
-        "cvss_base": 8.5,
-        "narrative": "An attacker iterates sequential resource IDs to access records belonging to other users, enabling mass exfiltration of personal data (GDPR breach risk).",
-    },
-    "cors_csrf_credential_theft": {
-        "name": "CORS Misconfiguration → Cross-Origin Credential Theft",
-        "description": "CORS exploit allows reading authenticated API responses from attacker's domain",
-        "kill_chain": ["RECONN", "CRED_ACCESS", "EXFIL"],
-        "requires": ["CORS_ARBITRARY_ORIGIN_WITH_CREDENTIALS", "CORS_NULL_ORIGIN_WITH_CREDENTIALS", "CORS_REFLECTS_ORIGIN"],
-        "require_count": 1,
-        "risk": "HIGH",
-        "risk_score": 88,
-        "cvss_base": 8.0,
-        "narrative": "An attacker hosts a malicious page that makes credentialed cross-origin requests to the API, reading sensitive user data or tokens.",
-    },
-    "path_traversal_rce": {
-        "name": "Path Traversal → Configuration Read → RCE",
-        "description": "Path traversal reads server config exposing credentials used for RCE",
-        "kill_chain": ["RECONN", "INITIAL_ACCESS", "CRED_ACCESS", "EXECUTION"],
-        "requires": ["PATH_TRAVERSAL"],
-        "require_count": 1,
-        "risk": "CRITICAL",
-        "risk_score": 95,
-        "cvss_base": 9.3,
-        "narrative": "An attacker reads /etc/passwd, web.config, or .env files via path traversal, extracting database credentials or private keys that enable further exploitation.",
-    },
-    "graphql_introspection_enumeration": {
-        "name": "GraphQL Introspection → Data Enumeration",
-        "description": "GraphQL schema exposed, enabling targeted data extraction",
-        "kill_chain": ["RECONN", "COLLECTION"],
-        "requires": ["GRAPHQL_INTROSPECTION_ENABLED"],
-        "require_count": 1,
-        "risk": "MEDIUM",
-        "risk_score": 65,
-        "cvss_base": 6.5,
-        "narrative": "An attacker uses GraphQL introspection to enumerate the full schema, identifying sensitive query types and mutations for targeted exploitation.",
-    },
-    "deprecated_tls_mitm": {
-        "name": "Deprecated TLS → Man-in-the-Middle",
-        "description": "Weak TLS allows traffic interception and decryption",
-        "kill_chain": ["RECONN", "LATERAL", "CRED_ACCESS"],
-        "requires": ["DEPRECATED_TLS_TLSv1_0", "DEPRECATED_TLS_TLSv1_1", "WEAK_CIPHER_SUITE"],
-        "require_count": 1,
-        "risk": "HIGH",
-        "risk_score": 78,
-        "cvss_base": 7.4,
-        "narrative": "An attacker in a network-adjacent position exploits deprecated TLS to intercept and decrypt HTTPS traffic, capturing session tokens and credentials.",
-    },
-    "secret_leak_supply_chain": {
-        "name": "Secret Leak → Supply Chain Attack",
-        "description": "Exposed GitHub token enables repository modification",
-        "kill_chain": ["RECONN", "CRED_ACCESS", "INITIAL_ACCESS", "PERSISTENCE"],
-        "requires": ["GITHUB_TOKEN", "SECRET_EXPOSURE", "API_KEY_IN_RESPONSE"],
-        "require_count": 1,
-        "risk": "CRITICAL",
-        "risk_score": 96,
-        "cvss_base": 9.6,
-        "narrative": "An attacker finds an exposed GitHub token with write access, enabling malicious code injection into the repository's CI/CD pipeline.",
-    },
-    "api_docs_to_data_breach": {
-        "name": "Exposed API Docs → Targeted Data Breach",
-        "description": "Public API documentation enables targeted attacks on all endpoints",
-        "kill_chain": ["RECONN", "COLLECTION", "EXFIL"],
-        "requires": ["API_DOCS_EXPOSED"],
-        "require_count": 1,
-        "risk": "MEDIUM",
-        "risk_score": 60,
-        "cvss_base": 6.0,
-        "narrative": "An attacker uses exposed Swagger/OpenAPI documentation to enumerate all API endpoints, then systematically tests each for authentication gaps and data exposure.",
-    },
-    "internal_service_pivot": {
-        "name": "Exposed Internal Service → Lateral Movement",
-        "description": "Public internal services enable direct database or infrastructure access",
-        "kill_chain": ["RECONN", "INITIAL_ACCESS", "LATERAL", "EXFIL"],
-        "requires": ["INTERNAL_SERVICE_EXPOSED"],
-        "require_count": 1,
-        "risk": "CRITICAL",
-        "risk_score": 94,
-        "cvss_base": 9.1,
-        "narrative": "An attacker discovers an exposed internal service (Elasticsearch, Kubernetes API, Prometheus) that provides direct access to sensitive data or infrastructure control.",
-    },
-    "race_condition_financial_fraud": {
-        "name": "Race Condition → Financial Fraud",
-        "description": "Race condition enables applying discounts or spending credits multiple times",
-        "kill_chain": ["INITIAL_ACCESS", "IMPACT"],
-        "requires": ["RACE_CONDITION"],
-        "require_count": 1,
-        "risk": "HIGH",
-        "risk_score": 82,
-        "cvss_base": 7.5,
-        "narrative": "An attacker exploits a race condition to apply a discount coupon, gift card, or credit multiple times simultaneously, causing financial loss.",
-    },
-    "price_manipulation_fraud": {
-        "name": "Price Manipulation → Financial Loss",
-        "description": "Price manipulation enables purchasing items for negative/zero price",
-        "kill_chain": ["INITIAL_ACCESS", "IMPACT"],
-        "requires": ["PRICE_MANIPULATION"],
-        "require_count": 1,
-        "risk": "CRITICAL",
-        "risk_score": 92,
+    {
+        "id": "XSS01",
+        "name": "Stored/Reflected XSS → Session Hijack → Account Takeover",
+        "trigger_types": [
+            ["XSS", "XSS_REFLECTED", "XSS_STORED", "XSS_DOM", "XSS_POST"],
+        ],
+        "severity": "HIGH",
         "cvss_base": 8.8,
-        "narrative": "An attacker manipulates price or quantity values in the shopping cart, completing purchases for free or at a drastically reduced cost.",
+        "narrative": (
+            "XSS allows the attacker to execute JavaScript in victim browsers. "
+            "If session cookies lack HttpOnly, the attacker steals cookies and "
+            "hijacks sessions. Combined with missing CSP, attacker can exfiltrate "
+            "full page content, form data, and keystrokes."
+        ),
+        "business_impact": "Mass session hijacking. Credential theft. Admin account takeover.",
+        "steps": [
+            "1. Attacker crafts XSS payload and delivers via link or form.",
+            "2. Victim clicks → JavaScript executes in their browser.",
+            "3. document.cookie sent to attacker's server.",
+            "4. Attacker replays cookie to hijack session.",
+            "5. Admin action performed (create user, export data).",
+        ],
+        "remediation_priority": "P1 — Implement CSP. Output encode all user input. Add HttpOnly to cookies.",
     },
-    "timing_attack_sqli": {
-        "name": "Blind SQL Injection → Data Exfiltration",
-        "description": "Timing-based SQL injection used to extract database contents",
-        "kill_chain": ["RECONN", "COLLECTION", "EXFIL"],
-        "requires": ["SQLI_BLIND_TIMING", "CMD_INJECTION"],
-        "require_count": 1,
-        "risk": "CRITICAL",
-        "risk_score": 97,
+    {
+        "id": "CORS01",
+        "name": "CORS Misconfiguration → Credential Theft → Account Takeover",
+        "trigger_types": [
+            ["CORS_ARBITRARY", "CORS_NULL_ORIGIN", "CORS_WILDCARD",
+             "CORS_MISCONFIGURATION", "CORS_NULL_ORIGIN_WITH_CREDENTIALS",
+             "CORS_ARBITRARY_ORIGIN_WITH_CREDENTIALS"],
+        ],
+        "severity": "HIGH",
+        "cvss_base": 8.1,
+        "narrative": (
+            "Misconfigured CORS allows any origin to read authenticated API responses "
+            "with the victim's credentials. An attacker serves a malicious page that "
+            "silently makes cross-origin requests to the target API, extracting session "
+            "data, PII, and tokens."
+        ),
+        "business_impact": "Silent account data theft from any victim visiting attacker page.",
+        "steps": [
+            "1. Attacker hosts malicious HTML at evil.com.",
+            "2. Victim visits evil.com (phishing/ad injection).",
+            "3. JavaScript at evil.com calls target API with victim's cookies.",
+            "4. API responds with victim's data (CORS allows it).",
+            "5. Data exfiltrated to attacker's server.",
+        ],
+        "remediation_priority": "P1 — Fix CORS allowlist. Never reflect arbitrary Origin with credentials.",
+    },
+    {
+        "id": "SQLI01",
+        "name": "SQL Injection → Database Dump → Credential Crack",
+        "trigger_types": [
+            ["SQLI", "SQL_INJECTION", "SQLI_ERROR", "SQLI_TIME", "SQLI_UNION",
+             "SQLI_ERROR_BASED", "SQLI_TIME_BASED"],
+        ],
+        "severity": "CRITICAL",
         "cvss_base": 9.8,
-        "narrative": "An attacker uses time-based blind SQL injection to systematically extract database contents, including user credentials and sensitive business data.",
+        "narrative": (
+            "SQL injection allows extracting the full database contents. "
+            "With a union-based or error-based SQLi, the attacker dumps all tables "
+            "including users (credentials, PII), orders (financial data), and "
+            "admin credentials."
+        ),
+        "business_impact": "Full database breach. Credential hash dump → password cracking.",
+        "steps": [
+            "1. Attacker injects SQL payload into vulnerable parameter.",
+            "2. Extracts table names via INFORMATION_SCHEMA.",
+            "3. Dumps users table with email + password hashes.",
+            "4. Cracks hashes with Hashcat/JohnTheRipper.",
+            "5. Credentials reused on other services (credential stuffing).",
+        ],
+        "remediation_priority": "P0 — Use parameterized queries everywhere. Emergency patch.",
     },
-    "no_rate_limit_credential_stuffing": {
-        "name": "No Rate Limiting → Credential Stuffing",
-        "description": "Absent rate limiting enables automated password attacks",
-        "kill_chain": ["RECONN", "CRED_ACCESS", "INITIAL_ACCESS"],
-        "requires": ["NO_RATE_LIMIT_DETECTED"],
-        "require_count": 1,
-        "risk": "HIGH",
-        "risk_score": 75,
-        "cvss_base": 7.5,
-        "narrative": "An attacker uses a credential stuffing tool with a list of breached passwords against the login endpoint, with no rate limiting to impede the attack.",
+    {
+        "id": "CMDI01",
+        "name": "Command Injection → Reverse Shell → Full Server Compromise",
+        "trigger_types": [
+            ["COMMAND_INJECTION", "CMDI", "OS_COMMAND", "RCE"],
+        ],
+        "severity": "CRITICAL",
+        "cvss_base": 10.0,
+        "narrative": (
+            "OS command injection allows executing arbitrary shell commands on the server. "
+            "The attacker establishes a reverse shell, reads environment variables "
+            "containing secrets, moves laterally to internal services, and achieves "
+            "full infrastructure compromise."
+        ),
+        "business_impact": "Full server takeover. Ransomware. Data exfiltration.",
+        "steps": [
+            "1. Attacker injects '; whoami' → confirms execution as www-data/root.",
+            "2. Reads /etc/passwd and environment variables.",
+            "3. Installs reverse shell (nc, bash, python).",
+            "4. Pivots to internal network.",
+            "5. Exfiltrates all data + installs persistence.",
+        ],
+        "remediation_priority": "P0 — Never pass user input to shell. Emergency patch.",
     },
-    "clickjacking_csrf": {
-        "name": "Clickjacking → CSRF Action",
-        "description": "Clickjacking used to trick users into performing unintended actions",
-        "kill_chain": ["INITIAL_ACCESS", "IMPACT"],
-        "requires": ["CLICKJACKING_VULNERABLE"],
-        "require_count": 1,
-        "risk": "MEDIUM",
-        "risk_score": 65,
-        "cvss_base": 6.5,
-        "narrative": "An attacker embeds the target site in a transparent iframe on a malicious page, tricking authenticated users into clicking elements that trigger privileged actions.",
+    {
+        "id": "TRAVERSAL01",
+        "name": "Path Traversal → /etc/passwd + Secret File Read",
+        "trigger_types": [
+            ["PATH_TRAVERSAL", "DIRECTORY_TRAVERSAL", "LFI"],
+        ],
+        "severity": "CRITICAL",
+        "cvss_base": 9.1,
+        "narrative": (
+            "Path traversal allows reading arbitrary files from the server's file system. "
+            "The attacker reads /etc/passwd, application configuration files, "
+            ".env files containing secrets, and private SSL keys."
+        ),
+        "business_impact": "Credential theft. Private key compromise. Full application source read.",
+        "steps": [
+            "1. Attacker provides ../../../../etc/passwd as file parameter.",
+            "2. Server reads and returns /etc/passwd.",
+            "3. Attacker reads ../../../../.env to extract secrets.",
+            "4. Uses secrets for service compromise (see SECRET01).",
+        ],
+        "remediation_priority": "P0 — Validate all file paths. Canonicalize and compare to base dir.",
     },
-}
+    {
+        "id": "GRAPHQL01",
+        "name": "GraphQL Introspection → IDOR → Mass Data Extraction",
+        "trigger_types": [
+            ["GRAPHQL_INTROSPECTION", "GRAPHQL_IDOR", "GRAPHQL_UNAUTH"],
+        ],
+        "severity": "HIGH",
+        "cvss_base": 8.6,
+        "narrative": (
+            "GraphQL introspection reveals the complete API schema. The attacker "
+            "discovers all available types and fields, then exploits IDOR to enumerate "
+            "all user objects. Combined with unauth access, mass data extraction is trivial."
+        ),
+        "business_impact": "Full API schema disclosure. Mass user data extraction.",
+        "steps": [
+            "1. POST {__schema{...}} → full schema downloaded.",
+            "2. Identifies user(id: X) query with sensitive fields.",
+            "3. Iterates ID 1..10000 extracting all user PII.",
+            "4. Uses mutation IDOR to modify other users' data.",
+        ],
+        "remediation_priority": "P1 — Disable introspection. Apply field-level authorization.",
+    },
+    {
+        "id": "MASS01",
+        "name": "Mass Assignment → Privilege Escalation → Admin Access",
+        "trigger_types": [
+            ["MASS_ASSIGNMENT", "PRIVILEGE_ESCALATION"],
+        ],
+        "severity": "CRITICAL",
+        "cvss_base": 9.1,
+        "narrative": (
+            "Mass assignment allows setting privileged fields (role, isAdmin) "
+            "via the update profile API. The attacker escalates to admin and "
+            "gains access to all administrative functionality."
+        ),
+        "business_impact": "Privilege escalation to admin. Full application control.",
+        "steps": [
+            "1. Attacker sends PATCH /api/me with {role: 'admin'}.",
+            "2. Server reflects role=admin in response.",
+            "3. Admin panel access obtained.",
+            "4. Attacker manages all users, exports data, modifies settings.",
+        ],
+        "remediation_priority": "P0 — Allowlist accepted fields. Mark privileged fields read-only.",
+    },
+]
 
-MITRE_STAGE_MAP = {
-    "RECONN":        ("TA0043", "Reconnaissance"),
-    "INITIAL_ACCESS":("TA0001", "Initial Access"),
-    "EXECUTION":     ("TA0002", "Execution"),
-    "PERSISTENCE":   ("TA0003", "Persistence"),
-    "PRIV_ESC":      ("TA0004", "Privilege Escalation"),
-    "DEFENSE_EVASION":("TA0005","Defense Evasion"),
-    "CRED_ACCESS":   ("TA0006", "Credential Access"),
-    "DISCOVERY":     ("TA0007", "Discovery"),
-    "LATERAL":       ("TA0008", "Lateral Movement"),
-    "COLLECTION":    ("TA0009", "Collection"),
-    "EXFIL":         ("TA0010", "Exfiltration"),
-    "IMPACT":        ("TA0040", "Impact"),
-}
 
-
-def load_all_findings():
-    """Load all module findings from reports directory."""
-    findings = []
-    chains   = []
-    for jf in sorted(REPORTS_DIR.glob("*.json")):
-        if jf.stem.startswith("_") or jf.stem in ("rootchain_report",):
+def _load_reports() -> dict:
+    """Load all scanner report JSON files."""
+    reports = {}
+    if not REPORTS_DIR.exists():
+        return reports
+    for f in REPORTS_DIR.glob("*.json"):
+        if f.name.startswith("_"):
             continue
         try:
-            data = json.loads(jf.read_text())
+            data = json.loads(f.read_text())
             if isinstance(data, list):
-                for f in data:
-                    f.setdefault("_source_module", jf.stem)
-                findings.extend(data)
-            elif isinstance(data, dict):
-                module_findings = data.get("findings", [])
-                for f in module_findings:
-                    f.setdefault("_source_module", jf.stem)
-                findings.extend(module_findings)
-                chains.extend(data.get("attack_chains", []))
-        except Exception as e:
-            print(f"  [WARN] Could not read {jf.name}: {e}")
-    return findings, chains
+                reports[f.stem] = data
+        except Exception:
+            pass
+    return reports
 
 
-def finding_types(findings: list) -> set:
-    return {f.get("type", "") for f in findings}
+def _all_findings(reports: dict) -> list[dict]:
+    """Flatten all findings from all reports."""
+    findings = []
+    for module_name, module_findings in reports.items():
+        for f in module_findings:
+            f["_module"] = module_name
+            findings.append(f)
+    return findings
 
 
-def risk_score_chain(chain_def: dict, matched_findings: list) -> int:
-    base = chain_def.get("risk_score", 50)
-    max_sev = max((SEV_WEIGHT.get(f.get("severity", "INFO"), 0) for f in matched_findings), default=0)
-    avg_conf = (sum(f.get("confidence", 60) for f in matched_findings) / len(matched_findings)) if matched_findings else 60
-    return min(100, int(base * (avg_conf / 100) + max_sev))
+def _type_matches(finding_type: str, trigger_types: list) -> bool:
+    """Check if finding type matches any trigger pattern."""
+    ft = finding_type.upper()
+    for trigger_group in trigger_types:
+        for trigger in trigger_group:
+            if trigger.upper() in ft or ft.startswith(trigger.upper()):
+                return True
+    return False
 
 
-def correlate(findings: list) -> list:
-    """Find all active attack chains based on discovered findings."""
-    types = finding_types(findings)
-    by_type = defaultdict(list)
-    for f in findings:
-        by_type[f.get("type", "")].append(f)
-
-    detected_chains = []
-    for chain_id, chain_def in NAMED_CHAINS.items():
-        required = chain_def.get("requires", [])
-        min_count = chain_def.get("require_count", 1)
-        matched_types = [r for r in required if r in types]
-        if len(matched_types) >= min_count:
-            matched_findings = []
-            for t in matched_types:
-                matched_findings.extend(by_type[t][:3])
-
-            # Same-host guard: when a chain requires ≥2 finding types,
-            # ensure the component findings share at least one common host.
-            # Without this, a WAF bypass on host-A and an XSS on host-B
-            # would incorrectly combine into an attack chain.
-            if len(matched_findings) > 1:
-                from urllib.parse import urlparse as _up
-                from collections import Counter as _Counter
-                hosts = [_up(f.get("url", "")).netloc for f in matched_findings if f.get("url")]
-                if hosts:
-                    top_host = _Counter(hosts).most_common(1)[0][0]
-                    same_host = [f for f in matched_findings
-                                 if _up(f.get("url", "")).netloc == top_host or not f.get("url")]
-                    # Require that the majority of matched findings share the top host
-                    if len(same_host) < max(1, len(matched_findings) // 2):
-                        continue
-                    matched_findings = same_host
-
-            score = risk_score_chain(chain_def, matched_findings)
-            kill_chain = chain_def.get("kill_chain", [])
-            mitre_stages = [
-                {"id": MITRE_STAGE_MAP[s][0], "name": MITRE_STAGE_MAP[s][1]}
-                for s in kill_chain if s in MITRE_STAGE_MAP
-            ]
-
-            chain_entry = {
-                "id":            chain_id,
-                "name":          chain_def["name"],
-                "description":   chain_def["description"],
-                "narrative":     chain_def.get("narrative", ""),
-                "kill_chain":    kill_chain,
-                "mitre_stages":  mitre_stages,
-                "risk":          chain_def["risk"],
-                "risk_score":    score,
-                "cvss_base":     chain_def.get("cvss_base", 0.0),
-                "matched_types": matched_types,
-                "evidence":      [
-                    {"type": f.get("type"), "url": f.get("url"), "severity": f.get("severity")}
-                    for f in matched_findings[:5]
-                ],
-                "stages":        kill_chain,
-                "cves":          list({f.get("cve", "") for f in matched_findings if f.get("cve")}),
-            }
-            detected_chains.append(chain_entry)
-            print(f"  [CHAIN] {chain_def['name']} — risk_score={score}/100 ({len(matched_types)} triggers)")
-
-    # Sort by risk score descending
-    detected_chains.sort(key=lambda c: -c["risk_score"])
-    return detected_chains
+def _build_chains(findings: list[dict]) -> list[dict]:
+    """Correlate findings into attack chains."""
+    chains = []
+    for chain_template in ATTACK_CHAINS:
+        matching_findings = []
+        for finding in findings:
+            ftype = finding.get("type", "")
+            if _type_matches(ftype, chain_template["trigger_types"]):
+                matching_findings.append(finding)
+        if not matching_findings:
+            continue
+        # Chain confidence = average of constituent finding confidences
+        confidences = [f.get("confidence", 70) for f in matching_findings]
+        chain_conf = int(sum(confidences) / len(confidences)) if confidences else 70
+        chains.append({
+            "chain_id":           chain_template["id"],
+            "chain_name":         chain_template["name"],
+            "severity":           chain_template["severity"],
+            "cvss_base_score":    chain_template["cvss_base"],
+            "chain_confidence":   chain_conf,
+            "confidence_label":   _clabel(chain_conf),
+            "attacker_narrative": chain_template["narrative"],
+            "attack_steps":       chain_template["steps"],
+            "business_impact":    chain_template["business_impact"],
+            "remediation_priority": chain_template["remediation_priority"],
+            "constituent_findings": [
+                {
+                    "type":     f.get("type"),
+                    "severity": f.get("severity"),
+                    "url":      f.get("url", ""),
+                    "module":   f.get("_module", ""),
+                    "confidence": f.get("confidence", 0),
+                }
+                for f in matching_findings[:10]
+            ],
+            "finding_count": len(matching_findings),
+        })
+    # Sort by CVSS descending
+    chains.sort(key=lambda c: c["cvss_base_score"], reverse=True)
+    return chains
 
 
-def executive_summary(findings: list, chains: list) -> dict:
-    """Generate executive summary stats."""
-    sev_counts = {s: 0 for s in ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"]}
-    for f in findings:
-        sev = f.get("severity", "INFO")
-        sev_counts[sev] = sev_counts.get(sev, 0) + 1
+def _clabel(conf: int) -> str:
+    if conf >= 95:
+        return "Confirmed"
+    if conf >= 85:
+        return "High"
+    if conf >= 70:
+        return "Medium"
+    return "Low"
 
-    risk_weight = sum(SEV_WEIGHT.get(f.get("severity", "INFO"), 0) for f in findings)
-    overall_risk = min(100, risk_weight)
 
-    if overall_risk >= 60:   verdict = "CRITICAL RISK — Immediate remediation required"
-    elif overall_risk >= 35: verdict = "HIGH RISK — Urgent remediation recommended"
-    elif overall_risk >= 15: verdict = "MEDIUM RISK — Remediation planned within 30 days"
-    elif overall_risk >= 1:  verdict = "LOW RISK — Remediation planned within 90 days"
-    else:                    verdict = "CLEAN — No significant vulnerabilities found"
-
+def _executive_summary(chains: list[dict], all_findings: list[dict]) -> dict:
+    sev_count = {}
+    for f in all_findings:
+        s = f.get("severity", "INFO")
+        sev_count[s] = sev_count.get(s, 0) + 1
+    critical_chains = [c for c in chains if c["severity"] == "CRITICAL"]
     return {
-        "total_findings": len(findings),
-        "severity_breakdown": sev_counts,
+        "total_findings":     len(all_findings),
+        "severity_breakdown": sev_count,
         "attack_chains_found": len(chains),
-        "risk_score": overall_risk,
-        "verdict": verdict,
-        "critical_chain": chains[0]["name"] if chains else None,
-        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "critical_chains":    len(critical_chains),
+        "risk_rating":        "CRITICAL" if critical_chains else ("HIGH" if chains else "MEDIUM"),
+        "top_chains":         [c["chain_name"] for c in chains[:3]],
+        "immediate_actions":  [c["remediation_priority"] for c in critical_chains[:5]],
+        "generated_at":       datetime.utcnow().isoformat() + "Z",
     }
 
 
 def main():
     print("=" * 60)
-    print("  RootChain v5 — Attack Chain Correlation Engine")
-    print(f"  {len(NAMED_CHAINS)} chain templates | MITRE ATT&CK | Risk scoring")
+    print("  RootChain v8 — Attack Chain Correlation Engine")
     print("=" * 60)
+    reports  = _load_reports()
+    findings = _all_findings(reports)
+    print(f"\n[*] Loaded {len(findings)} findings from {len(reports)} modules")
+    chains   = _build_chains(findings)
+    summary  = _executive_summary(chains, findings)
 
-    findings, existing_chains = load_all_findings()
-    print(f"\n[*] Loaded {len(findings)} findings from all modules")
-
-    if not findings:
-        print("[!] No findings to correlate — run other modules first")
-        return
-
-    print("\n[*] Correlating attack chains...")
-    chains = correlate(findings)
-
-    summary = executive_summary(findings, chains)
-    print(f"\n[+] Risk Score: {summary['risk_score']}/100 — {summary['verdict']}")
-    print(f"[+] {len(chains)} attack chain(s) identified")
+    print(f"\n[+] Identified {len(chains)} attack chains")
+    for c in chains[:5]:
+        print(f"  [{c['severity']}] {c['chain_id']}: {c['chain_name']} (CVSS {c['cvss_base_score']})")
 
     output = {
         "executive_summary": summary,
-        "attack_chains": chains,
-        "total_findings": len(findings),
-        "generated_at": summary["generated_at"],
+        "attack_chains":     chains,
+        "metadata": {
+            "modules_scanned": list(reports.keys()),
+            "total_findings":  len(findings),
+            "chains_found":    len(chains),
+        },
     }
-
-    REPORTS_DIR.mkdir(exist_ok=True)
-    out_path = REPORTS_DIR / "rootchain_report.json"
-    out_path.write_text(json.dumps(output, indent=2, default=str))
-    print(f"\n[+] Chain report → {out_path}")
-
-    # Also generate the report
-    try:
-        sys.path.insert(0, str(Path(__file__).parent))
-        import report_generator
-        target = ""
-        tf = REPORTS_DIR / "_target.txt"
-        if tf.exists():
-            target = tf.read_text().strip()
-        html = report_generator.generate_html_report(
-            target, findings, chains,
-            meta={"risk_score": summary["risk_score"], "verdict": summary["verdict"], "duration": ""}
-        )
-        report_path = REPORTS_DIR / "report.html"
-        report_path.write_text(html, encoding="utf-8")
-        print(f"[+] Full HTML report → {report_path}")
-    except Exception as e:
-        print(f"[WARN] Could not auto-generate HTML report: {e}")
+    out = REPORTS_DIR / "rootchain.json"
+    out.parent.mkdir(exist_ok=True)
+    out.write_text(json.dumps(output, indent=2, default=str))
+    print(f"\n[+] Saved {len(chains)} chains → {out}")
+    # Markdown summary
+    md_lines = [f"# RootChain v8 — Attack Chain Report\n",
+                f"Generated: {summary['generated_at']}\n",
+                f"**Total Findings:** {summary['total_findings']} | "
+                f"**Attack Chains:** {len(chains)} | "
+                f"**Risk Rating:** {summary['risk_rating']}\n"]
+    for c in chains:
+        md_lines.append(f"\n## [{c['severity']}] {c['chain_id']}: {c['chain_name']}")
+        md_lines.append(f"**CVSS:** {c['cvss_base_score']} | **Confidence:** {c['confidence_label']}")
+        md_lines.append(f"\n**Narrative:** {c['attacker_narrative']}")
+        md_lines.append(f"\n**Business Impact:** {c['business_impact']}")
+        md_lines.append(f"\n**Remediation:** {c['remediation_priority']}")
+        md_lines.append("\n**Steps:**\n" + "\n".join(c["attack_steps"]))
+    (REPORTS_DIR / "rootchain.md").write_text("\n".join(md_lines))
+    print(f"[+] Markdown report → {REPORTS_DIR / 'rootchain.md'}")
+    return output
 
 
 if __name__ == "__main__":

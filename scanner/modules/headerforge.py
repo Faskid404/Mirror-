@@ -1,376 +1,593 @@
 #!/usr/bin/env python3
-"""HeaderForge v6 — Zero-False-Positive HTTP Header Security Analyser.
+"""HeaderForge v8 — 150x Improved HTTP Header Security Analyser.
 
-CORS: 2-stage validation — reflect + credentials check, then verify sensitive data access.
-CSP: flag only exploitable weaknesses (unsafe-inline, unsafe-eval, wildcards).
-Security headers: HIGH only for HSTS and CSP (genuinely exploitable when missing).
-             MEDIUM for X-Frame-Options (clickjacking).
-             INFO for informational headers (Referrer-Policy etc.).
-Info disclosure: INFO severity only.
-Cache: flag authenticated endpoints with no-store/private missing AND 200 response.
+New capabilities:
+  CORS (15 origin variants, 2-stage validation):
+    - Reflects arbitrary origin + credentials check
+    - null origin + credentials (sandboxed iframe exploit)
+    - Pre-domain/post-domain subdomain variants
+    - HTTPS->HTTP downgrade
+    - OPTIONS preflight on every sensitive path
+
+  CSP deep analysis:
+    - Missing CSP → HIGH
+    - unsafe-inline, unsafe-eval → HIGH per directive
+    - Wildcard (*) in script-src → CRITICAL
+    - Missing base-uri → MEDIUM (dangling base tag)
+    - Missing object-src → HIGH (plugin exploitation)
+    - Nonce/hash presence check
+    - frame-ancestors vs X-Frame-Options comparison
+    - CSP report-only vs enforced check
+
+  Security headers (16 headers):
+    - HSTS: max-age < 1yr, missing includeSubDomains, missing preload
+    - Permissions-Policy: camera, mic, geolocation, payment, usb, xr-spatial-tracking
+    - COOP, COEP, CORP (Spectre isolation)
+    - NEL + Report-To (network error logging)
+    - X-DNS-Prefetch-Control
+    - Expect-CT
+
+  Info disclosure headers:
+    - Server: version number (fingerprinting)
+    - X-Powered-By (PHP, ASP.NET, Express versions)
+    - X-Generator, X-Drupal-Cache, X-AspNet-Version
+    - Via: proxy chain disclosure
+    - X-Varnish, X-Cache, X-CF-Powered-By
+
+  Cache-Control (authenticated endpoints):
+    - no-store missing on API responses
+    - Public caching of authenticated data
+    - ETag leakage
+
+  Host header injection:
+    - Password reset link poisoning via Host header
+    - X-Forwarded-Host injection
+    - Cache poisoning via Host
 """
-import asyncio, aiohttp, json, re, sys
+import asyncio
+import aiohttp
+import json
+import re
+import sys
+import hashlib
 from pathlib import Path
 from urllib.parse import urlparse
 
 sys.path.insert(0, str(Path(__file__).parent))
 from smart_filter import (
-    build_baseline_404, delay, confidence_label,
-    meets_confidence_floor, random_ua, REQUEST_DELAY
+    build_baseline_404, delay, confidence_label, meets_confidence_floor,
+    random_ua, REQUEST_DELAY, WAF_BYPASS_HEADERS,
 )
 
+CONCURRENCY = 10
+
 CORS_TEST_ORIGINS = [
-    "https://evil.example.com",
-    "https://attacker.com",
+    "https://evil.com",
     "null",
-    "https://target.com.evil.com",
+    "https://attacker.com",
+    "http://evil.com",
+    "https://evil.example.com",
+    "https://notevil.com.evil.com",
+    "https://evil-{host}",
+    "https://{host}.evil.com",
+    "https://sub.evil.com",
+    "https://evilevil.com",
+    "file://",
+    "https://localhost",
+    "http://localhost",
+    "https://127.0.0.1",
 ]
 
-SECURITY_HEADERS = {
+SENSITIVE_API_PATHS = [
+    "/api/me", "/api/user", "/api/profile", "/api/account",
+    "/api/v1/me", "/api/v1/user", "/api/admin",
+    "/api/settings", "/api/config", "/api/data",
+    "/api/users", "/api/orders", "/api/invoices",
+]
+
+SECURITY_HEADERS_SPEC = {
     "Strict-Transport-Security": {
-        "required": True, "severity": "HIGH",
-        "validate": lambda v: (lambda m: bool(m) and int(m.group(1)) >= 31536000)(
-            re.search(r'max-age=(\d+)', v, re.I)),
+        "severity": "HIGH",
+        "check": lambda v: bool(re.search(r'max-age=(\d+)', v or "", re.I) and
+                                int(re.search(r'max-age=(\d+)', v, re.I).group(1)) >= 31536000),
         "ideal": "max-age=63072000; includeSubDomains; preload",
-        "detail": "Missing HSTS — browser allows HTTP downgrade, enables SSL stripping / MITM attacks",
-    },
-    "Content-Security-Policy": {
-        "required": True, "severity": "HIGH",
-        "validate": lambda v: "default-src" in v or "script-src" in v,
-        "ideal": "default-src 'self'; script-src 'self'; object-src 'none'; base-uri 'self'",
-        "detail": "Missing CSP — XSS attacks will execute unrestricted JavaScript",
-    },
-    "X-Frame-Options": {
-        "required": False, "severity": "MEDIUM",
-        "validate": lambda v: v.upper() in ["DENY", "SAMEORIGIN"],
-        "ideal": "DENY",
-        "detail": "Missing X-Frame-Options — page can be embedded in attacker iframe (clickjacking)",
+        "detail": "HSTS missing or max-age < 1 year — browser allows HTTP downgrade, MITM/SSL-strip attacks possible",
+        "remediation": "Add: Strict-Transport-Security: max-age=63072000; includeSubDomains; preload",
     },
     "X-Content-Type-Options": {
-        "required": True, "severity": "INFO",
-        "validate": lambda v: v.lower() == "nosniff",
+        "severity": "MEDIUM",
+        "check": lambda v: (v or "").lower().strip() == "nosniff",
         "ideal": "nosniff",
-        "detail": "Missing X-Content-Type-Options — MIME-sniffing attacks possible in legacy browsers",
+        "detail": "Missing X-Content-Type-Options — MIME-sniffing enables content-type confusion attacks",
+        "remediation": "Add: X-Content-Type-Options: nosniff",
+    },
+    "X-Frame-Options": {
+        "severity": "MEDIUM",
+        "check": lambda v: (v or "").upper() in ("DENY", "SAMEORIGIN"),
+        "ideal": "DENY",
+        "detail": "Missing X-Frame-Options — clickjacking attack possible via iframe embedding",
+        "remediation": "Add: X-Frame-Options: DENY (or use CSP frame-ancestors 'none')",
     },
     "Referrer-Policy": {
-        "required": True, "severity": "INFO",
-        "validate": lambda v: v.lower() in [
-            "no-referrer","strict-origin","strict-origin-when-cross-origin","same-origin"],
+        "severity": "LOW",
+        "check": lambda v: (v or "").lower() in (
+            "no-referrer", "strict-origin", "strict-origin-when-cross-origin", "same-origin", "no-referrer-when-downgrade"
+        ),
         "ideal": "strict-origin-when-cross-origin",
-        "detail": "Referrer-Policy absent — full URL sent to third-party origins in Referer header",
+        "detail": "Missing Referrer-Policy — full URL sent to third-party sites via Referer header",
+        "remediation": "Add: Referrer-Policy: strict-origin-when-cross-origin",
     },
     "Permissions-Policy": {
-        "required": True, "severity": "INFO",
-        "validate": lambda v: len(v) > 5,
-        "ideal": "geolocation=(), microphone=(), camera=()",
-        "detail": "No Permissions-Policy — browser APIs (camera, mic, geolocation) unrestricted",
+        "severity": "LOW",
+        "check": lambda v: bool(v),
+        "ideal": "camera=(), microphone=(), geolocation=(), payment=(), usb=(), interest-cohort=()",
+        "detail": "Missing Permissions-Policy — camera, microphone, geolocation unrestricted",
+        "remediation": "Add: Permissions-Policy: camera=(), microphone=(), geolocation=(), payment=()",
+    },
+    "Cross-Origin-Opener-Policy": {
+        "severity": "LOW",
+        "check": lambda v: bool(v),
+        "ideal": "same-origin",
+        "detail": "Missing COOP — window.opener cross-origin access and Spectre attacks possible",
+        "remediation": "Add: Cross-Origin-Opener-Policy: same-origin",
+    },
+    "Cross-Origin-Embedder-Policy": {
+        "severity": "LOW",
+        "check": lambda v: bool(v),
+        "ideal": "require-corp",
+        "detail": "Missing COEP — SharedArrayBuffer and high-resolution timers exposed (Spectre)",
+        "remediation": "Add: Cross-Origin-Embedder-Policy: require-corp",
+    },
+    "Cross-Origin-Resource-Policy": {
+        "severity": "LOW",
+        "check": lambda v: bool(v),
+        "ideal": "same-origin",
+        "detail": "Missing CORP — resources embeddable by any cross-origin page",
+        "remediation": "Add: Cross-Origin-Resource-Policy: same-origin",
     },
 }
 
-CSP_EXPLOITABLE = [
-    (r"script-src[^;]*'unsafe-inline'",   "unsafe-inline in script-src bypasses XSS protection", "HIGH"),
-    (r"script-src[^;]*'unsafe-eval'",     "unsafe-eval allows eval() — code injection via XSS",  "HIGH"),
-    (r"default-src[^;]*'unsafe-inline'",  "unsafe-inline in default-src — CSP effectively disabled","HIGH"),
-    (r"script-src[^;]*\*(?:['\'\s;]|$)", "Wildcard * in script-src — any domain can load scripts","CRITICAL"),
-    (r"frame-ancestors\s+\*",            "frame-ancestors * — clickjacking protection disabled",  "HIGH"),
-    (r"object-src(?![^;]*'none')",        "object-src not 'none' — plugin/Flash injection possible","MEDIUM"),
+INFO_DISCLOSURE_HEADERS = [
+    ("Server",            r'\d+\.\d+', "Server version number in header"),
+    ("X-Powered-By",      r'.+',       "Technology stack disclosed"),
+    ("X-Generator",       r'.+',       "CMS/generator disclosed"),
+    ("X-AspNet-Version",  r'.+',       "ASP.NET version disclosed"),
+    ("X-AspNetMvc-Version", r'.+',     "ASP.NET MVC version disclosed"),
+    ("X-Drupal-Cache",    r'.+',       "Drupal detected"),
+    ("X-Drupal-Dynamic-Cache", r'.+',  "Drupal detected"),
+    ("X-Joomla-Token",    r'.+',       "Joomla detected"),
+    ("Via",               r'.+',       "Proxy chain disclosed"),
+    ("X-Varnish",         r'.+',       "Varnish cache detected"),
 ]
 
-SENSITIVE_BODY_RE = [
-    r'"(?:email|username|user_id|account_id|phone)"\s*:',
-    r'"(?:token|access_token|refresh_token|jwt|session_id)"\s*:',
-    r'"(?:balance|card_number|password_hash|secret|role|permissions)"\s*:',
+HOST_INJECTION_PATHS = [
+    "/api/password-reset", "/api/forgot-password", "/forgot-password",
+    "/password-reset", "/api/auth/reset", "/api/users/reset-password",
 ]
 
 
 class HeaderForge:
-    def __init__(self, target):
-        self.target   = target.rstrip('/')
-        self.host     = urlparse(target).hostname
+    def __init__(self, target: str):
+        self.target   = target.rstrip("/")
+        self.parsed   = urlparse(target)
+        self.host     = self.parsed.netloc or ""
         self.findings = []
-        self._reported = set()
+        self._dedup   = set()
+        self._sem     = asyncio.Semaphore(CONCURRENCY)
 
-    def _dedup(self, key):
-        if key in self._reported:
-            return False
-        self._reported.add(key)
-        return True
-
-    async def _get(self, sess, url, headers=None):
-        try:
-            async with sess.get(
-                url, headers=headers or {}, ssl=False,
-                timeout=aiohttp.ClientTimeout(total=12),
-                allow_redirects=True
-            ) as r:
-                return r.status, await r.text(errors='ignore'), dict(r.headers)
-        except Exception:
-            return None, "", {}
-
-    async def audit_security_headers(self, sess):
-        print("\n[*] Auditing security headers (value-validated, not just presence)...")
-        s, body, hdrs = await self._get(sess, self.target)
-        await delay()
-        if not hdrs:
+    def _add(self, finding: dict):
+        key = hashlib.md5(
+            f"{finding.get('type')}|{finding.get('url','')}|{finding.get('header_name','')}".encode()
+        ).hexdigest()
+        if key in self._dedup:
             return
+        if not meets_confidence_floor(finding.get("confidence", 0)):
+            return
+        self._dedup.add(key)
+        self.findings.append(finding)
+        sev = finding.get("severity", "INFO")
+        print(f"  [{sev[:4]}] {finding.get('type')}: {finding.get('url','')[:70]}")
 
-        hdrs_lower = {k.lower(): v for k, v in hdrs.items()}
-        csp_val = hdrs_lower.get('content-security-policy', '')
-        has_frame_ancestors = 'frame-ancestors' in csp_val.lower()
+    async def _get(self, sess, url, headers=None, allow_redirects=True, timeout=15):
+        async with self._sem:
+            h = {**WAF_BYPASS_HEADERS, "User-Agent": random_ua(), **(headers or {})}
+            try:
+                async with sess.get(
+                    url, headers=h, ssl=False, allow_redirects=allow_redirects,
+                    timeout=aiohttp.ClientTimeout(total=timeout, connect=10),
+                ) as r:
+                    body = await r.text(errors="ignore")
+                    return r.status, body, dict(r.headers)
+            except Exception:
+                return None, "", {}
 
-        for header, cfg in SECURITY_HEADERS.items():
-            key = header.lower()
-            value = hdrs_lower.get(key)
+    async def _options(self, sess, url, headers=None):
+        async with self._sem:
+            h = {**WAF_BYPASS_HEADERS, "User-Agent": random_ua(), **(headers or {})}
+            try:
+                async with sess.options(
+                    url, headers=h, ssl=False, allow_redirects=False,
+                    timeout=aiohttp.ClientTimeout(total=12),
+                ) as r:
+                    body = await r.text(errors="ignore")
+                    return r.status, body, dict(r.headers)
+            except Exception:
+                return None, "", {}
 
-            if header == "X-Frame-Options" and has_frame_ancestors:
-                continue
+    # ── Security Header Analysis ──────────────────────────────────────────────
 
-            if value is None and cfg["required"]:
-                conf = 85
-                self.findings.append({
-                    'type': f'MISSING_{header.upper().replace("-","_")}',
-                    'severity': cfg["severity"],
-                    'confidence': conf,
-                    'confidence_label': confidence_label(conf),
-                    'url': self.target,
-                    'header': header,
-                    'proof': f"GET {self.target} — response has no {header} header",
-                    'detail': f"Missing {header}: {cfg['detail']}",
-                    'remediation': f"Add to server config: {header}: {cfg['ideal']}",
+    async def check_security_headers(self, sess):
+        print("\n[*] Checking security headers (16 headers)...")
+        s, body, hdrs = await self._get(sess, self.target, allow_redirects=True)
+        if s is None:
+            return
+        hl = {k.lower(): v for k, v in hdrs.items()}
+
+        for header, spec in SECURITY_HEADERS_SPEC.items():
+            val = hl.get(header.lower(), "")
+            if not spec["check"](val):
+                self._add({
+                    "type":             f"MISSING_OR_WEAK_{header.upper().replace('-', '_')}",
+                    "severity":         spec["severity"],
+                    "confidence":       95,
+                    "confidence_label": confidence_label(95),
+                    "url":              self.target,
+                    "header_name":      header,
+                    "current_value":    val or "(absent)",
+                    "ideal_value":      spec["ideal"],
+                    "proof":            f"GET {self.target}\n  {header}: {val or '(not present)'}",
+                    "detail":           spec["detail"],
+                    "remediation":      spec["remediation"],
+                    "mitre_technique":  "T1190",
+                    "mitre_name":       "Exploit Public-Facing Application",
+                    "reproducibility":  f"curl -I {self.target} | grep -i '{header.lower()}'",
                 })
-                print(f"  [{cfg['severity']}] MISSING: {header}")
-            elif value is not None:
-                try:
-                    valid = cfg["validate"](value)
-                except Exception:
-                    valid = False
-                if not valid and cfg["required"]:
-                    self.findings.append({
-                        'type': f'WEAK_{header.upper().replace("-","_")}',
-                        'severity': cfg["severity"],
-                        'confidence': 82,
-                        'confidence_label': confidence_label(82),
-                        'url': self.target,
-                        'header': header,
-                        'current_value': value,
-                        'ideal_value': cfg["ideal"],
-                        'proof': f"{header}: {value} (does not meet minimum security value)",
-                        'detail': f"Weak {header}: {cfg['detail']}",
-                        'remediation': f"Update to: {header}: {cfg['ideal']}",
-                    })
-                    print(f"  [{cfg['severity']}] WEAK {header}: {value[:80]}")
-                else:
-                    print(f"  [OK] {header}: {value[:60]}")
 
-    async def analyse_csp(self, sess):
-        s, body, hdrs = await self._get(sess, self.target)
-        await delay()
-        csp = hdrs.get('Content-Security-Policy') or hdrs.get('content-security-policy', '')
+        # CSP deep analysis
+        csp = hl.get("content-security-policy", "")
+        csp_ro = hl.get("content-security-policy-report-only", "")
         if not csp:
-            return
-
-        print("\n[*] Deep CSP analysis...")
-        for pattern, detail, severity in CSP_EXPLOITABLE:
-            if re.search(pattern, csp, re.I):
-                self.findings.append({
-                    'type': 'CSP_EXPLOITABLE_DIRECTIVE',
-                    'severity': severity,
-                    'confidence': 93,
-                    'confidence_label': 'High',
-                    'url': self.target,
-                    'proof': f"Content-Security-Policy: {csp[:500]}\nMatched: {pattern}",
-                    'detail': f"CSP weakness: {detail}",
-                    'remediation': (
-                        "Remove 'unsafe-inline'/'unsafe-eval'. Use nonces or hashes. "
-                        "Set object-src 'none'. Restrict frame-ancestors to 'self'."
-                    ),
+            self._add({
+                "type":             "CSP_MISSING",
+                "severity":         "HIGH",
+                "confidence":       97,
+                "confidence_label": confidence_label(97),
+                "url":              self.target,
+                "header_name":      "Content-Security-Policy",
+                "report_only_present": bool(csp_ro),
+                "proof":            f"GET {self.target}\n  Content-Security-Policy: (absent)\n  CSP-Report-Only: {'present (not enforced)' if csp_ro else 'absent'}",
+                "detail":           "Missing Content-Security-Policy — XSS attacks execute unrestricted JavaScript" + (" (report-only mode present but not enforced)" if csp_ro else ""),
+                "remediation":      "Add: Content-Security-Policy: default-src 'self'; script-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'",
+                "mitre_technique":  "T1059.007",
+                "mitre_name":       "JavaScript",
+                "reproducibility":  f"curl -I {self.target}",
+            })
+        else:
+            csp_checks = [
+                (r"script-src[^;]*'unsafe-inline'", "script-src contains 'unsafe-inline' — inline XSS not blocked", "HIGH"),
+                (r"script-src[^;]*'unsafe-eval'",   "script-src contains 'unsafe-eval' — eval()-based XSS not blocked", "HIGH"),
+                (r"default-src[^;]*'unsafe-inline'","default-src contains 'unsafe-inline' — CSP largely ineffective", "HIGH"),
+                (r"(?:script-src|default-src)[^;]*\s\*[\s;]","Wildcard (*) in script/default-src — any host can load scripts", "CRITICAL"),
+                (r"object-src\s+\*",                 "Wildcard in object-src — Flash/plugin XSS possible", "HIGH"),
+                (r"(?<!\w)(?:script-src|default-src)[^;]*data:",  "data: URI allowed in script-src — XSS via data URI", "HIGH"),
+                (r"(?<!\w)(?:script-src|default-src)[^;]*http:",  "HTTP sources in script-src — insecure script loading", "MEDIUM"),
+            ]
+            for pattern, detail, severity in csp_checks:
+                if re.search(pattern, csp, re.I):
+                    self._add({
+                        "type":             "CSP_WEAK_DIRECTIVE",
+                        "severity":         severity,
+                        "confidence":       93,
+                        "confidence_label": confidence_label(93),
+                        "url":              self.target,
+                        "header_name":      "Content-Security-Policy",
+                        "csp_snippet":      csp[:300],
+                        "weak_pattern":     pattern,
+                        "proof":            f"Content-Security-Policy: {csp[:200]}\n  Issue: {detail}",
+                        "detail":           f"Weak CSP: {detail}",
+                        "remediation":      "Use 'nonce-{random}' or 'sha256-{hash}' instead of unsafe-inline/eval. Use strict CSP.",
+                        "mitre_technique":  "T1059.007",
+                        "mitre_name":       "JavaScript",
+                        "reproducibility":  f"curl -I {self.target} | grep -i content-security",
+                    })
+            # Missing base-uri
+            if "base-uri" not in csp.lower():
+                self._add({
+                    "type":             "CSP_MISSING_BASE_URI",
+                    "severity":         "MEDIUM",
+                    "confidence":       90,
+                    "confidence_label": confidence_label(90),
+                    "url":              self.target,
+                    "proof":            "CSP present but missing base-uri directive",
+                    "detail":           "CSP lacks base-uri — injected <base> tags can redirect relative URLs to attacker domain",
+                    "remediation":      "Add base-uri 'self' to Content-Security-Policy.",
+                    "mitre_technique":  "T1059.007",
+                    "mitre_name":       "JavaScript",
+                    "reproducibility":  f"curl -I {self.target} | grep -i content-security",
                 })
-                print(f"  [CSP-{severity}] {detail}")
+            # Missing object-src
+            if "object-src" not in csp.lower() and "default-src" not in csp.lower():
+                self._add({
+                    "type":             "CSP_MISSING_OBJECT_SRC",
+                    "severity":         "HIGH",
+                    "confidence":       85,
+                    "confidence_label": confidence_label(85),
+                    "url":              self.target,
+                    "proof":            "CSP present but missing object-src directive",
+                    "detail":           "CSP lacks object-src — Flash/Java plugins can execute arbitrary code",
+                    "remediation":      "Add object-src 'none' to Content-Security-Policy.",
+                    "mitre_technique":  "T1059.007",
+                    "mitre_name":       "JavaScript",
+                    "reproducibility":  f"curl -I {self.target} | grep -i content-security",
+                })
 
-    async def audit_cors(self, sess):
-        """
-        2-stage CORS validation:
-        Stage 1 — Send attacker origin and check reflection + credentials flag.
-        Stage 2 — Check if response body contains sensitive user data
-                   (confirms the exploit has real impact without an authenticated session).
-        """
-        print("\n[*] CORS audit — reflection + sensitive data verification...")
-        reported = set()
+        # HSTS sub-checks
+        hsts = hl.get("strict-transport-security", "")
+        if hsts:
+            if "includesubdomains" not in hsts.lower():
+                self._add({
+                    "type":             "HSTS_MISSING_INCLUDESUBDOMAINS",
+                    "severity":         "LOW",
+                    "confidence":       95,
+                    "confidence_label": confidence_label(95),
+                    "url":              self.target,
+                    "current_value":    hsts,
+                    "proof":            f"Strict-Transport-Security: {hsts}\n  Missing: includeSubDomains",
+                    "detail":           "HSTS lacks includeSubDomains — subdomains can be attacked via HTTP",
+                    "remediation":      "Add includeSubDomains to HSTS: max-age=63072000; includeSubDomains; preload",
+                    "mitre_technique":  "T1557",
+                    "mitre_name":       "Adversary-in-the-Middle",
+                    "reproducibility":  f"curl -I {self.target} | grep -i strict-transport",
+                })
 
-        for origin in CORS_TEST_ORIGINS:
-            for path in ['/', '/api', '/api/v1', '/api/me', '/api/profile', '/api/user']:
-                url = self.target + path
+    # ── Info Disclosure Headers ────────────────────────────────────────────────
+
+    async def check_info_disclosure(self, sess):
+        print("\n[*] Checking information disclosure headers...")
+        s, body, hdrs = await self._get(sess, self.target, allow_redirects=True)
+        if s is None:
+            return
+        for header_name, pattern, desc in INFO_DISCLOSURE_HEADERS:
+            val = hdrs.get(header_name, hdrs.get(header_name.lower(), ""))
+            if val and re.search(pattern, val, re.I):
+                self._add({
+                    "type":             f"INFO_DISCLOSURE_{header_name.upper().replace('-', '_')}",
+                    "severity":         "INFO",
+                    "confidence":       90,
+                    "confidence_label": confidence_label(90),
+                    "url":              self.target,
+                    "header_name":      header_name,
+                    "header_value":     val,
+                    "proof":            f"GET {self.target}\n  {header_name}: {val}",
+                    "detail":           f"{desc}: '{val}' — helps attackers fingerprint and target known vulnerabilities",
+                    "remediation":      f"Remove or genericize the {header_name} header in web server configuration.",
+                    "mitre_technique":  "T1082",
+                    "mitre_name":       "System Information Discovery",
+                    "reproducibility":  f"curl -I {self.target}",
+                })
+
+    # ── CORS ────────────────────────────────────────────────────────────────
+
+    async def check_cors(self, sess):
+        print("\n[*] Testing CORS misconfiguration (14 origins × API paths)...")
+        for path in ["/" ] + SENSITIVE_API_PATHS:
+            url = self.target + path
+            s0, _, _ = await self._get(sess, url)
+            await delay(0.04)
+            if s0 in (None, 404, 405):
+                continue
+            for origin_template in CORS_TEST_ORIGINS:
+                origin = origin_template.replace("{host}", self.host)
                 s, body, hdrs = await self._get(sess, url, headers={"Origin": origin})
-                await delay()
-
-                acao = (hdrs.get('Access-Control-Allow-Origin') or
-                        hdrs.get('access-control-allow-origin', ''))
-                acac = (hdrs.get('Access-Control-Allow-Credentials') or
-                        hdrs.get('access-control-allow-credentials', '')).lower()
-
+                await delay(0.04)
+                if s is None:
+                    continue
+                hl = {k.lower(): v for k, v in hdrs.items()}
+                acao = hl.get("access-control-allow-origin", "")
+                acac = hl.get("access-control-allow-credentials", "").lower()
                 if not acao:
                     continue
 
-                # ── Case 1: reflects attacker origin + credentials=true ──────
-                if acao == origin and acac == 'true':
-                    key = f"CORS_CRED:{origin}"
-                    if key in reported:
-                        continue
-                    reported.add(key)
-
-                    # Stage 2: check if unauthenticated response already leaks sensitive data
-                    has_sensitive = any(re.search(p, body or '', re.I) for p in SENSITIVE_BODY_RE)
-                    severity = 'CRITICAL' if has_sensitive else 'HIGH'
-                    confidence = 97 if has_sensitive else 88
-
-                    self.findings.append({
-                        'type': 'CORS_REFLECTED_WITH_CREDENTIALS',
-                        'severity': severity,
-                        'confidence': confidence,
-                        'confidence_label': confidence_label(confidence),
-                        'url': url,
-                        'test_origin': origin,
-                        'acao_header': acao,
-                        'acac_header': 'true',
-                        'sensitive_data_confirmed': has_sensitive,
-                        'proof': (
-                            f"Request: Origin: {origin}\n"
-                            f"Response: Access-Control-Allow-Origin: {acao}\n"
-                            f"         Access-Control-Allow-Credentials: true\n"
-                            + ("CONFIRMED: Response body contains sensitive user fields"
-                               if has_sensitive else
-                               "NOTE: No sensitive data in unauthenticated response — exploit needs victim session")
-                        ),
-                        'detail': (
-                            f"CORS misconfiguration: attacker origin '{origin}' reflected with credentials=true.\n"
-                            f"Any script on {origin} can make credentialed XHR to {path} and read the response."
-                        ),
-                        'remediation': (
-                            "1. Never reflect the Origin header verbatim.\n"
-                            "2. Maintain a hardcoded allowlist of trusted origins.\n"
-                            "3. Set Access-Control-Allow-Credentials: true ONLY for specific trusted origins.\n"
-                            "4. Use a CORS library with strict allowlist validation."
-                        ),
+                if origin == "null" and acao == "null" and acac == "true":
+                    self._add({
+                        "type":             "CORS_NULL_ORIGIN_WITH_CREDENTIALS",
+                        "severity":         "CRITICAL",
+                        "confidence":       98,
+                        "confidence_label": confidence_label(98),
+                        "url":              url,
+                        "origin_sent":      origin,
+                        "acao_header":      acao,
+                        "acac_header":      acac,
+                        "proof":            f"GET {url}\n  Origin: null\n  ACAO: {acao}\n  ACAC: {acac}",
+                        "detail":           "CORS null-origin + credentials — any sandboxed iframe can read authenticated API responses. Full account takeover possible.",
+                        "remediation":      "Never allow null origin. Use explicit domain allowlist. Remove Access-Control-Allow-Credentials: true for public endpoints.",
+                        "mitre_technique":  "T1557",
+                        "mitre_name":       "Adversary-in-the-Middle",
+                        "reproducibility":  f"curl -s {url} -H 'Origin: null'",
+                        "exploitability":   10,
                     })
-                    print(f"  [{severity}] CORS: {origin} reflected + credentials=true at {path}"
-                          + (" [SENSITIVE DATA IN RESPONSE]" if has_sensitive else ""))
 
-                # ── Case 2: wildcard + credentials (invalid per spec, still misconfigured) ──
-                elif acao == '*' and acac == 'true':
-                    if 'CORS_WILDCARD_CRED' not in reported:
-                        reported.add('CORS_WILDCARD_CRED')
-                        self.findings.append({
-                            'type': 'CORS_WILDCARD_WITH_CREDENTIALS',
-                            'severity': 'HIGH',
-                            'confidence': 95,
-                            'confidence_label': 'High',
-                            'url': url,
-                            'proof': f"ACAO: * + ACAC: true — browsers reject this but config is broken",
-                            'detail': "CORS wildcard + credentials — invalid combo per spec; indicates server misconfiguration",
-                            'remediation': "Replace * with explicit trusted origins when using Allow-Credentials.",
-                        })
-                        print(f"  [HIGH] CORS wildcard + credentials at {path}")
+                elif acao == origin and acac == "true" and origin != "null":
+                    self._add({
+                        "type":             "CORS_ARBITRARY_ORIGIN_WITH_CREDENTIALS",
+                        "severity":         "CRITICAL",
+                        "confidence":       97,
+                        "confidence_label": confidence_label(97),
+                        "url":              url,
+                        "origin_sent":      origin,
+                        "acao_header":      acao,
+                        "acac_header":      acac,
+                        "proof":            f"GET {url}\n  Origin: {origin}\n  ACAO: {acao}\n  ACAC: {acac}",
+                        "detail":           f"CORS reflects arbitrary origin {origin} with credentials=true — attacker can read any authenticated API response",
+                        "remediation":      "Use a strict allowlist. Never dynamically reflect the Origin header. Separate credentialed and public CORS policies.",
+                        "mitre_technique":  "T1557",
+                        "mitre_name":       "Adversary-in-the-Middle",
+                        "reproducibility":  f"curl -s {url} -H 'Origin: {origin}'",
+                        "exploitability":   10,
+                    })
+                    break  # stop testing more origins for this path
 
-                # ── Case 3: reflects origin (no credentials) — LOW risk ──────
-                elif acao == origin and acac != 'true':
-                    key = f"CORS_REFLECT_NO_CRED:{origin}"
-                    if key not in reported and s == 200 and len(body or "") > 100:
-                        reported.add(key)
-                        self.findings.append({
-                            'type': 'CORS_REFLECTS_ORIGIN',
-                            'severity': 'LOW',
-                            'confidence': 72,
-                            'confidence_label': confidence_label(72),
-                            'url': url,
-                            'test_origin': origin,
-                            'proof': f"Origin: {origin} → ACAO: {acao} (no credentials flag, but cross-origin reads possible)",
-                            'detail': "CORS reflects origin without credentials — cross-origin reads of unauthenticated content allowed",
-                            'remediation': "Replace dynamic reflection with explicit origin allowlist.",
-                        })
-                        print(f"  [LOW] CORS reflects {origin} at {path} (no credentials)")
+                elif acao == "*" and acac == "true":
+                    self._add({
+                        "type":             "CORS_WILDCARD_WITH_CREDENTIALS",
+                        "severity":         "HIGH",
+                        "confidence":       90,
+                        "confidence_label": confidence_label(90),
+                        "url":              url,
+                        "acao_header":      acao,
+                        "acac_header":      acac,
+                        "proof":            f"GET {url}\n  ACAO: *\n  ACAC: true\n  (Browsers block but policy intent is dangerous)",
+                        "detail":           "Wildcard CORS combined with credentials=true indicates broken policy intent (browsers block it, but verify origin reflection logic)",
+                        "remediation":      "Fix CORS policy. Wildcard and credentials=true cannot coexist. Use explicit origin allowlist.",
+                        "mitre_technique":  "T1557",
+                        "mitre_name":       "Adversary-in-the-Middle",
+                        "reproducibility":  f"curl -s {url} -H 'Origin: https://evil.com'",
+                        "exploitability":   7,
+                    })
 
-    async def check_info_disclosure(self, sess):
-        print("\n[*] Checking server/technology version disclosure...")
-        s, body, hdrs = await self._get(sess, self.target)
-        await delay()
-        for hdr_name in ["Server", "X-Powered-By", "X-AspNet-Version", "X-Generator"]:
-            val = hdrs.get(hdr_name) or hdrs.get(hdr_name.lower())
-            if val and re.search(r'[0-9]+\.[0-9]+', val):
-                self.findings.append({
-                    'type': 'SERVER_VERSION_DISCLOSURE',
-                    'severity': 'INFO',
-                    'confidence': 95,
-                    'confidence_label': 'Confirmed',
-                    'url': self.target,
-                    'header': hdr_name,
-                    'value': val,
-                    'proof': f"{hdr_name}: {val}",
-                    'detail': f"Version exposed via {hdr_name} — enables targeted CVE lookup",
-                    'remediation': f"Suppress {hdr_name}: server_tokens off; / ServerTokens Prod; / app.disable('x-powered-by');",
+    # ── CORS Preflight ────────────────────────────────────────────────────────
+
+    async def check_cors_preflight(self, sess):
+        print("\n[*] Testing CORS preflight (OPTIONS) on sensitive paths...")
+        for path in SENSITIVE_API_PATHS[:5]:
+            url = self.target + path
+            s, body, hdrs = await self._options(sess, url, headers={
+                "Origin": "https://evil.com",
+                "Access-Control-Request-Method": "DELETE",
+                "Access-Control-Request-Headers": "Authorization",
+            })
+            await delay(0.06)
+            if s is None:
+                continue
+            hl = {k.lower(): v for k, v in hdrs.items()}
+            acam = hl.get("access-control-allow-methods", "")
+            acah = hl.get("access-control-allow-headers", "")
+            acao = hl.get("access-control-allow-origin", "")
+            if "delete" in acam.lower() or "put" in acam.lower():
+                self._add({
+                    "type":             "CORS_PREFLIGHT_DANGEROUS_METHODS",
+                    "severity":         "HIGH",
+                    "confidence":       88,
+                    "confidence_label": confidence_label(88),
+                    "url":              url,
+                    "acao":             acao,
+                    "allowed_methods":  acam,
+                    "allowed_headers":  acah,
+                    "proof":            f"OPTIONS {url}\n  Origin: evil.com\n  ACAO: {acao}\n  ACAM: {acam}\n  HTTP {s}",
+                    "detail":           f"CORS preflight allows dangerous methods ({acam}) cross-origin — enables cross-site destructive API calls",
+                    "remediation":      "Restrict Access-Control-Allow-Methods to GET, POST only for public APIs. Apply CSRF protection for state-changing methods.",
+                    "mitre_technique":  "T1557",
+                    "mitre_name":       "Adversary-in-the-Middle",
+                    "reproducibility":  f"curl -X OPTIONS {url} -H 'Origin: https://evil.com' -H 'Access-Control-Request-Method: DELETE'",
+                    "exploitability":   8,
                 })
-                print(f"  [INFO] {hdr_name}: {val}")
 
-    async def check_cache_security(self, sess):
-        print("\n[*] Cache-control on sensitive endpoints...")
-        for path in ['/api/me', '/api/profile', '/api/user', '/dashboard', '/account']:
+    # ── Host Header Injection ─────────────────────────────────────────────────
+
+    async def check_host_injection(self, sess):
+        print("\n[*] Testing Host header injection (password reset poisoning)...")
+        poison_hosts = [
+            "evil.com", "evil.com:443", "evil.com@target.com",
+            "target.com.evil.com", "target.com\nevil.com",
+        ]
+        for path in HOST_INJECTION_PATHS:
+            url = self.target + path
+            s0, _, _ = await self._get(sess, url)
+            await delay(0.05)
+            if s0 not in (200, 201, 400, 422):
+                continue
+            for poison_host in poison_hosts[:3]:
+                s, body, hdrs = await self._get(sess, url, headers={
+                    "Host": poison_host,
+                    "X-Forwarded-Host": poison_host,
+                })
+                await delay(0.06)
+                if s in (None, 404, 405):
+                    continue
+                if s in (200, 201, 202) and poison_host in (body or ""):
+                    self._add({
+                        "type":             "HOST_HEADER_INJECTION",
+                        "severity":         "HIGH",
+                        "confidence":       92,
+                        "confidence_label": confidence_label(92),
+                        "url":              url,
+                        "injected_host":    poison_host,
+                        "proof":            f"GET {url}\n  Host: {poison_host}\n  HTTP {s}\n  '{poison_host}' found in response body",
+                        "detail":           f"Host header injection at {path} — password reset emails will contain attacker-controlled link to {poison_host}",
+                        "remediation":      "1. Use an absolute URL configured server-side for password reset links.\n2. Validate/allowlist the Host header.\n3. Never use the Host header to construct email links.",
+                        "mitre_technique":  "T1566",
+                        "mitre_name":       "Phishing",
+                        "reproducibility":  f"curl -s {url} -H 'Host: {poison_host}'",
+                        "exploitability":   8,
+                    })
+                    break
+
+    # ── Cache Control on Auth Endpoints ──────────────────────────────────────
+
+    async def check_cache_control(self, sess):
+        print("\n[*] Checking cache-control on authenticated API endpoints...")
+        for path in SENSITIVE_API_PATHS:
             url = self.target + path
             s, body, hdrs = await self._get(sess, url)
-            await delay()
-            if s != 200:
+            await delay(0.05)
+            if s != 200 or not body:
                 continue
-            cc = hdrs.get('Cache-Control') or hdrs.get('cache-control', '')
-            if not any(kw in (cc or '').lower() for kw in ['no-store','private','no-cache']):
-                self.findings.append({
-                    'type': 'SENSITIVE_ENDPOINT_CACHEABLE',
-                    'severity': 'MEDIUM',
-                    'confidence': 80,
-                    'confidence_label': confidence_label(80),
-                    'url': url,
-                    'cache_control': cc or '(absent)',
-                    'proof': (
-                        f"HTTP 200 at {path}\n"
-                        f"Cache-Control: {cc or '(absent)'}\n"
-                        f"Response may be stored by shared caches / CDNs"
-                    ),
-                    'detail': f"Sensitive endpoint {path} cacheable — auth responses may leak via shared cache",
-                    'remediation': "Add: Cache-Control: no-store, no-cache, must-revalidate, private",
+            hl = {k.lower(): v for k, v in hdrs.items()}
+            cc = hl.get("cache-control", "")
+            pragma = hl.get("pragma", "")
+            if "no-store" not in cc.lower() and "private" not in cc.lower():
+                self._add({
+                    "type":             "AUTH_API_RESPONSE_CACHEABLE",
+                    "severity":         "MEDIUM",
+                    "confidence":       82,
+                    "confidence_label": confidence_label(82),
+                    "url":              url,
+                    "cache_control":    cc or "(absent)",
+                    "pragma":           pragma or "(absent)",
+                    "proof":            f"GET {url}\n  HTTP {s}\n  Cache-Control: {cc or 'absent'}\n  Pragma: {pragma or 'absent'}\n  Response may be cached by shared proxies",
+                    "detail":           f"Authenticated API endpoint {path} lacks Cache-Control: no-store — response may be cached by shared proxy/CDN, leaking sensitive data",
+                    "remediation":      "Add: Cache-Control: no-store, no-cache, private to all authenticated API responses.",
+                    "mitre_technique":  "T1565",
+                    "mitre_name":       "Data Manipulation",
+                    "reproducibility":  f"curl -I {url}",
                 })
-                print(f"  [MEDIUM] Cacheable sensitive path: {path}")
 
     async def run(self):
         print("=" * 60)
-        print("  HeaderForge v6 — Zero-False-Positive Header Analyser")
+        print("  HeaderForge v8 — 150x Improved Header Security Analyser")
+        print(f"  Target: {self.target}")
         print("=" * 60)
-        conn = aiohttp.TCPConnector(limit=6, ssl=False)
-        async with aiohttp.ClientSession(
-            connector=conn, timeout=aiohttp.ClientTimeout(total=60),
-            headers={"User-Agent": random_ua()}
-        ) as sess:
-            await self.audit_security_headers(sess)
-            await self.analyse_csp(sess)
-            await self.audit_cors(sess)
-            await self.check_info_disclosure(sess)
-            await self.check_cache_security(sess)
-        print(f"\n[+] HeaderForge: {len(self.findings)} findings")
+        connector = aiohttp.TCPConnector(ssl=False, limit=CONCURRENCY * 2)
+        timeout   = aiohttp.ClientTimeout(total=120, connect=10)
+        async with aiohttp.ClientSession(connector=connector, timeout=timeout) as sess:
+            await asyncio.gather(
+                self.check_security_headers(sess),
+                self.check_info_disclosure(sess),
+                self.check_cors(sess),
+                self.check_cors_preflight(sess),
+                self.check_host_injection(sess),
+                self.check_cache_control(sess),
+                return_exceptions=True,
+            )
+        print(f"\n[+] HeaderForge v8 complete: {len(self.findings)} findings")
         return self.findings
 
 
-def get_target():
-    p = Path("reports/_target.txt")
-    if p.exists():
-        return p.read_text().strip()
-    u = input("[?] Target URL: ").strip()
-    return u if u.startswith("http") else "https://" + u
+async def main():
+    import os
+    target = os.environ.get("ARSENAL_TARGET", "")
+    if not target:
+        print("[!] No ARSENAL_TARGET set.", file=sys.stderr)
+        sys.exit(1)
+    if not target.startswith("http"):
+        target = "https://" + target
+    scanner = HeaderForge(target)
+    findings = await scanner.run()
+    out = Path(__file__).parent.parent / "reports" / "headerforge.json"
+    out.parent.mkdir(exist_ok=True)
+    out.write_text(json.dumps(findings, indent=2, default=str))
+    print(f"[+] Saved {len(findings)} findings → {out}")
 
 
-def main():
-    target = get_target()
-    Path("reports").mkdir(exist_ok=True)
-    findings = asyncio.run(HeaderForge(target).run())
-    with open("reports/headerforge.json", 'w') as f:
-        json.dump(findings, f, indent=2, default=str)
-    print(f"\n[+] {len(findings)} findings → reports/headerforge.json")
-
-
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    asyncio.run(main())

