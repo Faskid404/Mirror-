@@ -7,6 +7,9 @@ import {
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { useToast } from "@/hooks/use-toast";
+import {
+  Dialog, DialogContent, DialogHeader, DialogTitle,
+} from "@/components/ui/dialog";
 
 const API = "/scanner-api/api";
 
@@ -41,7 +44,192 @@ const SEV_CONFIG = [
   { key: "HIGH",     label: "High",     bg: "bg-orange-500/15", border: "border-orange-500/40", text: "text-orange-400", dot: "bg-orange-500" },
   { key: "MEDIUM",   label: "Medium",   bg: "bg-yellow-500/15", border: "border-yellow-500/40", text: "text-yellow-400", dot: "bg-yellow-500" },
   { key: "LOW",      label: "Low",      bg: "bg-blue-500/15",   border: "border-blue-500/40",   text: "text-blue-400",   dot: "bg-blue-500"   },
+  { key: "INFO",     label: "Info",     bg: "bg-slate-500/15",  border: "border-slate-500/40",  text: "text-slate-400",  dot: "bg-slate-400"  },
 ];
+
+function sevCfg(sev: string) {
+  return SEV_CONFIG.find(s => s.key === sev.toUpperCase()) ?? SEV_CONFIG[3];
+}
+
+// ── Finding detail modal ─────────────────────────────────────────────────────
+function FindingModal({ finding, onClose }: { finding: any; onClose: () => void }) {
+  const [showRaw, setShowRaw] = useState(false);
+  const sev    = (finding.severity || "LOW").toUpperCase();
+  const cfg    = sevCfg(sev);
+  const title  = (finding.type || finding.title || finding.name || "Finding")
+    .replace(/_/g, " ");
+
+  // Extra metadata tags to show as chips
+  const chips: { label: string; value: string | number }[] = [];
+  if (finding.confidence !== undefined)
+    chips.push({ label: "Confidence", value: `${finding.confidence}%${finding.confidence_label ? " · " + finding.confidence_label : ""}` });
+  if (finding.status)
+    chips.push({ label: "HTTP", value: finding.status });
+  if (finding.response_size)
+    chips.push({ label: "Size", value: `${finding.response_size} bytes` });
+  if (finding.types_exposed)
+    chips.push({ label: "Types exposed", value: finding.types_exposed });
+  if (finding.paths_count)
+    chips.push({ label: "API paths", value: finding.paths_count });
+  if (finding.sources_count)
+    chips.push({ label: "Source files", value: finding.sources_count });
+  if (finding.content_type)
+    chips.push({ label: "Content-Type", value: finding.content_type });
+  if (finding.cors_origin)
+    chips.push({ label: "CORS-Origin", value: finding.cors_origin });
+  if (finding.exploitability !== undefined)
+    chips.push({ label: "Exploitability", value: `${finding.exploitability}/10` });
+
+  return (
+    <Dialog open onOpenChange={onClose}>
+      <DialogContent className="max-w-2xl w-[95vw] p-0 overflow-hidden gap-0 border-border">
+
+        {/* Coloured header */}
+        <div className={`px-5 py-4 border-b border-border ${cfg.bg} flex items-start gap-3`}>
+          <span className={`text-[10px] px-2 py-1 rounded font-mono font-bold shrink-0 mt-0.5
+            border ${cfg.bg} ${cfg.text} ${cfg.border}`}>
+            {sev}
+          </span>
+          <div className="min-w-0 flex-1">
+            <DialogTitle className={`text-sm font-semibold ${cfg.text} leading-tight`}>
+              {title}
+            </DialogTitle>
+            {finding._module && (
+              <p className="text-[10px] text-muted-foreground mt-0.5">
+                Detected by: <span className="font-mono">{finding._module}</span>
+              </p>
+            )}
+          </div>
+        </div>
+
+        {/* Scrollable body */}
+        <div className="overflow-y-auto max-h-[72vh] p-5 space-y-4">
+
+          {/* URL */}
+          {(finding.url || finding.path) && (
+            <div>
+              <p className="text-[10px] text-muted-foreground uppercase tracking-wider font-semibold mb-1">
+                URL
+              </p>
+              <div className="font-mono text-xs text-foreground/80 bg-black/30 px-3 py-2 rounded break-all">
+                {finding.url || finding.path}
+              </div>
+            </div>
+          )}
+
+          {/* Description */}
+          {(finding.detail || finding.description) && (
+            <div>
+              <p className="text-[10px] text-muted-foreground uppercase tracking-wider font-semibold mb-1">
+                Description
+              </p>
+              <p className="text-xs text-foreground/80 leading-relaxed">
+                {finding.detail || finding.description}
+              </p>
+            </div>
+          )}
+
+          {/* Metadata chips */}
+          {chips.length > 0 && (
+            <div className="flex flex-wrap gap-1.5">
+              {chips.map(({ label, value }) => (
+                <span key={label}
+                  className="text-[10px] px-2 py-0.5 rounded bg-muted/40 border border-border text-muted-foreground font-mono">
+                  {label}: {value}
+                </span>
+              ))}
+            </div>
+          )}
+
+          {/* Proof */}
+          {finding.proof && (
+            <div>
+              <p className="text-[10px] text-blue-400/80 uppercase tracking-wider font-semibold mb-1.5">
+                Proof / Evidence
+              </p>
+              <div className="bg-black/40 border-l-2 border-blue-500/60 px-3 py-2.5 rounded-r-md">
+                <pre className="text-[11px] text-blue-300/80 whitespace-pre-wrap break-all leading-relaxed font-mono">
+                  {finding.proof}
+                </pre>
+              </div>
+            </div>
+          )}
+
+          {/* Remediation */}
+          {(finding.remediation || finding.fix) && (
+            <div>
+              <p className="text-[10px] text-green-400/80 uppercase tracking-wider font-semibold mb-1.5">
+                Remediation
+              </p>
+              <div className="bg-black/30 border-l-2 border-green-500/50 px-3 py-2.5 rounded-r-md">
+                <p className="text-[11px] text-green-300/80 leading-relaxed">
+                  {finding.remediation || finding.fix}
+                </p>
+              </div>
+            </div>
+          )}
+
+          {/* Impact */}
+          {finding.impact && (
+            <div>
+              <p className="text-[10px] text-orange-400/80 uppercase tracking-wider font-semibold mb-1">
+                Impact
+              </p>
+              <p className="text-xs text-foreground/70 leading-relaxed">{finding.impact}</p>
+            </div>
+          )}
+
+          {/* Reproducibility */}
+          {finding.reproducibility && finding.reproducibility !== "See proof field." && (
+            <div>
+              <p className="text-[10px] text-muted-foreground uppercase tracking-wider font-semibold mb-1">
+                Reproduce
+              </p>
+              <div className="font-mono text-[11px] text-foreground/70 bg-black/30 px-3 py-2 rounded break-all">
+                {finding.reproducibility}
+              </div>
+            </div>
+          )}
+
+          {/* MITRE badge */}
+          {finding.mitre_technique && (
+            <div>
+              <a
+                href={`https://attack.mitre.org/techniques/${finding.mitre_technique.replace(".", "/")}/`}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-block text-[10px] px-2.5 py-1 rounded
+                  bg-indigo-900/50 border border-indigo-500/30 text-indigo-300 font-mono
+                  hover:bg-indigo-900/70 transition-colors"
+              >
+                ↗ MITRE {finding.mitre_technique}
+                {finding.mitre_name ? ` — ${finding.mitre_name}` : ""}
+              </a>
+            </div>
+          )}
+
+          {/* Raw JSON toggle */}
+          <div className="border-t border-border/40 pt-3">
+            <button
+              onClick={() => setShowRaw(v => !v)}
+              className="text-[10px] text-muted-foreground hover:text-foreground transition-colors underline underline-offset-2"
+            >
+              {showRaw ? "Hide" : "Show"} raw finding JSON
+            </button>
+            {showRaw && (
+              <pre className="mt-2 text-[10px] text-muted-foreground bg-black/40 p-3 rounded
+                overflow-x-auto leading-relaxed font-mono max-h-64">
+                {JSON.stringify(finding, null, 2)}
+              </pre>
+            )}
+          </div>
+
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
+}
+// ── End FindingModal ─────────────────────────────────────────────────────────
 
 interface ScanStatus {
   status: string;
@@ -71,6 +259,7 @@ export default function Dashboard() {
   const [liveFindings, setLiveFindings]       = useState<any[]>([]);
   const [wsConnected, setWsConnected]         = useState(false);
   const [showLivePanel, setShowLivePanel]     = useState(true);
+  const [selectedFinding, setSelectedFinding] = useState<any>(null);
 
   const termRef    = useRef<HTMLDivElement>(null);
   const wsRef      = useRef<WebSocket | null>(null);
@@ -83,7 +272,7 @@ export default function Dashboard() {
     refetchInterval: 15_000,
   });
 
-  // ── Polling fallback (activated if WebSocket is unavailable) ──────────────
+  // ── Polling fallback ──────────────────────────────────────────────────────
   const startPolling = useCallback((id: string) => {
     if (pollRef.current) clearInterval(pollRef.current);
     pollRef.current = setInterval(async () => {
@@ -112,7 +301,7 @@ export default function Dashboard() {
     }, 1200);
   }, [toast]);
 
-  // ── Start mutation ─────────────────────────────────────────────────────────
+  // ── Start mutation ────────────────────────────────────────────────────────
   const startMut = useMutation({
     mutationFn: (body: object) =>
       fetch(`${API}/scan/start`, {
@@ -140,11 +329,10 @@ export default function Dashboard() {
       fetch(`${API}/scan/stop/${id}`, { method: "POST" }).then(r => r.json()),
   });
 
-  // ── WebSocket — primary streaming connection ───────────────────────────────
+  // ── WebSocket primary stream ──────────────────────────────────────────────
   useEffect(() => {
     if (!jobId) return;
 
-    // Tear down previous connections
     if (wsRef.current) { wsRef.current.close(); wsRef.current = null; }
     if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
 
@@ -161,13 +349,10 @@ export default function Dashboard() {
       startPolling(jobId);
     };
 
-    ws.onopen = () => setWsConnected(true);
-
+    ws.onopen  = () => setWsConnected(true);
     ws.onerror = activateFallback;
-
     ws.onclose = (e) => {
       setWsConnected(false);
-      // Code 1000 = normal close. Anything else during an active scan → fallback.
       if (e.code !== 1000 && e.code !== 1001) activateFallback();
     };
 
@@ -175,9 +360,7 @@ export default function Dashboard() {
       try {
         const evt = JSON.parse(e.data as string);
         switch (evt.type) {
-
-          case "ping":
-            break; // keepalive — ignore
+          case "ping": break;
 
           case "log":
             if (evt.data) setLines(prev => [...prev, evt.data as string]);
@@ -246,7 +429,7 @@ export default function Dashboard() {
     if (termRef.current) termRef.current.scrollTop = termRef.current.scrollHeight;
   }, [lines]);
 
-  // ── Derived state ──────────────────────────────────────────────────────────
+  // ── Derived state ─────────────────────────────────────────────────────────
   const isRunning = status?.status === "running" || status?.status === "queued";
   const isDone    = status?.status === "done";
   const isStopped = status?.status === "stopped";
@@ -292,7 +475,7 @@ export default function Dashboard() {
     a.click();
   }
 
-  // ── Render ─────────────────────────────────────────────────────────────────
+  // ── Render ────────────────────────────────────────────────────────────────
   return (
     <div className="p-4 md:p-6 space-y-4 max-w-4xl mx-auto">
 
@@ -320,7 +503,6 @@ export default function Dashboard() {
             <span className="text-sm text-muted-foreground">Connecting...</span>
           </>
         )}
-        {/* Live stream indicator */}
         {wsConnected && (
           <span className="ml-auto flex items-center gap-1.5 text-xs font-semibold text-green-400
             bg-green-400/10 border border-green-400/25 px-2 py-0.5 rounded-full">
@@ -373,7 +555,7 @@ export default function Dashboard() {
 
           {sevCounts && (
             <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 p-4">
-              {SEV_CONFIG.map(s => (
+              {SEV_CONFIG.slice(0, 4).map(s => (
                 <div key={s.key}
                   className={`rounded-lg border ${s.border} ${s.bg} p-3 flex flex-col items-center gap-1`}>
                   <span className={`text-2xl font-bold ${s.text}`}>{sevCounts[s.key] ?? 0}</span>
@@ -386,18 +568,24 @@ export default function Dashboard() {
             </div>
           )}
 
+          {/* Top findings — clickable to open modal */}
           {results?.findings && results.findings.length > 0 && (
             <div className="border-t border-card-border px-4 pb-4">
               <p className="text-xs text-muted-foreground uppercase tracking-wider mt-3 mb-2 font-medium">
-                Top Findings
+                Top Findings <span className="normal-case font-normal">(click to inspect)</span>
               </p>
               <div className="space-y-1.5">
                 {results.findings.slice(0, 5).map((f: any, i: number) => {
                   const sev = (f.severity || f.sev || "LOW").toUpperCase();
-                  const cfg = SEV_CONFIG.find(s => s.key === sev) ?? SEV_CONFIG[3];
+                  const cfg = sevCfg(sev);
                   return (
-                    <div key={i}
-                      className="flex items-start gap-2.5 p-2.5 rounded-lg bg-muted/20 border border-border/50">
+                    <button
+                      key={i}
+                      onClick={() => setSelectedFinding(f)}
+                      className="w-full text-left flex items-start gap-2.5 p-2.5 rounded-lg
+                        bg-muted/20 border border-border/50 hover:border-primary/40
+                        hover:bg-muted/40 transition-all duration-150 active:scale-[0.99]"
+                    >
                       <span className={`text-[10px] px-1.5 py-0.5 rounded font-mono font-bold shrink-0 mt-0.5 ${cfg.bg} ${cfg.text} border ${cfg.border}`}>
                         {sev}
                       </span>
@@ -416,7 +604,7 @@ export default function Dashboard() {
                           {f.module}
                         </span>
                       )}
-                    </div>
+                    </button>
                   );
                 })}
                 {results.findings.length > 5 && (
@@ -484,23 +672,20 @@ export default function Dashboard() {
           </span>
           <div className="flex items-center gap-3">
             <span
-              role="button"
-              tabIndex={0}
+              role="button" tabIndex={0}
               className="text-xs text-primary hover:underline px-1"
               onClick={e => { e.stopPropagation(); setSelected(allOn ? [] : ALL_MODULES.map(m => m.id)); }}
               onKeyDown={e => { if (e.key === "Enter") { e.stopPropagation(); setSelected(allOn ? [] : ALL_MODULES.map(m => m.id)); }}}
             >
               {allOn ? "Clear all" : "Select all"}
             </span>
-            {showModules
-              ? <ChevronUp className="w-4 h-4 text-muted-foreground" />
-              : <ChevronDown className="w-4 h-4 text-muted-foreground" />}
+            {showModules ? <ChevronUp className="w-4 h-4 text-muted-foreground" />
+                        : <ChevronDown className="w-4 h-4 text-muted-foreground" />}
           </div>
         </button>
 
         {showModules && (
           <div className="px-4 pb-4 space-y-3">
-            {/* Recon & Analysis */}
             <div>
               <p className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wider mb-2 flex items-center gap-1.5">
                 <span className="w-1.5 h-1.5 rounded-full bg-primary inline-block" />
@@ -528,7 +713,6 @@ export default function Dashboard() {
 
             <div className="border-t border-border/50" />
 
-            {/* Exploit Provers */}
             <div>
               <p className="text-[10px] font-semibold text-red-400/80 uppercase tracking-wider mb-2 flex items-center gap-1.5">
                 <span className="w-1.5 h-1.5 rounded-full bg-red-500 inline-block" />
@@ -586,7 +770,6 @@ export default function Dashboard() {
       {/* ── LIVE FINDINGS STREAM ──────────────────────────────────────────── */}
       {liveFindings.length > 0 && (
         <div className="rounded-xl border border-card-border bg-card overflow-hidden">
-          {/* Collapsible header */}
           <button
             className="w-full flex items-center justify-between px-4 py-2.5 border-b border-card-border bg-muted/20 hover:bg-muted/30 transition-colors"
             onClick={() => setShowLivePanel(p => !p)}
@@ -596,6 +779,9 @@ export default function Dashboard() {
               <span className="text-sm font-semibold text-foreground">Live Findings</span>
               <span className="text-xs text-muted-foreground">
                 {liveFindings.length} finding{liveFindings.length !== 1 ? "s" : ""}
+              </span>
+              <span className="text-[10px] text-muted-foreground/60 hidden sm:block">
+                — click any card to inspect
               </span>
             </div>
             <div className="flex items-center gap-2">
@@ -615,17 +801,18 @@ export default function Dashboard() {
             </div>
           </button>
 
-          {/* Findings list — newest first */}
           {showLivePanel && (
             <div className="max-h-80 overflow-y-auto p-3 space-y-1.5">
               {[...liveFindings].reverse().map((f, i) => {
                 const sev = (f.severity || "LOW").toUpperCase();
-                const cfg = SEV_CONFIG.find(s => s.key === sev) ?? SEV_CONFIG[3];
+                const cfg = sevCfg(sev);
                 return (
-                  <div
+                  <button
                     key={`${f._module ?? ""}-${i}`}
-                    className={`flex items-start gap-2.5 p-2.5 rounded-lg border ${cfg.border} ${cfg.bg}
-                      transition-all duration-300`}
+                    onClick={() => setSelectedFinding(f)}
+                    className={`w-full text-left flex items-start gap-2.5 p-2.5 rounded-lg border
+                      ${cfg.border} ${cfg.bg} transition-all duration-200
+                      hover:brightness-110 hover:shadow-sm active:scale-[0.99] cursor-pointer`}
                   >
                     <span className={`text-[10px] px-1.5 py-0.5 rounded font-mono font-bold shrink-0 mt-0.5
                       ${cfg.bg} ${cfg.text} border ${cfg.border}`}>
@@ -646,7 +833,7 @@ export default function Dashboard() {
                         {f._module}
                       </span>
                     )}
-                  </div>
+                  </button>
                 );
               })}
             </div>
@@ -681,6 +868,14 @@ export default function Dashboard() {
         <AlertTriangle className="w-3.5 h-3.5 shrink-0 text-yellow-500 mt-0.5" />
         <span>Only scan systems you own or have explicit written permission to test. Unauthorized scanning is illegal.</span>
       </div>
+
+      {/* ── Per-finding drill-down modal ─────────────────────────────────── */}
+      {selectedFinding && (
+        <FindingModal
+          finding={selectedFinding}
+          onClose={() => setSelectedFinding(null)}
+        />
+      )}
 
     </div>
   );
