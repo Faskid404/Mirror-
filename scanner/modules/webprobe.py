@@ -396,7 +396,11 @@ class WebProbe:
                 await delay(0.03)
                 if s not in (200, 201) or not body:
                     continue
-                if payload in body and not self._is_escaped(payload, body):
+                ct = hdrs.get("Content-Type", hdrs.get("content-type", ""))
+                # Only report XSS on HTML responses — JSON/text/xml won't render scripts
+                if payload in body and not self._is_escaped(payload, body) and (
+                    "text/html" in ct or "application/xhtml" in ct or not ct
+                ):
                     csp = hdrs.get("Content-Security-Policy",
                                    hdrs.get("content-security-policy", ""))
                     key = f"xss_{param}_{payload[:25]}"

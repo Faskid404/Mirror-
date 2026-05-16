@@ -40,7 +40,8 @@ from urllib.parse import urlparse, quote, urljoin
 sys.path.insert(0, str(Path(__file__).parent))
 from smart_filter import (
     delay, confidence_label, meets_confidence_floor,
-    random_ua, REQUEST_DELAY, WAF_BYPASS_HEADERS,
+    random_ua, REQUEST_DELAY, WAF_BYPASS_HEADERS, make_bypass_headers,
+    PATH_BYPASS_VARIANTS,
 )
 
 SEED = "MIRROR" + "".join(random.choices(string.ascii_uppercase, k=4))

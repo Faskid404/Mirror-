@@ -380,13 +380,37 @@ class DeepLogic:
                 await delay(0.05)
                 if s in (None, 404, 405):
                     continue
-                # Check for unexpected success or error leakage
-                if s in (200, 201):
+                # Require concrete evidence beyond HTTP 200 to avoid false positives.
+                # Look for: data processed/accepted indicators, admin field reflected,
+                # or NoSQL operator being echoed back (not just a generic 200).
+                body_l = (body or "").lower()
+                evidence = (
+                    # Array email accepted and reflected
+                    (label == "array_for_string_email" and (
+                        '"email"' in body and "[" not in (body or "") and
+                        any(kw in body_l for kw in ["user", "account", "token", "success"])
+                    )) or
+                    # NoSQL injection in role: server returned a user object without error
+                    (label == "nosql_injection_in_role" and (
+                        '"role"' in body or '"email"' in body or '"user"' in body
+                    ) and '"error"' not in body_l and '"message"' not in body_l) or
+                    # Boolean ID accepted and response has real-looking data
+                    (label == "boolean_id" and (
+                        '"id"' in body and any(kw in body_l for kw in ["email", "user", "name", "token"])
+                    )) or
+                    # Null ID returned data instead of 400/404
+                    (label == "null_id" and any(kw in body_l for kw in ["email", "role", "admin", "balance"])) or
+                    # SQL injection in typed field echoed an error
+                    (label == "sqli_in_typed_field" and any(
+                        e in body_l for e in ["syntax error", "sql", "ora-", "pg_", "sqlstate", "mysql"]
+                    ))
+                )
+                if s in (200, 201) and evidence:
                     self._add(self._f(
                         ftype=f"TYPE_CONFUSION_{label.upper()}",
-                        sev="MEDIUM", conf=75,
+                        sev="MEDIUM", conf=78,
                         proof=f"POST {url}\n  Payload: {payload}\n  HTTP {s}\n  Body: {(body or '')[:200]}",
-                        detail=f"Type confusion ({label}): unexpected success with malformed field types at {path}",
+                        detail=f"Type confusion ({label}): server processed malformed field types at {path} with evidence in response",
                         url=url,
                         rem=(
                             "1. Use strict type validation on all input fields.\n"

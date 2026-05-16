@@ -101,6 +101,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from smart_filter import (
     delay, confidence_label, meets_confidence_floor,
     random_ua, REQUEST_DELAY, WAF_BYPASS_HEADERS,
+    make_bypass_headers, PATH_BYPASS_VARIANTS,
 )
 
 CONCURRENCY = 5
@@ -1316,6 +1317,64 @@ class AuthBypass:
                 )
                 return
 
+    # ── Test 19: Path normalization bypass using smart_filter variants ────────
+
+    async def test_smart_path_bypass_variants(self, sess):
+        """Use PATH_BYPASS_VARIANTS from smart_filter to attempt 34+ path variants
+        against every protected endpoint, rotating the source IP on every request.
+        Only reports a finding when the bypass variant returns 200/201 while the
+        canonical path returns 401/403/404 (true-positive gated)."""
+        print("\n[*] Testing smart path normalization bypass (34+ variants)...")
+        probe_paths = PROTECTED_PATHS[:8]  # top 8 to limit noise
+        for base_path in probe_paths:
+            canonical = self.target + base_path
+            s_canonical, body_canonical, _ = await self._get(sess, canonical)
+            await delay(0.1)
+            # Skip if canonical returns 200 (nothing to bypass) or outright 404 (not found)
+            if s_canonical is None or s_canonical in (200, 201, 404):
+                continue
+            blocked_status = s_canonical  # typically 401 or 403
+            for variant_path, _bypass_label in PATH_BYPASS_VARIANTS(base_path):
+                if variant_path == base_path:
+                    continue
+                hdrs = make_bypass_headers(extra={"User-Agent": random_ua()})
+                url = self.target + variant_path
+                s, body, _ = await self._get(sess, url, headers=hdrs)
+                await delay(0.05)
+                if s not in (200, 201):
+                    continue
+                # Confirm body has meaningful data (not just a redirect to login page)
+                body_l = (body or "").lower()
+                if not any(kw in body_l for kw in ["id", "email", "user", "token", "admin", "role", "name"]):
+                    continue
+                self._finding(
+                    ftype="PATH_BYPASS_AUTH",
+                    severity="HIGH", conf=88,
+                    proof=(
+                        f"Canonical: GET {canonical} → HTTP {blocked_status}\n"
+                        f"Bypass:    GET {url} → HTTP {s}\n"
+                        f"Body snippet: {body[:200]!r}"
+                    ),
+                    detail=(
+                        f"Path normalization bypass: canonical path {base_path!r} returns {blocked_status} "
+                        f"but variant {variant_path!r} returns {s}, exposing protected resource."
+                    ),
+                    url=url,
+                    remediation=(
+                        "1. Normalize all incoming paths before applying authorization checks.\n"
+                        "2. Reject paths containing ../, double-slashes, null bytes, encoded slashes.\n"
+                        "3. Apply access control in middleware before any routing occurs.\n"
+                        "4. Use allowlist-based path matching in your security layer."
+                    ),
+                    exploitability=8,
+                    impact="Authentication bypass — protected endpoint accessible without valid credentials.",
+                    reproducibility=f"curl -s '{url}' -H 'X-Forwarded-For: 127.0.0.1'",
+                    mitigation_layers=["Path normalization", "AuthZ middleware ordering", "WAF rules"],
+                    proof_type="EXPLOITATION",
+                    extra={"bypass_variant": variant_path, "canonical": base_path},
+                )
+                break  # one confirmed bypass per base_path is enough
+
     # ── Main ─────────────────────────────────────────────────────────────────
 
     async def run(self):
@@ -1342,6 +1401,7 @@ class AuthBypass:
                 self.test_api_version_downgrade(sess),
                 self.test_account_enumeration(sess),
                 self.test_rate_limit_bypass(sess),
+                self.test_smart_path_bypass_variants(sess),
             ]
             # Run in concurrent batches (some tests depend on shared state)
             await asyncio.gather(*tests, return_exceptions=True)

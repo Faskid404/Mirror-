@@ -36,7 +36,7 @@ from urllib.parse import urlparse, urljoin
 sys.path.insert(0, str(Path(__file__).parent))
 from smart_filter import (
     build_baseline_404, delay, confidence_label, meets_confidence_floor,
-    random_ua, WAF_BYPASS_HEADERS, REQUEST_DELAY,
+    random_ua, WAF_BYPASS_HEADERS, REQUEST_DELAY, make_bypass_headers,
 )
 
 CONCURRENCY = 6

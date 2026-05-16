@@ -218,7 +218,7 @@ class BackendProbe:
 
     def _add(self, finding: dict):
         key = hashlib.md5(
-            f"{finding.get('type')}|{finding.get('url','')}|{finding.get('payload','')}[:30]".encode()
+            f"{finding.get('type')}|{finding.get('url','')}|{str(finding.get('payload',''))[:30]}".encode()
         ).hexdigest()
         if key in self._dedup or not meets_confidence_floor(finding.get("confidence", 0)):
             return

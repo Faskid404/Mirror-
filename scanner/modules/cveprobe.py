@@ -27,47 +27,14 @@ from pathlib import Path
 from urllib.parse import urlparse, quote
 
 sys.path.insert(0, str(Path(__file__).parent))
-try:
-    from smart_filter import REQUEST_DELAY, confidence_score, confidence_label, severity_from_confidence
-except ImportError:
-    REQUEST_DELAY = 0.3
-    def confidence_score(f): return min(100, sum(w for v, w in f.values() if v))
-    def confidence_label(s): return "High" if s >= 75 else ("Medium" if s >= 50 else "Low")
-    def severity_from_confidence(s, c): return s
+from smart_filter import (
+    REQUEST_DELAY, confidence_score, confidence_label, severity_from_confidence,
+    random_ua, WAF_BYPASS_HEADERS, make_bypass_headers, meets_confidence_floor,
+)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Constants
 # ──────────────────────────────────────────────────────────────────────────────
-
-USER_AGENTS = [
-    # Mainstream browsers
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Safari/605.1.15",
-    "Mozilla/5.0 (X11; Linux x86_64; rv:126.0) Gecko/20100101 Firefox/126.0",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0",
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Mobile/15E148 Safari/604.1",
-    # Crawlers / bots (bypass bot-detection filter logic)
-    "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
-    "Mozilla/5.0 (compatible; bingbot/2.0; +http://www.bing.com/bingbot.htm)",
-    "Slackbot-LinkExpanding 1.0 (+https://api.slack.com/robots)",
-    # CLI / library tools (common during legitimate scanning)
-    "curl/8.7.1",
-    "python-requests/2.31.0",
-    "Go-http-client/2.0",
-    "Java/17.0.11",
-    # Security scanners (help test WAF/IDS evasion)
-    "Nuclei - Open-source project (github.com/projectdiscovery/nuclei)",
-    "sqlmap/1.8.3#stable (https://sqlmap.org)",
-    "Nikto/2.1.6",
-]
-
-WAF_BYPASS_HEADERS = {
-    "X-Originating-IP": "127.0.0.1",
-    "X-Forwarded-For":  "127.0.0.1",
-    "X-Remote-IP":      "127.0.0.1",
-    "X-Remote-Addr":    "127.0.0.1",
-    "X-Client-IP":      "127.0.0.1",
-}
 
 NVD_BASE = "https://nvd.nist.gov/vuln/detail/"
 
@@ -540,7 +507,7 @@ class CVEProbeEngine:
     async def _request(self, sess, method, url, headers=None, body=None, retries=2):
         """Send HTTP request with retry on timeout, WAF evasion headers."""
         merged_headers = {**WAF_BYPASS_HEADERS,
-                         "User-Agent": random.choice(USER_AGENTS)}
+                         "User-Agent": random_ua()}
         if headers:
             merged_headers.update(headers)
 
