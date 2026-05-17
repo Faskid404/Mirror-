@@ -299,10 +299,6 @@ DEFAULT_CREDS = [
     ("api",            "apikey"),
     ("dev",            "dev"),
     ("developer",      "developer"),
-    ("test@test.com",  "test"),
-    ("admin@admin.com","admin"),
-    ("info@example.com","password"),
-    ("noreply@example.com", "password"),
 ]
 
 # ── Mass assignment privilege fields ──────────────────────────────────────────
@@ -558,7 +554,7 @@ class AuthBypass:
                     await delay()
                     if s is None or s in (404, 405, 429) or not body:
                         continue
-                    if s not in (200, 201) or len(body) < 40:
+                    if not is_real_200(s) or len(body) < 40:
                         continue
                     token = self._extract_token(body)
                     email = self._extract_json_field(body, "email")
@@ -603,7 +599,7 @@ class AuthBypass:
                     await delay(0.25)
                     if s is None or s in (404, 405, 429):
                         break
-                    if s not in (200, 201) or len(body) < 40:
+                    if not is_real_200(s) or len(body) < 40:
                         continue
                     token = self._extract_token(body)
                     role  = self._extract_json_field(body, "role")
@@ -904,7 +900,7 @@ class AuthBypass:
                     json_data={"otp": otp_val, "code": otp_val, "token": otp_val,
                                "mfa_code": otp_val, "totp": otp_val})
                 await delay(0.2)
-                if s in (200, 201) and self._has_auth_success(body):
+                if is_real_200(s) and self._has_auth_success(body):
                     self._finding(
                         ftype="MFA_OTP_TRIVIAL_BYPASS",
                         severity="CRITICAL", conf=93,
@@ -940,7 +936,7 @@ class AuthBypass:
                 await delay()
                 if s is None or s in (404, 405):
                     break
-                if s not in (200, 201) or len(body) < 20:
+                if not is_real_200(s) or len(body) < 20:
                     continue
                 esc_key = list(esc_payload.keys())[0]
                 esc_val = list(esc_payload.values())[0]
@@ -1345,7 +1341,7 @@ class AuthBypass:
                 url = self.target + variant_path
                 s, body, _ = await self._get(sess, url, headers=hdrs)
                 await delay(0.05)
-                if s not in (200, 201):
+                if not is_real_200(s):
                     continue
                 # Confirm body has meaningful data (not just a redirect to login page)
                 body_l = (body or "").lower()

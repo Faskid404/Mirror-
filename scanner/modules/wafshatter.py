@@ -495,8 +495,9 @@ class WAFShatter:
 
             rate_limited = any(s in (429, 503) for s in statuses if s)
             lockout = any(s == 423 for s in statuses if s)
+            got_real_response = any(is_real_200(s) for s in statuses if s)
 
-            if not rate_limited and not lockout:
+            if not rate_limited and not lockout and got_real_response:
                 unique_statuses = list(set(s for s in statuses if s))
                 self._add({
                     "type":             "AUTH_RATE_LIMIT_MISSING",
@@ -531,21 +532,6 @@ class WAFShatter:
                     "impact":          "Unlimited password brute-force and credential stuffing attacks possible.",
                     "reproducibility": f"for i in $(seq 1 100); do curl -s -X POST {url} -d '{{\"email\":\"admin@target.com\",\"password\":\"$i\"}}'; done",
                 })
-            else:
-                self._add({
-                    "type":            "AUTH_RATE_LIMIT_PRESENT",
-                    "severity":        "INFO",
-                    "confidence":      92,
-                    "confidence_label": confidence_label(92),
-                    "url":             url,
-                    "requests_before_limit": statuses.index(429) if 429 in statuses else len(statuses),
-                    "retry_after":     retry_afters[0] if retry_afters else "(not specified)",
-                    "proof":           f"POST {url} — rate-limited after {statuses.index(429) if 429 in statuses else '?'} requests. HTTP 429 received.",
-                    "detail":          f"Rate-limiting active on {path} — brute-force protection confirmed.",
-                    "remediation":     "Rate-limiting confirmed. Verify CAPTCHA and lockout escalation.",
-                    "mitre_technique": "T1110",
-                    "mitre_name":      "Brute Force",
-                })
 
     # ── HTTP Method Restriction ──────────────────────────────────────────────
 
@@ -571,7 +557,7 @@ class WAFShatter:
                         status, body = None, ""
 
                 await delay(0.05)
-                if status in (200, 201, 202, 204):
+                if is_real_200(status) and body:
                     self._add({
                         "type":             f"HTTP_METHOD_{method}_ALLOWED",
                         "severity":         "HIGH",
@@ -579,14 +565,13 @@ class WAFShatter:
                         "confidence_label": confidence_label(85),
                         "url":              url,
                         "method":           method,
-                        "proof":            f"{method} {url} → HTTP {status} (not blocked)",
+                        "proof":            f"{method} {url} → HTTP {status} — body: {body[:200]}",
                         "detail":           f"Dangerous HTTP method {method} allowed on {path}",
                         "remediation":      f"Restrict {method} method at web server / API gateway level. Use allowlist of permitted methods per endpoint.",
                         "mitre_technique":  "T1190",
                         "mitre_name":       "Exploit Public-Facing Application",
                     })
 
-                # Try override via header
                 for ovr_hdr in ["X-HTTP-Method-Override", "X-Method-Override", "_method"]:
                     s2, body2, _ = await self._post(
                         sess, url,
@@ -594,7 +579,7 @@ class WAFShatter:
                         headers={ovr_hdr: method},
                     )
                     await delay(0.05)
-                    if s2 in (200, 201, 202, 204):
+                    if is_real_200(s2) and body2:
                         self._add({
                             "type":             "HTTP_METHOD_OVERRIDE_BYPASS",
                             "severity":         "HIGH",

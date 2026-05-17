@@ -505,7 +505,7 @@ class BackendProbe:
                 await delay(0.05)
                 if s in (None, 404, 405):
                     continue
-                if s in (200, 201) and body:
+                if is_real_200(s) and body:
                     field_str = f'"{field}"'
                     val_str   = f'"{value}"' if isinstance(value, str) else str(value).lower()
                     if field_str in body and val_str in body.lower():

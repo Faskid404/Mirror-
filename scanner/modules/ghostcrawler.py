@@ -532,7 +532,7 @@ class GhostCrawler:
     async def _analyze_url(self, sess, url: str, status: int, body: str, hdrs: dict):
         hl = {k.lower(): v for k, v in hdrs.items()}
         keyword_hit = any(kw in url.lower() for kw in SENSITIVE_PATH_KEYWORDS)
-        is_sensitive = keyword_hit or status in (200, 201)
+        is_sensitive = keyword_hit or is_real_200(status)
 
         # Secret scanning
         if body and is_sensitive:

@@ -398,7 +398,7 @@ class WebProbe:
                 url = f"{self.target}?{param}={quote(payload, safe='')}"
                 s, body, hdrs = await self._get(sess, url, allow_redirects=True)
                 await delay(0.03)
-                if s not in (200, 201) or not body:
+                if not is_real_200(s) or not body:
                     continue
                 ct = hdrs.get("Content-Type", hdrs.get("content-type", ""))
                 # Only report XSS on HTML responses — JSON/text/xml won't render scripts
@@ -445,7 +445,7 @@ class WebProbe:
                              "comment": payload, "text": payload}
                 s, body, _ = await self._post(sess, url, json_data=form_data)
                 await delay(0.05)
-                if s not in (200, 201) or not body:
+                if not is_real_200(s) or not body:
                     continue
                 if payload in (body or "") and not self._is_escaped(payload, body or ""):
                     self._add({
@@ -513,7 +513,7 @@ class WebProbe:
                 url = f"{self.target}?{param}={val}"
                 s, body, hdrs = await self._get(sess, url, allow_redirects=True)
                 await delay(0.04)
-                if s not in (200, 201) or not body:
+                if not is_real_200(s) or not body:
                     continue
                 # Look for evidence the payload affected server response
                 if any(k in (body or "") for k in ['"admin":true', '"isAdmin":true', '"role":"admin"']):

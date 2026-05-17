@@ -281,7 +281,7 @@ class CryptoHunter:
             url = self.target + path
             s, body, _ = await self._get(sess, url)
             await delay(0.05)
-            if s not in (200, 201) or not body:
+            if not is_real_200(s) or not body:
                 continue
             md5_matches = MD5_PATTERN.findall(body)
             sha1_matches = SHA1_PATTERN.findall(body)

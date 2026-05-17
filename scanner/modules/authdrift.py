@@ -315,7 +315,7 @@ class AuthDrift:
                     data={"code": code, "otp": code, "token": code,
                           "totp": code, "mfa_code": code})
                 await delay(0.06)
-                if s in (200, 201) and body:
+                if is_real_200(s) and body:
                     if any(k in (body or "").lower() for k in
                            ["success", "verified", "token", "access"]):
                         self._add(self._f(

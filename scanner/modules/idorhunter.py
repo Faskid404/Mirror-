@@ -325,7 +325,7 @@ class IDORHunter:
                 url = self.target + path_template.format(id=obj_id)
                 s, body, hdrs = await self._get(sess, url)
                 await delay(0.05)
-                if s not in (200, 201) or not body:
+                if not is_real_200(s) or not body:
                     continue
                 if s in baseline_404:
                     continue
@@ -365,12 +365,9 @@ class IDORHunter:
             s, body, _ = await self._get(sess, self.target + "/")
             await delay()
         exposed_uuids = _extract_uuids(body or "")
-        # Also try common UUIDs
-        test_uuids = exposed_uuids[:5] + [
-            str(uuid.uuid4()),
-            "00000000-0000-0000-0000-000000000001",
-            "11111111-1111-1111-1111-111111111111",
-        ]
+        if not exposed_uuids:
+            return
+        test_uuids = exposed_uuids[:8]
         for path_template, expected_fields in IDOR_API_PATHS[:20]:
             for uid in test_uuids[:6]:
                 url = self.target + path_template.format(id=uid)
@@ -515,7 +512,7 @@ class IDORHunter:
                     url = self.target + path_template + str(obj_id)
                 s, body, hdrs = await self._get(sess, url)
                 await delay(0.06)
-                if s not in (200, 201) or not body:
+                if not is_real_200(s) or not body:
                     continue
                 if s in baseline_404:
                     continue

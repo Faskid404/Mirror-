@@ -228,6 +228,9 @@ class TokenSniper:
 
     async def analyse_structure(self, sess):
         print("\n[*] Analysing JWT structure and claims...")
+        if getattr(self, "_synth_only", False):
+            print("  [-] Skipping — no real token harvested from server")
+            return
         for token in self._tokens[:3]:
             dec = _decode_jwt(token)
             if not dec:
@@ -262,12 +265,6 @@ class TokenSniper:
                     f"JWT payload contains sensitive fields {sensitive} — base64 is not encryption.",
                     self.target,
                     "Never store sensitive data in JWT payload. Use JWE if payload must be confidential."))
-            if "kid" in header:
-                self._add(self._finding("JWT_KID_PRESENT", "INFO", 80,
-                    f"JWT kid: {header['kid']}",
-                    "JWT uses kid header — test for SQL/path-traversal injection in key lookup.",
-                    self.target,
-                    "Validate kid against strict allowlist. Never interpolate kid into DB query."))
 
     async def test_alg_none(self, sess):
         print("\n[*] Testing JWT alg:none bypass (5 variants)...")

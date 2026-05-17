@@ -193,8 +193,7 @@ class DeepLogic:
                 await delay(0.06)
                 if s in (None, 404, 405):
                     continue
-                if s in (200, 201) and body:
-                    # Check for success indicator
+                if is_real_200(s) and body:
                     success = any(kw in (body or "").lower() for kw in
                                   ["success", "order_id", "order id", "transaction", "payment", "completed",
                                    "confirmation", "receipt"])
@@ -291,7 +290,7 @@ class DeepLogic:
                     payload = {field: value, "name": "testuser"}
                     s, body, _ = await self._post(sess, url, data=payload)
                     await delay(0.05)
-                    if s not in (200, 201) or not body:
+                    if not is_real_200(s) or not body:
                         continue
                     # Check if field reflected back
                     val_check = str(value).lower()
@@ -330,7 +329,7 @@ class DeepLogic:
             await delay(0.06)
             if s in (None, 404, 405):
                 continue
-            if s in (200, 201) and body:
+            if is_real_200(s) and body:
                 success = any(kw in (body or "").lower() for kw in
                               ["success", "activated", "confirmed", "completed", "order_id"])
                 if success:
@@ -425,7 +424,7 @@ class DeepLogic:
                         e in body_l for e in ["syntax error", "sql", "ora-", "pg_", "sqlstate", "mysql"]
                     ))
                 )
-                if s in (200, 201) and evidence:
+                if is_real_200(s) and evidence:
                     self._add(self._f(
                         ftype=f"TYPE_CONFUSION_{label.upper()}",
                         sev="MEDIUM", conf=78,
