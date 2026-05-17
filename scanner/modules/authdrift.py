@@ -402,7 +402,7 @@ class AuthDrift:
                 data={"email": "admin@admin.com"},
                 headers={"Host": "evil.com", "X-Forwarded-Host": "evil.com"})
             await delay(0.08)
-            if s2 in (200, 201, 204) and "evil.com" in (body2 or ""):
+            if is_real_200(s2) and "evil.com" in (body2 or ""):
                 self._add(self._f(
                     ftype="RESET_HOST_HEADER_INJECTION",
                     sev="HIGH", conf=92,
@@ -443,7 +443,7 @@ class AuthDrift:
                     s2, body2, _ = await self._get(sess, self.target + me_path,
                                                    headers={"Authorization": f"Bearer {token}"})
                     await delay(0.1)
-                    if s2 in (200, 201) and body2 and '"id"' in body2:
+                    if is_real_200(s2) and body2 and '"id"' in body2:
                         self._add(self._f(
                             ftype="SESSION_NOT_INVALIDATED_ON_LOGOUT",
                             sev="HIGH", conf=93,

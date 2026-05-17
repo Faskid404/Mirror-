@@ -982,7 +982,7 @@ class AuthBypass:
                 await delay()
                 if s is None or s in (404, 405):
                     break
-                if s in (200, 201, 202):
+                if is_real_200(s) and body:
                     reflected = poison_host in body
                     reset_triggered = any(k in body.lower() for k in ["reset", "email", "sent", "link", "token", "check"])
                     if reflected or reset_triggered:

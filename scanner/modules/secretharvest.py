@@ -34,7 +34,7 @@ from urllib.parse import urlparse, urljoin
 
 sys.path.insert(0, str(Path(__file__).parent))
 from smart_filter import (
-    delay, confidence_label, meets_confidence_floor,
+    delay, confidence_label, meets_confidence_floor, is_real_200,
     random_ua, shannon_entropy, WAF_BYPASS_HEADERS, gen_bypass_attempts,
 )
 
@@ -412,7 +412,7 @@ class SecretHarvest:
         await delay(0.04)
         if s is None or s in (404, 410):
             return
-        if s in (200, 206) and body:
+        if is_real_200(s) and body:
             for f in self._scan_body(body, url):
                 self._add(f)
             for f in self._scan_headers(hdrs, url):

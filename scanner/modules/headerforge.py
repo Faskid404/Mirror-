@@ -55,7 +55,7 @@ from urllib.parse import urlparse
 
 sys.path.insert(0, str(Path(__file__).parent))
 from smart_filter import (
-    build_baseline_404, delay, confidence_label, meets_confidence_floor,
+    build_baseline_404, delay, confidence_label, meets_confidence_floor, is_real_200,
     random_ua, REQUEST_DELAY, WAF_BYPASS_HEADERS, gen_bypass_attempts,
 )
 
@@ -509,7 +509,7 @@ class HeaderForge:
                 await delay(0.06)
                 if s in (None, 404, 405):
                     continue
-                if s in (200, 201, 202) and poison_host in (body or ""):
+                if is_real_200(s) and poison_host in (body or ""):
                     self._add({
                         "type":             "HOST_HEADER_INJECTION",
                         "severity":         "HIGH",

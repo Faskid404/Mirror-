@@ -62,7 +62,7 @@ from urllib.parse import urlparse, quote
 
 sys.path.insert(0, str(Path(__file__).parent))
 from smart_filter import (
-    delay, confidence_label, meets_confidence_floor,
+    delay, confidence_label, meets_confidence_floor, is_real_200,
     random_ua, WAF_BYPASS_HEADERS, gen_bypass_attempts,
 )
 
@@ -232,7 +232,7 @@ class DeepLogic:
             # Fire 20 concurrent requests
             tasks = [self._post(sess, url, data={"item_id": 1, "target_id": 1}) for _ in range(20)]
             results = await asyncio.gather(*tasks, return_exceptions=True)
-            successes = sum(1 for r in results if not isinstance(r, Exception) and r[0] in (200, 201))
+            successes = sum(1 for r in results if not isinstance(r, Exception) and is_real_200(r[0]))
             if successes > 1:
                 self._add(self._f(
                     ftype="RACE_CONDITION_VOTE_DUPLICATE",
@@ -263,7 +263,7 @@ class DeepLogic:
                 continue
             tasks = [self._post(sess, url, data={"code": "TEST10", "coupon": "TEST10"}) for _ in range(10)]
             results = await asyncio.gather(*tasks, return_exceptions=True)
-            successes = sum(1 for r in results if not isinstance(r, Exception) and r[0] in (200, 201))
+            successes = sum(1 for r in results if not isinstance(r, Exception) and is_real_200(r[0]))
             if successes > 1:
                 self._add(self._f(
                     ftype="RACE_CONDITION_COUPON_REPLAY",
