@@ -60,7 +60,7 @@ from urllib.parse import urlparse
 
 sys.path.insert(0, str(Path(__file__).parent))
 from smart_filter import (
-    delay, confidence_label, meets_confidence_floor,
+    delay, confidence_label, meets_confidence_floor, is_real_200,
     random_ua, WAF_BYPASS_HEADERS, gen_bypass_attempts,
 )
 
@@ -278,7 +278,7 @@ class GraphQLProbe:
             if isinstance(res, Exception):
                 continue
             s, body, hdrs = res
-            if s and s != 404:
+            if is_real_200(s):
                 try:
                     data = json.loads(body or "{}")
                     if "__typename" in body or "data" in data:
@@ -363,7 +363,7 @@ class GraphQLProbe:
         for url in self._active_endpoints:
             s, body, _ = await self._post(sess, url, {"query": "{ __typnam }"})
             await delay(0.06)
-            if s and "Did you mean" in (body or ""):
+            if is_real_200(s) and "Did you mean" in (body or ""):
                 m = re.search(r'Did you mean[^?]*\?["\s]*([^"?\n]+)', body, re.I)
                 suggestion = m.group(1).strip() if m else ""
                 self._add(self._f(

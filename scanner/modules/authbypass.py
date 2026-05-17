@@ -99,7 +99,7 @@ from urllib.parse import urlparse, urlencode, quote
 
 sys.path.insert(0, str(Path(__file__).parent))
 from smart_filter import (
-    delay, confidence_label, meets_confidence_floor,
+    delay, confidence_label, meets_confidence_floor, is_real_200,
     random_ua, REQUEST_DELAY, WAF_BYPASS_HEADERS,
     make_bypass_headers, PATH_BYPASS_VARIANTS, gen_bypass_attempts,
 )

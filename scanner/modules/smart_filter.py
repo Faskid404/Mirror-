@@ -466,6 +466,13 @@ def meets_confidence_floor(conf: int) -> bool:
     return conf >= CONFIDENCE_FLOOR
 
 
+def is_real_200(status: int | None) -> bool:
+    """Return True only for genuine success responses (200 or 201).
+    Explicitly rejects 403 and all other non-success statuses so that
+    findings are never created based on Forbidden responses."""
+    return status in (200, 201)
+
+
 def shannon_entropy(s: str) -> float:
     """Calculate Shannon entropy of a string (bits per character)."""
     if not s:

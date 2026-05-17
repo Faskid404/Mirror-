@@ -55,7 +55,7 @@ from urllib.parse import urlparse, quote, urljoin
 
 sys.path.insert(0, str(Path(__file__).parent))
 from smart_filter import (
-    build_baseline_404, delay, confidence_label, meets_confidence_floor,
+    build_baseline_404, delay, confidence_label, meets_confidence_floor, is_real_200,
     random_ua, WAF_BYPASS_HEADERS, gen_bypass_attempts,
 )
 
@@ -353,7 +353,7 @@ class BackendProbe:
                 url = f"{self.target}/?{param}={quote(payload, safe='')}"
                 s, body, _ = await self._get(sess, url, timeout=10)
                 await delay(0.04)
-                if s in (None,):
+                if not is_real_200(s):
                     continue
                 if any(ind in (body or "") for ind in FILE_READ_INDICATORS):
                     self._add(self._f(
@@ -382,7 +382,7 @@ class BackendProbe:
                 url = f"{self.target}/?{param}={quote(payload, safe='')}"
                 s, body, _ = await self._get(sess, url, timeout=10)
                 await delay(0.05)
-                if s and any(ind.lower() in (body or "").lower() for ind in indicators):
+                if is_real_200(s) and any(ind.lower() in (body or "").lower() for ind in indicators):
                     self._add(self._f(
                         ftype="SQLI_ERROR_BASED",
                         sev="CRITICAL", conf=93,
@@ -427,7 +427,7 @@ class BackendProbe:
                 url = f"{self.target}/?{param}={quote(payload, safe='')}"
                 s, body, _ = await self._get(sess, url, timeout=10)
                 await delay(0.04)
-                if s and any(ind in (body or "") for ind in indicators):
+                if is_real_200(s) and any(ind in (body or "") for ind in indicators):
                     self._add(self._f(
                         ftype="COMMAND_INJECTION_CONFIRMED",
                         sev="CRITICAL", conf=97,
@@ -462,7 +462,7 @@ class BackendProbe:
                         headers={"Content-Type": ct},
                     )
                     await delay(0.06)
-                    if s and any(ind in (body or "") for ind in indicators):
+                    if is_real_200(s) and any(ind in (body or "") for ind in indicators):
                         self._add(self._f(
                             ftype="XXE_CONFIRMED",
                             sev="CRITICAL", conf=95,

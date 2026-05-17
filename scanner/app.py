@@ -288,6 +288,24 @@ def scan_status(job_id):
     })
 
 
+def _filter_403_findings(findings: list) -> list:
+    """Remove any finding whose proof string contains an HTTP 403 status line
+    and whose type is NOT a WAF-bypass finding (those legitimately document
+    403 → 200 bypass chains and must be kept)."""
+    WAF_BYPASS_TYPES = {"WAF_BYPASS_CONFIRMED", "WAF_IP_RESTRICTION_BYPASS"}
+    filtered = []
+    for f in findings:
+        if f.get("type") in WAF_BYPASS_TYPES:
+            filtered.append(f)
+            continue
+        proof = str(f.get("proof", ""))
+        # Drop findings where the only confirmed status is 403
+        if "HTTP 403" in proof and "HTTP 200" not in proof and "HTTP 201" not in proof:
+            continue
+        filtered.append(f)
+    return filtered
+
+
 @bp.route("/api/scan/results/<job_id>", methods=["GET"])
 def scan_results(job_id):
     with JOBS_LOCK:
@@ -301,11 +319,12 @@ def scan_results(job_id):
             chains = json.loads(rc_file.read_text()).get("attack_chains", [])
         except Exception:
             pass
+    findings = _filter_403_findings(job.get("all_findings", []))
     return jsonify({
         "job_id":    job_id,
         "status":    job.get("status"),
         "target":    job.get("target"),
-        "findings":  job.get("all_findings", []),
+        "findings":  findings,
         "chains":    chains,
         "output":    job.get("output", []),
         "duration":  round(job.get("finished", time.time()) - job.get("started", time.time()), 1),

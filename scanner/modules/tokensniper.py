@@ -24,7 +24,7 @@ from urllib.parse import urlparse
 
 sys.path.insert(0, str(Path(__file__).parent))
 from smart_filter import (
-    delay, confidence_label, meets_confidence_floor,
+    delay, confidence_label, meets_confidence_floor, is_real_200,
     random_ua, WAF_BYPASS_HEADERS, shannon_entropy, gen_bypass_attempts,
 )
 

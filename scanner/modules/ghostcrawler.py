@@ -61,7 +61,7 @@ from urllib.parse import urlparse, urljoin, urldefrag, urlencode
 
 sys.path.insert(0, str(Path(__file__).parent))
 from smart_filter import (
-    build_baseline_404, delay, confidence_label, meets_confidence_floor,
+    build_baseline_404, delay, confidence_label, meets_confidence_floor, is_real_200,
     random_ua, REQUEST_DELAY, WAF_BYPASS_HEADERS, shannon_entropy,
     severity_sanity_check, enrich_finding, dedup_key, MITRE_MAP,
     gen_bypass_attempts,
@@ -539,8 +539,8 @@ class GhostCrawler:
             for f in self._scan_secrets(body, url):
                 self._add(f)
 
-        # Error leakage
-        if body and status in (200, 500, 403):
+        # Error leakage — only on 200/201/500, never on 403
+        if body and status in (200, 201, 500):
             for f in self._scan_errors(body, url):
                 self._add(f)
 
