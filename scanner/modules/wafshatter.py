@@ -461,13 +461,13 @@ class WAFShatter:
         print("\n[*] Testing authentication rate-limiting (brute-force protection)...")
         for path, method, payload in RATE_LIMIT_ENDPOINTS:
             url = self.target + path
-            # First check endpoint exists
+            # First check endpoint exists — skip non-existent endpoints entirely
             if method == "POST":
-                s0, _, _ = await self._post(sess, url, json_data=payload)
+                s0, body0, _ = await self._post(sess, url, json_data=payload)
             else:
-                s0, _, _ = await self._get(sess, url)
+                s0, body0, _ = await self._get(sess, url)
             await delay(0.1)
-            if s0 in (None, 404, 405, 410):
+            if s0 in (None, 404, 405, 410, 501):
                 continue
 
             # Now fire 30 rapid requests and check if any 429/503 appears

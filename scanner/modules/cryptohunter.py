@@ -168,7 +168,8 @@ class CryptoHunter:
             return
         try:
             ctx = ssl.create_default_context()
-            conn = await asyncio.get_event_loop().run_in_executor(
+            loop = asyncio.get_running_loop()
+            conn = await loop.run_in_executor(
                 None, lambda: ssl.create_connection((self.host, self.port), timeout=10)
             )
             ssl_sock = ctx.wrap_socket(conn, server_hostname=self.host)

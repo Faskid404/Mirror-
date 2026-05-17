@@ -176,6 +176,11 @@ class DeepLogic:
         print("\n[*] Testing price/amount manipulation attacks...")
         for path in CHECKOUT_PATHS:
             url = self.target + path
+            # Pre-check: only probe checkout-like endpoints that actually respond
+            s_probe, _, _ = await self._get(sess, url)
+            await delay(0.06)
+            if s_probe in (None, 404, 405, 410, 501):
+                continue
             attacks = [
                 ({"amount": -1, "price": -1, "quantity": 1},        "negative_price"),
                 ({"amount": 0, "price": 0, "quantity": 1},          "zero_price"),
@@ -216,6 +221,11 @@ class DeepLogic:
         # Test vote/like race
         for path in VOTE_PATHS:
             url = self.target + path
+            # Verify endpoint is reachable before flooding it
+            s_probe, _, _ = await self._get(sess, url)
+            await delay(0.06)
+            if s_probe in (None, 404, 405, 410):
+                continue
             s0, _, _ = await self._post(sess, url, data={"item_id": 1, "target_id": 1})
             await delay(0.1)
             if s0 in (None, 404, 405):
@@ -243,6 +253,11 @@ class DeepLogic:
         # Test coupon race condition
         for path in COUPON_PATHS:
             url = self.target + path
+            # Verify endpoint before flooding
+            s_probe, _, _ = await self._get(sess, url)
+            await delay(0.06)
+            if s_probe in (None, 404, 405, 410):
+                continue
             s0, _, _ = await self._post(sess, url, data={"code": "TEST10", "coupon": "TEST10"})
             await delay(0.1)
             if s0 in (None, 404, 405):
@@ -267,9 +282,9 @@ class DeepLogic:
         print("\n[*] Testing mass assignment (40+ privileged fields)...")
         for path in PROFILE_UPDATE_PATHS:
             url = self.target + path
-            s0, _, _ = await self._get(sess, url)
+            s0, body0, _ = await self._get(sess, url)
             await delay(0.05)
-            if s0 in (None, 404):
+            if s0 in (None, 404, 405, 410):
                 continue
             for field, values in PRIVILEGED_FIELDS:
                 for value in values[:2]:

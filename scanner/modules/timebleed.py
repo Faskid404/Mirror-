@@ -231,7 +231,8 @@ class TimeBleed:
             baseline_url = f"{self.target}/?{param}=1"
             t_base, s_base, _ = await self._timed_get(sess, baseline_url, timeout=6)
             await delay(0.1)
-            if s_base is None:
+            # Skip params that return error/not-found — can't meaningfully compare timing
+            if s_base is None or s_base in (404, 400, 410):
                 continue
 
             for payload, db in BLIND_SQLI_TIME[:3]:
@@ -274,7 +275,7 @@ class TimeBleed:
             baseline_url = f"{self.target}/?{param}=hello"
             t_base, s_base, _ = await self._timed_get(sess, baseline_url, timeout=6)
             await delay(0.1)
-            if s_base is None:
+            if s_base is None or s_base in (404, 400, 410):
                 continue
             for payload, label in BLIND_SSTI_TIME[:2]:
                 url = f"{self.target}/?{param}={quote(payload, safe='')}"
@@ -311,6 +312,11 @@ class TimeBleed:
         print("\n[*] Testing coupon/promo code timing oracle...")
         for path in COUPON_PATHS:
             url = self.target + path
+            # Verify endpoint exists before heavy sampling
+            t_probe, s_probe, _ = await self._timed_get(sess, url)
+            await delay(0.05)
+            if s_probe in (None, 404, 405, 410):
+                continue
             # Valid-format vs clearly invalid code
             times_real   = await self._sample_times(sess, "POST", url,
                 {"code": "SAVE10OFF", "coupon": "SAVE10OFF"}, n=6)

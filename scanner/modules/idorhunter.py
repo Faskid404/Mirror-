@@ -153,9 +153,15 @@ GRAPHQL_ENDPOINTS = ["/graphql", "/api/graphql", "/api/v1/graphql", "/query"]
 
 
 def _is_placeholder_pii(val: str) -> bool:
-    placeholders = ["example.com", "test.com", "localhost", "user@", "name@",
-                    "placeholder", "undefined", "null", "none", "n/a"]
-    return any(p in val.lower() for p in placeholders)
+    placeholders = [
+        "example.com", "test.com", "localhost", "user@", "name@",
+        "placeholder", "undefined", "null", "none", "n/a", "fake",
+        "demo", "sample", "dummy", "fixture", "mock", "test@", "admin@",
+        "yourname", "username", "email@", "xxxx", "0000", "1234",
+        "example@", "noreply@", "@example", "@test", ".example",
+    ]
+    v_low = val.lower()
+    return any(p in v_low for p in placeholders)
 
 
 def _extract_pii(body: str) -> dict:

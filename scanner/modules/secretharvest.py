@@ -139,6 +139,12 @@ PLACEHOLDER_WORDS = {
     "undefined", "todo", "fixme", "enter_here", "your_api_key",
     "put_secret_here", "my_password", "supersecret", "verysecret",
     "sk-xxxx", "sk_test_xxxx", "akia_xxxx", "token_here",
+    "xxxxxxxxxxx", "yyyyyyyyyyyy", "zzzzzzzzzzzz", "aaaaaaaaaaaa",
+    "1234567890", "0000000000", "nnnnnnnnnnnn", "not_set", "not-set",
+    "fill_in_here", "fill-in-here", "set_me", "set-me",
+    "your-secret-here", "your_secret_here", "my_secret_key",
+    "default_secret", "default-secret", "change_me", "insert_secret",
+    "redacted", "censored", "hidden", "masked", "obfuscated",
 }
 
 # ── Files to probe ────────────────────────────────────────────────────────────

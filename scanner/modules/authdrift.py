@@ -59,7 +59,7 @@ from urllib.parse import urlparse
 
 sys.path.insert(0, str(Path(__file__).parent))
 from smart_filter import (
-    delay, confidence_label, meets_confidence_floor,
+    delay, confidence_label, meets_confidence_floor, is_real_200,
     random_ua, WAF_BYPASS_HEADERS, shannon_entropy, gen_bypass_attempts,
 )
 
@@ -176,7 +176,7 @@ class AuthDrift:
             return last
 
     def _detect_login_success(self, status: int, body: str, hdrs: dict) -> bool:
-        if status not in (200, 201):
+        if not is_real_200(status):
             return False
         body_low = (body or "").lower()
         token_in_body = bool(re.search(r'eyJ[A-Za-z0-9\-_]{10,}\.eyJ', body or ""))
@@ -187,10 +187,15 @@ class AuthDrift:
     # ── Password Policy ─────────────────────────────────────────────────────
 
     async def test_password_policy(self, sess):
+        import random as _rand
         print("\n[*] Testing password policy enforcement...")
         for path in REGISTER_PATHS[:4]:
             url = self.target + path
-            # Try registering with weak passwords
+            # First verify endpoint exists
+            s_probe, _, _ = await self._get(sess, url)
+            await delay(0.08)
+            if s_probe in (None, 404, 405, 410):
+                continue
             weak_pass_tests = [
                 ("a",       "1-char password"),
                 ("abc",     "3-char password"),
@@ -200,17 +205,16 @@ class AuthDrift:
                 ("",        "blank password"),
             ]
             for pwd, label in weak_pass_tests:
-                import random
-                email = f"probe_{random.randint(1000,9999)}@evil-test.com"
-                payload = {"email": email, "password": pwd, "username": f"probe_{random.randint(1000,9999)}"}
+                email = f"probe_{_rand.randint(10000,99999)}@evil-test.com"
+                payload = {"email": email, "password": pwd, "username": f"probe_{_rand.randint(10000,99999)}"}
                 s, body, _ = await self._post(sess, url, data=payload)
                 await delay(0.1)
                 if s in (None, 404, 405):
                     continue
-                if s in (200, 201) and body:
-                    # Check if registration succeeded
+                if is_real_200(s) and body:
+                    # Check if registration actually succeeded (not just a 200 error page)
                     if any(kw in (body or "").lower() for kw in
-                           ["created", "registered", "success", "user_id", "id", "token"]):
+                           ["created", "registered", "user_id", "token", '"id"']):
                         self._add(self._f(
                             ftype="WEAK_PASSWORD_ACCEPTED",
                             sev="HIGH", conf=90,
